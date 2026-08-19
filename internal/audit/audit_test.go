@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -25,8 +26,8 @@ func TestStateDirFor(t *testing.T) {
 		home string
 		want string
 	}{
-		{name: "xdg", goos: "linux", env: map[string]string{"XDG_STATE_HOME": "/state"}, home: "/home/me", want: filepath.Join("/state", "ward", "v1")},
-		{name: "unix fallback", goos: "darwin", env: map[string]string{}, home: "/Users/me", want: filepath.Join("/Users/me", ".local", "state", "ward", "v1")},
+		{name: "xdg", goos: "linux", env: map[string]string{"XDG_STATE_HOME": "/state"}, home: "/home/me", want: pathpkg.Join("/state", "ward", "v1")},
+		{name: "unix fallback", goos: "darwin", env: map[string]string{}, home: "/Users/me", want: pathpkg.Join("/Users/me", ".local", "state", "ward", "v1")},
 		{name: "windows", goos: "windows", env: map[string]string{"LOCALAPPDATA": filepath.Clean("C:/Users/me/AppData/Local")}, home: "ignored", want: filepath.Join(filepath.Clean("C:/Users/me/AppData/Local"), "Ward", "state", "v1")},
 	}
 	for _, test := range tests {

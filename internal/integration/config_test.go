@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -133,17 +134,17 @@ func TestInstallConfigPreservesApprovalAndRestoresSandboxBytes(t *testing.T) {
 	if strings.Contains(string(installed), "[permissions.ward-baseline.network]") {
 		t.Fatal("workspace-write migration unexpectedly enabled command network access")
 	}
-	if !strings.Contains(string(installed), `"`+options.Paths.StateDir+`" = "deny"`) {
+	if !strings.Contains(string(installed), strconv.Quote(options.Paths.StateDir)+` = "deny"`) {
 		t.Fatalf("state path is not protected: %s", installed)
 	}
-	if !strings.Contains(string(installed), `"`+options.Paths.UserPolicyPath+`" = "deny"`) {
+	if !strings.Contains(string(installed), strconv.Quote(options.Paths.UserPolicyPath)+` = "deny"`) {
 		t.Fatalf("policy path is not protected: %s", installed)
 	}
-	if !strings.Contains(string(installed), `"`+options.Paths.BinaryPath+`" = "read"`) {
+	if !strings.Contains(string(installed), strconv.Quote(options.Paths.BinaryPath)+` = "read"`) {
 		t.Fatalf("binary is not sandbox read-only: %s", installed)
 	}
 	for _, directory := range readOnlyBoundaryDirectories(options.Paths) {
-		if !strings.Contains(string(installed), `"`+directory+`" = "read"`) {
+		if !strings.Contains(string(installed), strconv.Quote(directory)+` = "read"`) {
 			t.Fatalf("boundary directory is not read-only: %s", directory)
 		}
 	}

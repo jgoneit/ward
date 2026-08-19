@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
+	pathpkg "path"
 	"strings"
 )
 
@@ -362,16 +362,19 @@ func newWardGroup(command, status string) (json.RawMessage, error) {
 
 func hookCommand(binaryPath, subcommand string) string {
 	if windowsAbsolute(binaryPath) {
+		if strings.HasPrefix(binaryPath, "//") {
+			binaryPath = `\\` + strings.ReplaceAll(strings.TrimPrefix(binaryPath, "//"), "/", `\`)
+		}
 		return quoteWindows(binaryPath) + " hook " + subcommand
 	}
-	return quotePOSIX(filepath.Clean(binaryPath)) + " hook " + subcommand
+	return quotePOSIX(pathpkg.Clean(binaryPath)) + " hook " + subcommand
 }
 
 func windowsAbsolute(value string) bool {
 	if len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
 		return true
 	}
-	return strings.HasPrefix(value, `\\`)
+	return strings.HasPrefix(value, `\\`) || strings.HasPrefix(value, "//")
 }
 
 func quoteWindows(value string) string {

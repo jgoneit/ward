@@ -10,11 +10,18 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// FILE_ALL_ACCESS is STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | all
+// file-object-specific rights. Using the concrete mapping avoids relying on
+// whether a filesystem persists or expands GENERIC_ALL in inheritable ACEs.
+const windowsFileAllAccess = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff)
+
 func securePrivateDirectory(path string) error { return setPrivateWindowsACL(path, true) }
 func securePrivateFile(path string) error      { return setPrivateWindowsACL(path, false) }
 
-func inspectPrivateDirectoryPermissions(path string) error { return inspectPrivateWindowsACL(path) }
-func inspectPrivateFilePermissions(path string) error      { return inspectPrivateWindowsACL(path) }
+func inspectPrivateDirectoryPermissions(path string) error {
+	return inspectPrivateWindowsACL(path, true)
+}
+func inspectPrivateFilePermissions(path string) error { return inspectPrivateWindowsACL(path, false) }
 
 func setPrivateWindowsACL(path string, directory bool) error {
 	userSID, closeToken, err := currentUserSID()
@@ -32,7 +39,7 @@ func setPrivateWindowsACL(path string, directory bool) error {
 	}
 	entries := []windows.EXPLICIT_ACCESS{
 		{
-			AccessPermissions: windows.ACCESS_MASK(windows.GENERIC_ALL),
+			AccessPermissions: windowsFileAllAccess,
 			AccessMode:        windows.SET_ACCESS,
 			Inheritance:       inheritance,
 			Trustee: windows.TRUSTEE{
@@ -42,12 +49,12 @@ func setPrivateWindowsACL(path string, directory bool) error {
 			},
 		},
 		{
-			AccessPermissions: windows.ACCESS_MASK(windows.GENERIC_ALL),
+			AccessPermissions: windowsFileAllAccess,
 			AccessMode:        windows.SET_ACCESS,
 			Inheritance:       inheritance,
 			Trustee: windows.TRUSTEE{
 				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+				TrusteeType:  windows.TRUSTEE_IS_USER,
 				TrusteeValue: windows.TrusteeValueFromSID(systemSID),
 			},
 		},
@@ -67,10 +74,10 @@ func setPrivateWindowsACL(path string, directory bool) error {
 	); err != nil {
 		return fmt.Errorf("set private Windows DACL: %w", err)
 	}
-	return inspectPrivateWindowsACL(path)
+	return inspectPrivateWindowsACL(path, directory)
 }
 
-func inspectPrivateWindowsACL(path string) error {
+func inspectPrivateWindowsACL(path string, directory bool) error {
 	userSID, closeToken, err := currentUserSID()
 	if err != nil {
 		return err
@@ -103,33 +110,63 @@ func inspectPrivateWindowsACL(path string) error {
 	if err != nil || dacl == nil {
 		return errors.New("Windows object has no private DACL")
 	}
-	if dacl.AceCount != 2 {
-		return fmt.Errorf("Windows DACL has %d entries, want 2", dacl.AceCount)
+	type principalCoverage struct {
+		effective        bool
+		objectInherit    bool
+		containerInherit bool
 	}
-	seenUser := false
-	seenSystem := false
+	userCoverage := principalCoverage{}
+	systemCoverage := principalCoverage{}
 	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return fmt.Errorf("read Windows DACL entry: %w", err)
 		}
-		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask&windows.ACCESS_MASK(windows.GENERIC_ALL) == 0 {
+		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || !windowsACEGrantsFullFileAccess(ace.Mask) {
 			return errors.New("Windows DACL contains a non-private access entry")
 		}
+		if ace.Header.AceFlags&uint8(windows.INHERITED_ACE) != 0 {
+			return errors.New("Windows DACL contains an inherited access entry")
+		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		var coverage *principalCoverage
 		switch {
 		case windows.EqualSid(sid, userSID):
-			seenUser = true
+			coverage = &userCoverage
 		case windows.EqualSid(sid, systemSID):
-			seenSystem = true
+			coverage = &systemCoverage
 		default:
 			return errors.New("Windows DACL grants access to an unexpected principal")
 		}
+		flags := ace.Header.AceFlags
+		allowedFlags := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE | windows.INHERIT_ONLY_ACE)
+		if (!directory && flags != 0) || (directory && flags&^allowedFlags != 0) {
+			return errors.New("Windows DACL contains unsupported inheritance flags")
+		}
+		if flags&uint8(windows.INHERIT_ONLY_ACE) != 0 && flags&uint8(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) == 0 {
+			return errors.New("Windows DACL contains an ineffective inherit-only entry")
+		}
+		if flags&uint8(windows.INHERIT_ONLY_ACE) == 0 {
+			coverage.effective = true
+		}
+		coverage.objectInherit = coverage.objectInherit || flags&uint8(windows.OBJECT_INHERIT_ACE) != 0
+		coverage.containerInherit = coverage.containerInherit || flags&uint8(windows.CONTAINER_INHERIT_ACE) != 0
 	}
-	if !seenUser || !seenSystem {
+	if !userCoverage.effective || !systemCoverage.effective {
 		return errors.New("Windows DACL is missing current-user or LocalSystem access")
 	}
+	if directory && (!userCoverage.objectInherit || !userCoverage.containerInherit || !systemCoverage.objectInherit || !systemCoverage.containerInherit) {
+		return errors.New("Windows directory DACL does not protect all descendants")
+	}
 	return nil
+}
+
+func windowsACEGrantsFullFileAccess(mask windows.ACCESS_MASK) bool {
+	if mask&windows.ACCESS_MASK(windows.GENERIC_ALL) != 0 {
+		return true
+	}
+	// File systems may persist GENERIC_ALL as its object-specific mapping.
+	return mask&windowsFileAllAccess == windowsFileAllAccess
 }
 
 func currentUserSID() (*windows.SID, func(), error) {

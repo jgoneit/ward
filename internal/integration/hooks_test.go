@@ -65,6 +65,14 @@ func TestHookCommandQuotesWindowsPath(t *testing.T) {
 	}
 }
 
+func TestHookCommandPreservesForwardSlashUNCPath(t *testing.T) {
+	got := hookCommand(`//server/share/Ward Tools/ward.exe`, "codex-pre-tool-use")
+	want := `"\\server\share\Ward Tools\ward.exe" hook codex-pre-tool-use`
+	if got != want {
+		t.Fatalf("hookCommand() = %q, want %q", got, want)
+	}
+}
+
 func TestMergeHooksRejectsDuplicateJSONKeys(t *testing.T) {
 	_, _, err := mergeHooks([]byte(`{"hooks":{},"hooks":{}}`), "/tmp/ward")
 	if err == nil {

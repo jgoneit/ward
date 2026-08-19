@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -42,15 +43,15 @@ func stateDirFor(goos string, getenv func(string) string, home string) (string, 
 
 	base := strings.TrimSpace(getenv("XDG_STATE_HOME"))
 	if base != "" {
-		if !filepath.IsAbs(base) {
+		if !pathpkg.IsAbs(base) {
 			return "", errors.New("XDG_STATE_HOME must be absolute")
 		}
-		return filepath.Join(base, "ward", "v1"), nil
+		return pathpkg.Join(base, "ward", "v1"), nil
 	}
-	if home == "" || !filepath.IsAbs(home) {
+	if home == "" || !pathpkg.IsAbs(home) {
 		return "", errors.New("user home must be absolute")
 	}
-	return filepath.Join(home, ".local", "state", "ward", "v1"), nil
+	return pathpkg.Join(home, ".local", "state", "ward", "v1"), nil
 }
 
 func windowsAbsolute(path string) bool {
