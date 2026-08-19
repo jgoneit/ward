@@ -23,5 +23,8 @@ No release may skip the acceptance gates in this file.
   prompt. Requiring the user to relay routine diagnostics from a terminal is
   not RC-complete.
 
-Only then may `v0.1.0-rc.1` be created. Toolkit integration pins the reviewed
-release commit by exact Git SHA; it never follows a branch.
+Only then may `v0.1.0-rc.1` be created. Before RC, Harness Toolkit may pin a
+reviewed development commit only with Ward marked **Experimental**. That source
+pin does not activate Ward or imply that any RC gate passed. After the gates
+pass, a separate Toolkit update pins the reviewed release commit by exact Git
+SHA; Toolkit pins never follow a branch.

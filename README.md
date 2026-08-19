@@ -209,13 +209,16 @@ repair.
 
 ## Rollout gate
 
-Ward will not publish `v0.1.0-rc.1` or enter Harness Toolkit until isolated
-platform E2E passes, Plugin Doctor/audit has a reviewed Host-side management
-path, and twenty real Tasks complete with zero Ward-added prompts, zero secret
-or catastrophic escapes, zero unresolved false deny, and zero need to disable
-Ward. Requiring a human to relay routine diagnostics from a terminal is not
-RC-complete. Toolkit will then pin the reviewed Ward commit by exact SHA at
-`modules/security/ward` using the relative URL `../ward.git`.
+Ward may be listed in Harness Toolkit before RC only as an **Experimental**
+source pin. That gitlink does not install or activate Ward, satisfy any release
+gate, or claim production readiness. Ward will not publish `v0.1.0-rc.1` or
+advance beyond Experimental until isolated platform E2E passes, Plugin
+Doctor/audit has a reviewed Host-side management path, and twenty real Tasks
+complete with zero Ward-added prompts, zero secret or catastrophic escapes,
+zero unresolved false deny, and zero need to disable Ward. Requiring a human
+to relay routine diagnostics from a terminal is not RC-complete. A later
+explicit Toolkit update will pin the reviewed release commit by exact SHA at
+`modules/security/ward`; Toolkit pins never follow a branch.
 
 See [CHARTER.md](CHARTER.md), [SECURITY.md](SECURITY.md), and
 [RELEASING.md](RELEASING.md).
