@@ -117,14 +117,57 @@ that project; ancestor relocation can degrade audit continuity and remains a
 release blocker there. Ward does not make all of `~/.local` or a custom state
 tree read-only merely to hide that limitation.
 
-## Build from source
+## Build and install from source
 
 Requirements: Go 1.25 or newer.
 
 ```sh
-go build -o bin/ward ./cmd/ward
 go test ./...
 go vet ./...
+
+ward_bin="${CODEX_HOME:-$HOME/.codex}/ward/bin/ward"
+mkdir -p "$(dirname "$ward_bin")"
+go build -o "$ward_bin" ./cmd/ward
+"$ward_bin" codex install --scope user --profile baseline --dry-run
+```
+
+PowerShell uses the same protected `CODEX_HOME` layout:
+
+```powershell
+$codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$wardBin = Join-Path $codexDir 'ward\bin\ward.exe'
+New-Item -ItemType Directory -Force -Path (Split-Path $wardBin) | Out-Null
+go build -o $wardBin ./cmd/ward
+& $wardBin codex install --scope user --profile baseline --dry-run
+```
+
+The dry run does not activate Ward. Review its result before running the same
+command without `--dry-run`; add `--migrate-permissions` only when explicitly
+migrating a legacy `sandbox_mode` configuration.
+
+Remove a source-installed binary and its Ward-owned Codex integration with the
+repository-owned uninstaller. Audit state and its key are intentionally
+preserved:
+
+```sh
+./uninstall.sh
+```
+
+```powershell
+.\uninstall.ps1
+```
+
+After a tagged release exists, the checksum-verifying release installers own
+the same binary lifecycle:
+
+```sh
+./install.sh --version vX.Y.Z
+./uninstall.sh
+```
+
+```powershell
+.\install.ps1 -Version vX.Y.Z
+.\uninstall.ps1
 ```
 
 ## CLI
@@ -151,6 +194,18 @@ ward audit repair [--project PATH] [--dry-run] [--json]
 
 The machine contracts are `ward-request/v1`, `ward-decision/v1`,
 `ward-audit-event/v1`, and `ward-doctor/v1`.
+
+### Exit contract
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command completed successfully; a valid Ward decision may still be `deny` or `defer`. |
+| `1` | A runtime or operating-system operation failed. |
+| `2` | CLI usage or arguments were invalid. |
+| `3` | A request or machine-contract input was malformed or unavailable. |
+| `4` | Policy loading or validation failed. |
+| `5` | Audit storage, integrity, retention, or repair failed. |
+| `6` | Codex integration or Doctor health validation failed. |
 
 ## Codex installation
 
