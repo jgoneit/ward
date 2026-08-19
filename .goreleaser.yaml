@@ -1,0 +1,43 @@
+version: 2
+
+project_name: ward
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: ward
+    main: ./cmd/ward
+    binary: ward
+    env: [CGO_ENABLED=0]
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/jgoneit/ward/internal/version.Version={{ .Version }}
+        -X github.com/jgoneit/ward/internal/version.Commit={{ .Commit }}
+        -X github.com/jgoneit/ward/internal/version.Date={{ .Date }}
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - ids: [ward]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      ward_{{ trimPrefix .Version "v" }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  draft: true

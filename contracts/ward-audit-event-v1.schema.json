@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jgoneit/ward/contracts/ward-audit-event-v1.schema.json",
+  "title": "Ward metadata-only audit event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "seq",
+    "timestamp",
+    "phase",
+    "host_disposition",
+    "project_id",
+    "input_fp",
+    "tool_fp",
+    "request_fp",
+    "tool_kind",
+    "record_mac"
+  ],
+  "properties": {
+    "schema": { "const": "ward-audit-event/v1" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "phase": { "enum": ["pre", "permission_request", "post"] },
+    "host_disposition": { "enum": ["approval_requested", "post_observed", "unknown"] },
+    "project_id": { "$ref": "#/$defs/fingerprint" },
+    "session_fp": { "$ref": "#/$defs/fingerprint" },
+    "turn_fp": { "$ref": "#/$defs/fingerprint" },
+    "tool_use_fp": { "$ref": "#/$defs/fingerprint" },
+    "input_fp": { "$ref": "#/$defs/fingerprint" },
+    "tool_fp": { "$ref": "#/$defs/fingerprint" },
+    "request_fp": { "$ref": "#/$defs/fingerprint" },
+    "tool_kind": { "enum": ["shell", "patch", "mcp", "local", "unknown"] },
+    "ward_decision": { "enum": ["deny", "defer", "error"] },
+    "rule_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "risk_class": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "coverage_gap_code": {
+      "enum": [
+        "ambiguous_cmd",
+        "ambiguous_powershell",
+        "ambiguous_powershell_options",
+        "builtin_dispatch",
+        "complex_command_wrapper",
+        "complex_env_wrapper",
+        "complex_file_operands",
+        "complex_nohup_wrapper",
+        "complex_sudo_wrapper",
+        "dynamic_additive_prefix",
+        "dynamic_find_path",
+        "dynamic_global_option",
+        "dynamic_interpreter_payload",
+        "dynamic_patch_path",
+        "dynamic_path",
+        "dynamic_shell_word",
+        "dynamic_wrapper",
+        "empty_windows_command",
+        "find_command_action",
+        "inline_shell_input",
+        "interpreter_payload",
+        "malformed_patch_path",
+        "missing_command",
+        "missing_structured_move_roles",
+        "missing_structured_path",
+        "nested_shell_limit",
+        "nohup_stdin_semantics",
+        "opaque_command_dispatch",
+        "shell_function",
+        "shell_parse_error",
+        "unrecognized_patch",
+        "unresolved_home_target",
+        "unsupported_docker_global_option",
+        "unsupported_git_global_option",
+        "unsupported_global_option",
+        "unsupported_kubectl_global_option",
+        "unsupported_tool",
+        "unknown"
+      ]
+    },
+    "permission_mode": {
+      "enum": ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "unknown"]
+    },
+    "policy_fp": { "$ref": "#/$defs/fingerprint" },
+    "engine_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "prev_mac": { "$ref": "#/$defs/fingerprint" },
+    "record_mac": { "$ref": "#/$defs/fingerprint" }
+  },
+  "$defs": {
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "phase": { "const": "pre" } } },
+      "then": {
+        "properties": { "host_disposition": { "const": "unknown" } },
+        "required": ["ward_decision"]
+      }
+    },
+    {
+      "if": { "properties": { "phase": { "const": "permission_request" } } },
+      "then": {
+        "properties": { "host_disposition": { "const": "approval_requested" } },
+        "required": ["ward_decision"]
+      }
+    },
+    {
+      "if": { "properties": { "phase": { "const": "post" } } },
+      "then": {
+        "properties": { "host_disposition": { "const": "post_observed" } },
+        "not": { "required": ["ward_decision"] }
+      }
+    },
+    {
+      "if": { "required": ["coverage_gap_code"] },
+      "then": {
+        "properties": { "ward_decision": { "const": "defer" } },
+        "required": ["ward_decision"]
+      }
+    }
+  ]
+}
