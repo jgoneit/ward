@@ -1,8 +1,11 @@
 package evaluator
 
 import (
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -14,7 +17,7 @@ const maxNestedShellDepth = 3
 
 var (
 	dropDatabaseSQL      = regexp.MustCompile(`(?i)^drop[[:space:]]+database[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:"[^"]+"|[a-z0-9_.-]+)(?:[[:space:]]+(?:with[[:space:]]*)?\([^;]*\))?[[:space:]]*;?$`)
-	dropDatabaseMySQLSQL = regexp.MustCompile(`(?i)^drop[[:space:]]+(?:database|schema)[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:` + "`[^`]+`" + `|[a-z0-9_.-]+)[[:space:]]*;?$`)
+	dropDatabaseMySQLSQL = regexp.MustCompile(`(?i)^drop[[:space:]]+database[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:` + "`[^`]+`" + `|[a-z0-9_.-]+)[[:space:]]*;?$`)
 	dropSchemaCascadeSQL = regexp.MustCompile(`(?i)^drop[[:space:]]+schema[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:"[^"]+"|[a-z0-9_.-]+)[[:space:]]+cascade[[:space:]]*;?$`)
 )
 
@@ -24,6 +27,21 @@ type literalArg struct {
 }
 
 func (e *Evaluator) evaluatePOSIX(command, cwd string, depth int) scanResult {
+	return e.evaluatePOSIXWithCWD(command, cwd, depth, true)
+}
+
+type posixCWDState struct {
+	path  string
+	known bool
+	facts []posixPathFact
+}
+
+type posixPathFact struct {
+	path   string
+	exists bool
+}
+
+func (e *Evaluator) evaluatePOSIXWithCWD(command, cwd string, depth int, cwdKnown bool) scanResult {
 	if depth > maxNestedShellDepth {
 		return scanResult{gap: gap("nested_shell_limit", "Nested shell evaluation exceeded its bounded depth.")}
 	}
@@ -32,28 +50,39 @@ func (e *Evaluator) evaluatePOSIX(command, cwd string, depth int) scanResult {
 	if err != nil {
 		return scanResult{gap: gap("shell_parse_error", "The POSIX shell parser rejected the command.")}
 	}
-	if exactInteractive(file) {
-		return denied("WARD_INTERACTIVE_SESSION", "An explicit interactive session is denied.")
-	}
-	if compoundInteractiveTail(file) {
-		return denied("WARD_INTERACTIVE_SESSION", "An explicit interactive session is denied.")
-	}
 	pwdCall := singleSimpleCall(file)
+	initialState := posixCWDState{path: cwd, known: cwdKnown}
+	callStates := e.posixCallStates(file, initialState)
 
 	result := scanResult{}
 	syntax.Walk(file, func(node syntax.Node) bool {
-		if node == nil || result.deny != nil {
+		if node == nil {
 			return false
 		}
-		switch typed := node.(type) {
-		case *syntax.FuncDecl:
+		if result.deny != nil {
+			return false
+		}
+		if _, ok := node.(*syntax.FuncDecl); ok {
 			// A function declaration does not execute its body. A later invocation
 			// appears as its own CallExpr and is evaluated independently.
 			result.addGap(gap("shell_function", "A shell function body is not evaluated until invocation."))
 			return false
+		}
+		switch typed := node.(type) {
 		case *syntax.CallExpr:
-			callResult := e.evaluatePOSIXCall(typed, cwd, depth, typed == pwdCall)
-			result.merge(callResult)
+			states, classified := callStates[typed]
+			if !classified {
+				states = []posixCWDState{initialState}
+			}
+			if len(states) == 0 {
+				return true
+			}
+			for _, state := range states {
+				result.merge(e.evaluatePOSIXCall(typed, state.path, depth, typed == pwdCall, !state.known))
+				if result.deny != nil {
+					break
+				}
+			}
 		case *syntax.Redirect:
 			switch typed.Op {
 			case syntax.Hdoc, syntax.DashHdoc, syntax.WordHdoc:
@@ -67,124 +96,22 @@ func (e *Evaluator) evaluatePOSIX(command, cwd string, depth int) scanResult {
 				result.addGap(gap("dynamic_shell_word", "A shell redirection contains runtime expansion."))
 				break
 			}
-			if ruleID, protected := e.matchProtectedPath(value, cwd, false); protected {
-				result.merge(denied(ruleID, secretReason))
-			}
+			_ = value
 		}
-		return result.deny == nil
+		return true
 	})
 	return result
 }
 
-func compoundInteractiveTail(file *syntax.File) bool {
-	if file == nil || len(file.Stmts) == 0 {
-		return false
-	}
-	for _, statement := range file.Stmts {
-		if interactiveChannelStatement(statement) {
-			return true
-		}
-		if statementStopsFollowingCommands(statement) {
-			return false
-		}
-	}
-	return false
-}
-
-func interactiveChannelStatement(statement *syntax.Stmt) bool {
-	if statement == nil || len(statement.Redirs) != 0 || statement.Negated ||
-		statement.Background || statement.Coprocess || statement.Disown {
-		return false
-	}
-	switch command := statement.Cmd.(type) {
-	case *syntax.CallExpr:
-		if len(command.Args) == 0 {
-			return false
-		}
-		argv := make([]literalArg, len(command.Args))
-		for index, word := range command.Args {
-			value, static := literalWord(word)
-			if !static {
-				return false
-			}
-			argv[index] = literalArg{value: value, static: true}
-		}
-		unwrapped, unwrapGap, envDump := unwrapPOSIX(argv, false)
-		return unwrapGap == nil && !envDump && inputDrivenInteractive(unwrapped)
+func posixIntroducesCWDIsolation(node syntax.Node) bool {
+	switch typed := node.(type) {
+	case *syntax.Subshell, *syntax.CmdSubst:
+		return true
 	case *syntax.BinaryCmd:
-		// In a pipeline, only the left-most command retains the tool's stdin.
-		// The right side receives the upstream pipe and is not an unobserved host
-		// input channel.
-		if command.Op == syntax.Pipe || command.Op == syntax.PipeAll {
-			return interactiveChannelStatement(command.X)
-		}
-		if interactiveChannelStatement(command.X) {
-			return true
-		}
-		if status, known := literalStatementStatus(command.X); known {
-			if command.Op == syntax.AndStmt && !status || command.Op == syntax.OrStmt && status {
-				return false
-			}
-		}
-		return interactiveChannelStatement(command.Y)
-	case *syntax.Subshell:
-		return interactiveChannelStatements(command.Stmts)
-	case *syntax.Block:
-		return interactiveChannelStatements(command.Stmts)
+		return typed.Op == syntax.Pipe || typed.Op == syntax.PipeAll
 	default:
 		return false
 	}
-}
-
-func interactiveChannelStatements(statements []*syntax.Stmt) bool {
-	for _, statement := range statements {
-		if interactiveChannelStatement(statement) {
-			return true
-		}
-		if statementStopsFollowingCommands(statement) {
-			return false
-		}
-	}
-	return false
-}
-
-func literalStatementStatus(statement *syntax.Stmt) (bool, bool) {
-	if statement == nil || len(statement.Redirs) != 0 || statement.Background || statement.Coprocess || statement.Disown {
-		return false, false
-	}
-	call, ok := statement.Cmd.(*syntax.CallExpr)
-	if !ok || len(call.Args) != 1 {
-		return false, false
-	}
-	value, static := literalWord(call.Args[0])
-	if !static {
-		return false, false
-	}
-	var status bool
-	switch posixExecutableBase(value) {
-	case "true", ":":
-		status = true
-	case "false":
-		status = false
-	default:
-		return false, false
-	}
-	if statement.Negated {
-		status = !status
-	}
-	return status, true
-}
-
-func statementStopsFollowingCommands(statement *syntax.Stmt) bool {
-	if statement == nil || len(statement.Redirs) != 0 || statement.Background || statement.Coprocess || statement.Disown {
-		return false
-	}
-	call, ok := statement.Cmd.(*syntax.CallExpr)
-	if !ok || len(call.Args) == 0 {
-		return false
-	}
-	value, static := literalWord(call.Args[0])
-	return static && (posixExecutableBase(value) == "exit" || posixExecutableBase(value) == "return")
 }
 
 func singleSimpleCall(file *syntax.File) *syntax.CallExpr {
@@ -199,101 +126,548 @@ func singleSimpleCall(file *syntax.File) *syntax.CallExpr {
 	return call
 }
 
-func exactInteractive(file *syntax.File) bool {
-	if file == nil || len(file.Stmts) != 1 {
-		return false
+type posixStateFlow struct {
+	success []posixCWDState
+	failure []posixCWDState
+}
+
+func (e *Evaluator) posixCallStates(file *syntax.File, initial posixCWDState) map[*syntax.CallExpr][]posixCWDState {
+	states := make(map[*syntax.CallExpr][]posixCWDState)
+	if file != nil {
+		e.posixStmtListFlow(file.Stmts, []posixCWDState{initial}, states)
 	}
-	stmt := file.Stmts[0]
-	if stmt == nil || len(stmt.Redirs) != 0 || stmt.Semicolon.IsValid() ||
-		stmt.Negated || stmt.Background || stmt.Coprocess || stmt.Disown {
-		return false
+	return states
+}
+
+func (e *Evaluator) posixStmtListFlow(statements []*syntax.Stmt, inputs []posixCWDState, calls map[*syntax.CallExpr][]posixCWDState) posixStateFlow {
+	current := dedupePOSIXStates(inputs)
+	flow := posixStateFlow{success: current, failure: current}
+	for _, statement := range statements {
+		flow = e.posixStmtFlow(statement, current, calls)
+		current = unionPOSIXStates(flow.success, flow.failure)
 	}
-	call, ok := stmt.Cmd.(*syntax.CallExpr)
-	if !ok || len(call.Args) < 1 {
+	return flow
+}
+
+func (e *Evaluator) posixStmtFlow(statement *syntax.Stmt, inputs []posixCWDState, calls map[*syntax.CallExpr][]posixCWDState) posixStateFlow {
+	if statement == nil || statement.Cmd == nil {
+		return posixStateFlow{success: inputs, failure: inputs}
+	}
+	flow := e.posixCommandFlow(statement.Cmd, inputs, calls)
+	if statement.Negated {
+		flow.success, flow.failure = flow.failure, flow.success
+	}
+	if statement.Background || statement.Coprocess || statement.Disown {
+		return posixStateFlow{success: inputs, failure: inputs}
+	}
+	return flow
+}
+
+func (e *Evaluator) posixCommandFlow(command syntax.Command, inputs []posixCWDState, calls map[*syntax.CallExpr][]posixCWDState) posixStateFlow {
+	switch typed := command.(type) {
+	case *syntax.CallExpr:
+		calls[typed] = unionPOSIXStates(calls[typed], inputs)
+		e.recordNestedPOSIXCallStates(typed, inputs, calls)
+		var success, failure []posixCWDState
+		for _, state := range inputs {
+			if posixCallChangesCWD(typed) {
+				transition := e.posixCWDChangeFlow(typed, state)
+				success = append(success, transition.success...)
+				failure = append(failure, transition.failure...)
+				continue
+			}
+			status := literalPOSIXCallStatus(typed)
+			if status == 2 {
+				continue
+			}
+			if status >= 0 {
+				success = append(success, e.posixCallSuccessState(typed, state))
+			}
+			if status <= 0 {
+				failure = append(failure, state)
+			}
+		}
+		return posixStateFlow{success: dedupePOSIXStates(success), failure: dedupePOSIXStates(failure)}
+	case *syntax.BinaryCmd:
+		switch typed.Op {
+		case syntax.AndStmt:
+			left := e.posixStmtFlow(typed.X, inputs, calls)
+			right := e.posixStmtFlow(typed.Y, left.success, calls)
+			return posixStateFlow{success: right.success, failure: unionPOSIXStates(left.failure, right.failure)}
+		case syntax.OrStmt:
+			left := e.posixStmtFlow(typed.X, inputs, calls)
+			right := e.posixStmtFlow(typed.Y, left.failure, calls)
+			return posixStateFlow{success: unionPOSIXStates(left.success, right.success), failure: right.failure}
+		case syntax.Pipe, syntax.PipeAll:
+			e.posixStmtFlow(typed.X, inputs, calls)
+			e.posixStmtFlow(typed.Y, inputs, calls)
+			return posixStateFlow{success: inputs, failure: inputs}
+		default:
+			return posixStateFlow{success: inputs, failure: inputs}
+		}
+	case *syntax.Block:
+		return e.posixStmtListFlow(typed.Stmts, inputs, calls)
+	case *syntax.Subshell:
+		e.posixStmtListFlow(typed.Stmts, inputs, calls)
+		return posixStateFlow{success: inputs, failure: inputs}
+	case *syntax.IfClause:
+		condition := e.posixStmtListFlow(typed.Cond, inputs, calls)
+		thenFlow := e.posixStmtListFlow(typed.Then, condition.success, calls)
+		elseFlow := posixStateFlow{success: condition.failure, failure: condition.failure}
+		if typed.Else != nil {
+			elseFlow = e.posixCommandFlow(typed.Else, condition.failure, calls)
+		}
+		return posixStateFlow{
+			success: unionPOSIXStates(thenFlow.success, elseFlow.success),
+			failure: unionPOSIXStates(thenFlow.failure, elseFlow.failure),
+		}
+	case *syntax.WhileClause:
+		condition := e.posixStmtListFlow(typed.Cond, inputs, calls)
+		bodyInputs := condition.success
+		if typed.Until {
+			bodyInputs = condition.failure
+		}
+		body := e.posixStmtListFlow(typed.Do, bodyInputs, calls)
+		all := unionPOSIXStates(inputs, body.success, body.failure)
+		return posixStateFlow{success: all, failure: all}
+	case *syntax.ForClause:
+		body := e.posixStmtListFlow(typed.Do, inputs, calls)
+		all := unionPOSIXStates(inputs, body.success, body.failure)
+		return posixStateFlow{success: all, failure: all}
+	case *syntax.CaseClause:
+		all := append([]posixCWDState(nil), inputs...)
+		for _, item := range typed.Items {
+			itemFlow := e.posixStmtListFlow(item.Stmts, inputs, calls)
+			all = unionPOSIXStates(all, itemFlow.success, itemFlow.failure)
+		}
+		return posixStateFlow{success: all, failure: all}
+	case *syntax.TimeClause:
+		return e.posixStmtFlow(typed.Stmt, inputs, calls)
+	case *syntax.CoprocClause:
+		e.posixStmtFlow(typed.Stmt, inputs, calls)
+		return posixStateFlow{success: inputs, failure: inputs}
+	case *syntax.FuncDecl:
+		return posixStateFlow{success: inputs, failure: inputs}
+	default:
+		return posixStateFlow{success: inputs, failure: inputs}
+	}
+}
+
+func (e *Evaluator) recordNestedPOSIXCallStates(root *syntax.CallExpr, inputs []posixCWDState, calls map[*syntax.CallExpr][]posixCWDState) {
+	syntax.Walk(root, func(node syntax.Node) bool {
+		switch typed := node.(type) {
+		case *syntax.CallExpr:
+			return typed == root
+		case *syntax.CmdSubst:
+			e.posixStmtListFlow(typed.Stmts, inputs, calls)
+			return false
+		case *syntax.ProcSubst:
+			e.posixStmtListFlow(typed.Stmts, inputs, calls)
+			return false
+		default:
+			return true
+		}
+	})
+}
+
+func literalPOSIXCallStatus(call *syntax.CallExpr) int {
+	if call == nil || len(call.Args) == 0 {
+		return 0
+	}
+	value, static := literalWord(call.Args[0])
+	if !static {
+		return 0
+	}
+	switch posixExecutableBase(value) {
+	case "true", ":":
+		return 1
+	case "false":
+		return -1
+	case "exit":
+		return 2
+	default:
+		return 0
+	}
+}
+
+func posixCallChangesCWD(call *syntax.CallExpr) bool {
+	if call == nil || len(call.Args) == 0 {
 		return false
 	}
 	argv := make([]literalArg, len(call.Args))
-	for i, arg := range call.Args {
-		value, static := literalWord(arg)
-		if !static {
+	for index, word := range call.Args {
+		argv[index].value, argv[index].static = literalWord(word)
+	}
+	unwrapped, _, envDump := unwrapPOSIX(argv, true)
+	if envDump || len(unwrapped) == 0 || !unwrapped[0].static {
+		return false
+	}
+	base := posixExecutableBase(unwrapped[0].value)
+	if base == "builtin" && len(unwrapped) > 1 && unwrapped[1].static {
+		base = unwrapped[1].value
+	}
+	return base == "cd" || base == "pushd" || base == "popd"
+}
+
+func unionPOSIXStates(groups ...[]posixCWDState) []posixCWDState {
+	var combined []posixCWDState
+	for _, group := range groups {
+		combined = append(combined, group...)
+	}
+	return dedupePOSIXStates(combined)
+}
+
+func dedupePOSIXStates(states []posixCWDState) []posixCWDState {
+	seen := make(map[string]struct{}, len(states))
+	result := make([]posixCWDState, 0, len(states))
+	for _, state := range states {
+		key := state.path
+		if !state.known {
+			key = "?" + key
+		}
+		for _, fact := range state.facts {
+			key += "\x00" + fact.path
+			if fact.exists {
+				key += "\x01"
+			}
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, state)
+	}
+	return result
+}
+
+func (e *Evaluator) posixCWDChangeFlow(call *syntax.CallExpr, current posixCWDState) posixStateFlow {
+	next := e.posixCallCWDState(call, current)
+	if !next.known {
+		if target, literal := e.posixLiteralCWDTarget(call, current); literal {
+			if exists, known := e.posixPathFactValue(current.facts, target); known && exists {
+				next.path, next.known = target, true
+				return posixStateFlow{success: []posixCWDState{next}}
+			}
+			if e.boundaries.goos == runtime.GOOS {
+				if info, err := os.Stat(filepath.FromSlash(current.path)); err != nil || !info.IsDir() {
+					// Synthetic/cross-filesystem conformance paths cannot prove the
+					// chdir failure. Preserve an unknown success branch so absolute
+					// catastrophic targets remain classifiable.
+					return posixStateFlow{success: []posixCWDState{next}}
+				}
+			}
+			return posixStateFlow{failure: []posixCWDState{current}}
+		}
+		// Dynamic directory changes are deliberately not promoted to a denial.
+		// They retain one unknown success state and leave the request to the Host.
+		return posixStateFlow{success: []posixCWDState{next}}
+	}
+	if e.posixCWDTargetInvalidated(call, current, next.path) {
+		return posixStateFlow{failure: []posixCWDState{current}}
+	}
+	return posixStateFlow{success: []posixCWDState{next}}
+}
+
+func (e *Evaluator) posixLiteralCWDTarget(call *syntax.CallExpr, current posixCWDState) (string, bool) {
+	if call == nil || len(call.Args) < 2 {
+		return "", false
+	}
+	argv := make([]literalArg, len(call.Args))
+	for index, word := range call.Args {
+		argv[index].value, argv[index].static = literalWord(word)
+		if !argv[index].static {
+			return "", false
+		}
+	}
+	unwrapped, _, envDump := unwrapPOSIX(argv, true)
+	if envDump || len(unwrapped) < 2 || !unwrapped[0].static {
+		return "", false
+	}
+	base := posixExecutableBase(unwrapped[0].value)
+	args := unwrapped[1:]
+	if base == "builtin" && len(args) > 1 && args[0].static {
+		base, args = args[0].value, args[1:]
+	}
+	if base != "cd" && base != "pushd" {
+		return "", false
+	}
+	for _, arg := range args {
+		if arg.value == "--" || strings.HasPrefix(arg.value, "-") {
+			continue
+		}
+		if arg.value == "" || !current.known && !e.boundaries.isAbsoluteCandidate(arg.value) {
+			return "", false
+		}
+		target := arg.value
+		if !e.boundaries.isAbsoluteCandidate(target) {
+			target = path.Join(current.path, target)
+		}
+		normalized, ok := normalizeAbsoluteBoundary(target, e.boundaries.goos)
+		return normalized, ok
+	}
+	return "", false
+}
+
+func (e *Evaluator) posixPathFactValue(facts []posixPathFact, target string) (exists, known bool) {
+	for index := len(facts) - 1; index >= 0; index-- {
+		fact := facts[index]
+		if e.boundaries.sameBoundaryObject(target, fact.path) {
+			return fact.exists, true
+		}
+		if !fact.exists && e.boundaries.boundaryObjectContains(fact.path, target) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func (e *Evaluator) posixCWDTargetInvalidated(call *syntax.CallExpr, current posixCWDState, target string) bool {
+	if e.boundaries.sameBoundaryObject(target, current.path) {
+		return false
+	}
+	for index := len(current.facts) - 1; index >= 0; index-- {
+		fact := current.facts[index]
+		if !e.boundaries.sameBoundaryObject(target, fact.path) && !e.boundaries.boundaryObjectContains(fact.path, target) {
+			continue
+		}
+		if fact.exists && e.boundaries.sameBoundaryObject(target, fact.path) {
 			return false
 		}
-		argv[i] = literalArg{value: value, static: true}
+		return !fact.exists
 	}
-	unwrapped, unwrapGap, envDump := unwrapPOSIX(argv, false)
-	return unwrapGap == nil && !envDump && inputDrivenInteractive(unwrapped)
+	// A literal target that existed while the request was classified is treated
+	// as the successful branch. A missing literal target preserves the original
+	// CWD as the only high-confidence branch.
+	if e.boundaries.goos == runtime.GOOS {
+		info, err := os.Stat(filepath.FromSlash(target))
+		return err != nil || !info.IsDir()
+	}
+	_ = call
+	return false
 }
 
-func exactInteractiveArgv(values []string) bool {
-	if len(values) == 1 {
-		return isInteractiveExecutable(posixExecutableBase(values[0]))
+func (e *Evaluator) posixCallSuccessState(call *syntax.CallExpr, current posixCWDState) posixCWDState {
+	if call == nil || len(call.Args) == 0 {
+		return current
 	}
-	return len(values) == 2 && values[1] == "-i" &&
-		isExplicitInteractiveFlagExecutable(posixExecutableBase(values[0]))
-}
-
-func isExplicitInteractiveFlagExecutable(base string) bool {
-	if isPythonExecutable(base) {
-		return true
+	argv := make([]literalArg, len(call.Args))
+	for index, word := range call.Args {
+		argv[index].value, argv[index].static = literalWord(word)
+		if !argv[index].static {
+			return current
+		}
 	}
+	unwrapped, _, envDump := unwrapPOSIX(argv, true)
+	if envDump || len(unwrapped) == 0 || !unwrapped[0].static {
+		return current
+	}
+	base := posixExecutableBase(unwrapped[0].value)
+	args := unwrapped[1:]
+	var removed, created []string
 	switch base {
-	case "bash", "sh", "zsh", "node":
-		return true
-	default:
-		return false
+	case "rm", "rmdir", "unlink":
+		removed = e.posixStaticOperands(args, current, nil)
+	case "mv":
+		operands := e.posixStaticOperands(args, current, map[string]bool{"-t": true, "--target-directory": true})
+		if len(operands) >= 2 {
+			removed = operands[:len(operands)-1]
+		}
+	case "find":
+		if hasLiteral(args, "-delete") && !findHasNarrowingExpression(args) {
+			paths, _ := reviewedFindSearchPaths(args)
+			removed = e.posixResolvedOperands(paths, current)
+		}
+	case "mkdir":
+		created = e.posixStaticOperands(args, current, map[string]bool{"-m": true, "--mode": true, "-Z": true, "--context": true})
 	}
+	for _, target := range removed {
+		current.facts = appendPathFact(current.facts, posixPathFact{path: target})
+	}
+	for _, target := range created {
+		current.facts = appendPathFact(current.facts, posixPathFact{path: target, exists: true})
+	}
+	return current
 }
 
-func isInteractiveExecutable(base string) bool {
-	if isPythonExecutable(base) {
-		return true
-	}
-	switch base {
-	case "bash", "sh", "zsh", "node", "ruby", "perl",
-		"psql", "mysql", "mariadb", "sqlite3", "sqlplus", "mongosh",
-		"powershell", "pwsh", "cmd":
-		return true
-	default:
-		return false
-	}
-}
-
-// inputDrivenInteractive recognizes only literal invocations that start a
-// shell/REPL or read executable input from the still-open tool stdin. It runs
-// after benign wrappers such as env and command are removed, preventing one
-// approved tool call from becoming an unobserved command channel.
-func inputDrivenInteractive(argv []literalArg) bool {
-	if len(argv) == 0 {
-		return false
-	}
-	values := make([]string, len(argv))
-	for index, arg := range argv {
+func (e *Evaluator) posixStaticOperands(args []literalArg, current posixCWDState, valueOptions map[string]bool) []string {
+	var operands []literalArg
+	optionsDone := false
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
 		if !arg.static {
-			return false
+			return nil
 		}
-		values[index] = arg.value
+		if !optionsDone && arg.value == "--" {
+			optionsDone = true
+			continue
+		}
+		if !optionsDone && strings.HasPrefix(arg.value, "-") && arg.value != "-" {
+			if valueOptions != nil && valueOptions[arg.value] {
+				index++
+				if index >= len(args) || !args[index].static {
+					return nil
+				}
+			}
+			continue
+		}
+		operands = append(operands, arg)
 	}
-	if exactInteractiveArgv(values) {
-		return true
+	return e.posixResolvedOperands(operands, current)
+}
+
+func (e *Evaluator) posixResolvedOperands(args []literalArg, current posixCWDState) []string {
+	result := make([]string, 0, len(args))
+	for _, arg := range args {
+		if !arg.static || !current.known && !e.boundaries.isAbsoluteCandidate(arg.value) {
+			return nil
+		}
+		target := arg.value
+		if !e.boundaries.isAbsoluteCandidate(target) {
+			target = path.Join(current.path, target)
+		}
+		normalized, ok := normalizeAbsoluteBoundary(target, e.boundaries.goos)
+		if !ok {
+			return nil
+		}
+		result = append(result, normalized)
 	}
-	base := posixExecutableBase(values[0])
-	args := values[1:]
-	if isPythonExecutable(base) {
-		return pythonReadsToolInput(args)
+	return result
+}
+
+func appendPathFact(facts []posixPathFact, fact posixPathFact) []posixPathFact {
+	copyOfFacts := append([]posixPathFact(nil), facts...)
+	return append(copyOfFacts, fact)
+}
+
+func (e *Evaluator) posixCallCWDState(call *syntax.CallExpr, current posixCWDState) posixCWDState {
+	if call == nil || len(call.Args) == 0 {
+		return current
 	}
-	switch base {
-	case "bash", "sh", "zsh":
-		parsed := parseShellInvocation(base, argv[1:])
-		return parsed.known && parsed.readsStdin
-	case "node":
-		return nodeReadsToolInput(args)
-	case "psql":
-		return psqlOptionOnlyInvocation(args)
-	case "mysql", "mariadb":
-		return mysqlOptionOnlyInvocation(args)
-	default:
-		return false
+	argv := make([]literalArg, len(call.Args))
+	dynamicArgument := false
+	for index, word := range call.Args {
+		argv[index].value, argv[index].static = literalWord(word)
+		if !argv[index].static {
+			if index == 0 {
+				return current
+			}
+			dynamicArgument = true
+		}
 	}
+	if dynamicArgument {
+		base := posixExecutableBase(argv[0].value)
+		if base == "cd" || base == "pushd" || base == "popd" || base == "builtin" {
+			return posixCWDState{path: current.path, known: false}
+		}
+		return current
+	}
+	unwrapped, _, envDump := unwrapPOSIX(argv, true)
+	if envDump || len(unwrapped) == 0 || !unwrapped[0].static {
+		return current
+	}
+	base := posixExecutableBase(unwrapped[0].value)
+	args := unwrapped[1:]
+	if base == "builtin" && len(unwrapped) > 1 && unwrapped[1].static {
+		base = unwrapped[1].value
+		args = unwrapped[2:]
+	}
+	if base == "popd" {
+		return posixCWDState{path: current.path, known: false}
+	}
+	if base == "pushd" {
+		if len(args) != 1 || !args[0].static || strings.HasPrefix(args[0].value, "+") || strings.HasPrefix(args[0].value, "-") {
+			return posixCWDState{path: current.path, known: false}
+		}
+		if !current.known && !e.boundaries.isAbsoluteCandidate(args[0].value) {
+			return posixCWDState{path: current.path, known: false}
+		}
+		resolved, known := e.boundaries.resolveKnownDirectory(current.path, args[0].value)
+		if !known {
+			return posixCWDState{path: current.path, known: false}
+		}
+		return posixCWDState{path: resolved, known: true}
+	}
+	if base != "cd" {
+		return current
+	}
+	targetIndex := 0
+	for targetIndex < len(args) {
+		value := args[targetIndex].value
+		if value == "--" {
+			targetIndex++
+			break
+		}
+		if value == "-L" || value == "-P" || value == "-e" || value == "-@" {
+			targetIndex++
+			continue
+		}
+		if strings.HasPrefix(value, "-") {
+			return posixCWDState{path: current.path, known: false}
+		}
+		break
+	}
+	if targetIndex >= len(args) || len(args[targetIndex:]) != 1 || !args[targetIndex].static {
+		return posixCWDState{path: current.path, known: false}
+	}
+	target := strings.TrimSpace(args[targetIndex].value)
+	if target == "" {
+		return posixCWDState{path: current.path, known: false}
+	}
+	if !current.known && !e.boundaries.isAbsoluteCandidate(target) {
+		return posixCWDState{path: current.path, known: false}
+	}
+	resolved, known := e.boundaries.resolveKnownDirectory(current.path, target)
+	if !known {
+		return posixCWDState{path: current.path, known: false}
+	}
+	return posixCWDState{path: resolved, known: true}
+}
+
+func (e *Evaluator) posixWrapperCWDState(argv []literalArg, current posixCWDState) posixCWDState {
+	if len(argv) == 0 || !argv[0].static || posixExecutableBase(argv[0].value) != "env" {
+		return current
+	}
+	for index := 1; index < len(argv); index++ {
+		arg := argv[index]
+		if !arg.static {
+			return posixCWDState{path: current.path, known: false}
+		}
+		value := arg.value
+		if value == "--" {
+			break
+		}
+		var target string
+		switch {
+		case value == "-C" || value == "--chdir":
+			if index+1 >= len(argv) || !argv[index+1].static {
+				return posixCWDState{path: current.path, known: false}
+			}
+			index++
+			target = argv[index].value
+		case strings.HasPrefix(value, "--chdir=") && len(value) > len("--chdir="):
+			target = strings.TrimPrefix(value, "--chdir=")
+		case isAssignment(value) || value == "-i" || value == "--ignore-environment" || value == "-0" || value == "--null":
+			continue
+		case value == "-u" || value == "--unset":
+			index++
+			continue
+		case strings.HasPrefix(value, "--unset="):
+			continue
+		default:
+			return current
+		}
+		if target == "" || !current.known && !e.boundaries.isAbsoluteCandidate(target) {
+			current.known = false
+			continue
+		}
+		resolved, known := e.boundaries.resolveKnownDirectory(current.path, target)
+		if !known {
+			current.known = false
+			continue
+		}
+		current = posixCWDState{path: resolved, known: true}
+	}
+	return current
 }
 
 type shellInvocation struct {
@@ -368,10 +742,12 @@ func reviewedShellShortCluster(base, value string) (command, stdin, noExec, ok b
 	switch base {
 	case "bash":
 		allowed = "abefhklmnptuvxBCHPirsDc"
-	case "sh":
+	case "sh", "dash":
 		allowed = "aefnuvxilsc"
 	case "zsh":
 		allowed = "dfilnsvxXc"
+	case "ksh", "mksh":
+		allowed = "cl"
 	default:
 		return false, false, false, false
 	}
@@ -415,191 +791,6 @@ func reviewedShellValueOption(base, value string) bool {
 	return false
 }
 
-func pythonReadsToolInput(args []string) bool {
-	interactive := false
-	for index := 0; index < len(args); index++ {
-		value := args[index]
-		if stringIn(value, []string{"-h", "--help", "-V", "--version", "-VV"}) {
-			return false
-		}
-		if value == "-i" {
-			interactive = true
-			continue
-		}
-		if len(value) > 2 && value[0] == '-' && value[1] != '-' {
-			cluster := value[1:]
-			valid := true
-			for _, flag := range cluster {
-				if !strings.ContainsRune("iquBbEIOPsSvx", flag) {
-					valid = false
-					break
-				}
-				interactive = interactive || flag == 'i'
-			}
-			if valid {
-				continue
-			}
-		}
-		if stringIn(value, []string{"-q", "-u", "-B", "-b", "-bb", "-E", "-I", "-O", "-OO", "-P", "-s", "-S", "-v", "-x"}) {
-			continue
-		}
-		if value == "-W" || value == "-X" {
-			if index+1 >= len(args) {
-				return false
-			}
-			index++
-			continue
-		}
-		if strings.HasPrefix(value, "-W") && len(value) > 2 || strings.HasPrefix(value, "-X") && len(value) > 2 {
-			continue
-		}
-		if value == "--check-hash-based-pycs" {
-			if index+1 >= len(args) || !stringIn(args[index+1], []string{"default", "always", "never"}) {
-				return false
-			}
-			index++
-			continue
-		}
-		if strings.HasPrefix(value, "--check-hash-based-pycs=") {
-			if !stringIn(strings.TrimPrefix(value, "--check-hash-based-pycs="), []string{"default", "always", "never"}) {
-				return false
-			}
-			continue
-		}
-		if value == "-c" || value == "-m" {
-			return interactive && index+1 < len(args)
-		}
-		if value == "-" {
-			return true
-		}
-		if value == "--" {
-			return interactive || index+1 == len(args)
-		}
-		if strings.HasPrefix(value, "-") {
-			return false
-		}
-		return interactive
-	}
-	return true
-}
-
-func nodeReadsToolInput(args []string) bool {
-	interactive := false
-	for index := 0; index < len(args); index++ {
-		value := args[index]
-		if stringIn(value, []string{"-h", "--help", "-v", "--version"}) {
-			return false
-		}
-		if value == "-i" || value == "--interactive" {
-			interactive = true
-			continue
-		}
-		if stringIn(value, []string{"--experimental-repl-await", "--no-warnings", "--trace-warnings"}) {
-			continue
-		}
-		if nodeValueOption(value) {
-			if index+1 >= len(args) || args[index+1] == "" {
-				return false
-			}
-			if value == "--input-type" && !validNodeInputType(args[index+1]) {
-				return false
-			}
-			index++
-			continue
-		}
-		if nodeAssignedValueOption(value) {
-			continue
-		}
-		if value == "-e" || value == "--eval" || value == "-p" || value == "--print" {
-			return interactive && index+1 < len(args)
-		}
-		if strings.HasPrefix(value, "--eval=") || strings.HasPrefix(value, "--print=") ||
-			strings.HasPrefix(value, "-e") && len(value) > 2 || strings.HasPrefix(value, "-p") && len(value) > 2 {
-			return interactive
-		}
-		if value == "-" {
-			return true
-		}
-		if value == "--" {
-			return interactive || index+1 == len(args)
-		}
-		if strings.HasPrefix(value, "-") {
-			return false
-		}
-		return interactive
-	}
-	return true
-}
-
-func nodeValueOption(value string) bool {
-	return stringIn(value, []string{"--input-type", "--require", "-r"})
-}
-
-func nodeAssignedValueOption(value string) bool {
-	if strings.HasPrefix(value, "--input-type=") {
-		return validNodeInputType(strings.TrimPrefix(value, "--input-type="))
-	}
-	if strings.HasPrefix(value, "--require=") && len(value) > len("--require=") {
-		return true
-	}
-	return strings.HasPrefix(value, "-r") && len(value) > 2
-}
-
-func validNodeInputType(value string) bool {
-	return stringIn(value, []string{"commonjs", "module", "commonjs-typescript", "module-typescript"})
-}
-
-func psqlOptionOnlyInvocation(args []string) bool {
-	return reviewedOptionOnlyInvocation(args,
-		[]string{"-a", "--echo-all", "-e", "--echo-queries", "-E", "--echo-hidden", "-n", "--no-readline", "-q", "--quiet", "-s", "--single-step", "-S", "--single-line", "-w", "--no-password", "-W", "--password", "-X", "--no-psqlrc"},
-		[]string{"-d", "--dbname", "-h", "--host", "-p", "--port", "-U", "--username", "-v", "--set", "-P", "--pset"})
-}
-
-func mysqlOptionOnlyInvocation(args []string) bool {
-	filtered := make([]string, 0, len(args))
-	for _, value := range args {
-		if strings.HasPrefix(value, "--password=") || strings.HasPrefix(value, "-p") && len(value) > 2 {
-			continue
-		}
-		filtered = append(filtered, value)
-	}
-	return reviewedOptionOnlyInvocation(filtered,
-		[]string{"-A", "--no-auto-rehash", "--auto-rehash", "--compress", "--ssl", "-q", "--quick", "-s", "--silent", "-N", "--skip-column-names", "-p", "--password"},
-		[]string{"-D", "--database", "-h", "--host", "-P", "--port", "-S", "--socket", "-u", "--user", "--protocol", "--default-character-set"})
-}
-
-func reviewedOptionOnlyInvocation(args, flags, valueOptions []string) bool {
-	if len(args) == 0 {
-		return true
-	}
-	for index := 0; index < len(args); index++ {
-		value := args[index]
-		if stringIn(value, flags) {
-			continue
-		}
-		matched := false
-		for _, option := range valueOptions {
-			if value == option {
-				if index+1 >= len(args) || args[index+1] == "" || strings.HasPrefix(args[index+1], "-") {
-					return false
-				}
-				index++
-				matched = true
-				break
-			}
-			if strings.HasPrefix(value, option+"=") && len(value) > len(option)+1 ||
-				len(option) == 2 && strings.HasPrefix(value, option) && len(value) > 2 {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	return true
-}
-
 func stringIn(value string, candidates []string) bool {
 	for _, candidate := range candidates {
 		if value == candidate {
@@ -609,7 +800,7 @@ func stringIn(value string, candidates []string) bool {
 	return false
 }
 
-func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth int, resolvePWD bool) scanResult {
+func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth int, resolvePWD, cwdUncertain bool) scanResult {
 	if len(call.Args) == 0 {
 		return scanResult{}
 	}
@@ -617,6 +808,9 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 	result := scanResult{}
 	for i, word := range call.Args {
 		argv[i].value, argv[i].static = literalWord(word)
+		if resolved, exact := exactHomeWord(word, e.boundaries.home); exact {
+			argv[i].value, argv[i].static = resolved, true
+		}
 		if resolvePWD && !argv[i].static {
 			if resolved, exact := exactPWDWord(word, cwd); exact {
 				argv[i].value, argv[i].static = resolved, true
@@ -629,6 +823,8 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 	if !argv[0].static {
 		return result
 	}
+	effectiveCWD := e.posixWrapperCWDState(argv, posixCWDState{path: cwd, known: !cwdUncertain})
+	cwd, cwdUncertain = effectiveCWD.path, !effectiveCWD.known
 
 	unwrapped, unwrapGap, envDump := unwrapPOSIX(argv, true)
 	result.addGap(unwrapGap)
@@ -639,9 +835,6 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 		return result
 	}
 	base := posixExecutableBase(unwrapped[0].value)
-	if hasNohupWrapper(argv) && inputDrivenInteractive(unwrapped) {
-		result.addGap(gap("nohup_stdin_semantics", "Nohup stdin behavior is outside interactive-session classification."))
-	}
 	if knownInformationalInterpreterInvocation(base, unwrapped[1:]) {
 		return result
 	}
@@ -650,7 +843,7 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 			result.addGap(gap("dynamic_interpreter_payload", "A nested shell payload is not a static literal."))
 			return result
 		}
-		result.merge(e.evaluatePOSIX(script, cwd, depth+1))
+		result.merge(e.evaluatePOSIXWithCWD(script, cwd, depth+1, !cwdUncertain))
 		return result
 	}
 	if isInterpreterPayload(base, unwrapped[1:]) {
@@ -660,49 +853,14 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 		result.addGap(gap("opaque_command_dispatch", "A command dispatcher payload is outside Ward command classification."))
 	}
 
-	if ruleID, matched, ambiguous := e.matchAdditiveCommand(unwrapped, false); matched {
-		return denied(ruleID, additiveReason)
-	} else if ambiguous {
-		result.addGap(gap("dynamic_additive_prefix", "An additive command prefix contains runtime expansion."))
-	}
 	operationArgs, operationGap := unwrapOperationGlobalOptions(base, unwrapped[1:])
 	result.addGap(operationGap)
 
-	if base == "rsync" {
-		result.merge(e.evaluateRsyncFileOptions(unwrapped[1:], cwd))
+	if base == "mv" {
+		result.merge(e.evaluateMoveAncestors(unwrapped[1:], cwd, cwdUncertain))
 		if result.deny != nil {
 			return result
 		}
-	} else if isPatternFileCommand(base) {
-		result.merge(e.evaluatePatternFileCommand(base, unwrapped[1:], cwd))
-		if result.deny != nil {
-			return result
-		}
-	} else if isFileAccessCommand(base) || base == "source" || base == "." {
-		if base == "mv" {
-			result.merge(e.evaluateMoveAncestors(unwrapped[1:], cwd))
-			if result.deny != nil {
-				return result
-			}
-		}
-		for _, arg := range unwrapped[1:] {
-			if !arg.static || strings.HasPrefix(arg.value, "-") {
-				continue
-			}
-			candidate := arg.value
-			if base == "dd" {
-				name, value, found := strings.Cut(candidate, "=")
-				if found && (name == "if" || name == "of") {
-					candidate = value
-				}
-			}
-			if ruleID, protected := e.matchProtectedPath(candidate, cwd, false); protected {
-				return denied(ruleID, secretReason)
-			}
-		}
-	}
-	if ruleID, protected := e.secretTransferPath(base, unwrapped[1:], cwd); protected {
-		return denied(ruleID, secretReason)
 	}
 
 	switch base {
@@ -710,41 +868,53 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 		if hasRMInformationalOption(unwrapped[1:]) {
 			return result
 		}
-		result.merge(e.evaluateDeleteTargets(unwrapped[1:], cwd))
+		result.merge(e.evaluateDeleteTargets(unwrapped[1:], cwd, cwdUncertain))
 		if result.deny != nil {
 			return result
 		}
 		if recursiveRMHasUnresolvedHome(unwrapped[1:]) {
 			result.addGap(gap("unresolved_home_target", "A recursive deletion target uses unresolved home expansion."))
 		}
-		if catastrophicRM(unwrapped[1:], cwd) {
+		if e.catastrophicRM(unwrapped[1:], cwd, cwdUncertain) {
 			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
 		}
 	case "unlink", "rmdir":
-		result.merge(e.evaluateDeleteTargets(unwrapped[1:], cwd))
+		if hasSimpleInformationalOption(unwrapped[1:]) {
+			return result
+		}
+		result.merge(e.evaluateDeleteTargets(unwrapped[1:], cwd, cwdUncertain))
 		if result.deny != nil {
 			return result
 		}
+		if base == "rmdir" && rmdirParentsEnabled(unwrapped[1:]) {
+			result.merge(e.evaluateParentRemovalTargets(unwrapped[1:], cwd, cwdUncertain))
+			if result.deny != nil {
+				return result
+			}
+		}
 	case "find":
-		result.merge(e.evaluateFindPaths(unwrapped[1:], cwd))
+		result.merge(e.evaluateFindPaths(unwrapped[1:], cwd, cwdUncertain))
 		if result.deny != nil {
 			return result
 		}
 		if hasFindCommandAction(unwrapped[1:]) {
 			result.addGap(gap("find_command_action", "A find command action is outside Ward command classification."))
 		}
-		if catastrophicFind(unwrapped[1:], cwd) {
-			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
-		}
 	case "git":
 		if literalAt(operationArgs, 0, "rm") {
-			result.merge(e.evaluateDeleteTargets(operationArgs[1:], cwd))
+			if gitSubcommandDryRun(operationArgs[1:]) {
+				return result
+			}
+			result.merge(e.evaluateDeleteTargets(operationArgs[1:], cwd, cwdUncertain))
 			if result.deny != nil {
 				return result
 			}
 		}
 		if literalAt(operationArgs, 0, "mv") {
-			result.merge(e.evaluateMoveAncestors(operationArgs[1:], cwd))
+			if gitSubcommandDryRun(operationArgs[1:]) {
+				return result
+			}
+			result.merge(e.evaluateMoveAncestors(operationArgs[1:], cwd, cwdUncertain))
 			if result.deny != nil {
 				return result
 			}
@@ -796,9 +966,30 @@ func hasRMInformationalOption(args []literalArg) bool {
 	return false
 }
 
-func hasNohupWrapper(argv []literalArg) bool {
-	for _, arg := range argv {
-		if arg.static && posixExecutableBase(arg.value) == "nohup" {
+func hasSimpleInformationalOption(args []literalArg) bool {
+	for _, arg := range args {
+		if !arg.static {
+			return false
+		}
+		if arg.value == "--" {
+			return false
+		}
+		if arg.value == "--help" || arg.value == "--version" {
+			return true
+		}
+	}
+	return false
+}
+
+func gitSubcommandDryRun(args []literalArg) bool {
+	for _, arg := range args {
+		if !arg.static {
+			return false
+		}
+		if arg.value == "--" {
+			return false
+		}
+		if arg.value == "-n" || arg.value == "--dry-run" {
 			return true
 		}
 	}
@@ -1061,22 +1252,161 @@ func validDockerGlobalOptionValue(name, value string) bool {
 	return true
 }
 
-func (e *Evaluator) evaluateFindPaths(args []literalArg, cwd string) scanResult {
+func (e *Evaluator) evaluateFindPaths(args []literalArg, cwd string, cwdUncertain bool) scanResult {
 	result := scanResult{}
 	deleteOperation := hasLiteral(args, "-delete")
-	for _, arg := range args {
+	if deleteOperation && findHasNarrowingExpression(args) {
+		result.addGap(gap("find_command_action", "A find selection expression narrows the delete operation."))
+		return result
+	}
+	dereferenceCommandLine := findDereferencesCommandLine(args)
+	paths, pathGap := reviewedFindSearchPaths(args)
+	result.addGap(pathGap)
+	for _, arg := range paths {
 		if !arg.static {
 			result.addGap(gap("dynamic_find_path", "A find search path contains runtime expansion or globbing."))
 			continue
 		}
-		if strings.HasPrefix(arg.value, "-") || arg.value == "!" || arg.value == "(" {
-			break
-		}
-		if ruleID, protected := e.matchProtectedPath(arg.value, cwd, deleteOperation); protected {
-			return denied(ruleID, secretReason)
+		if deleteOperation {
+			candidate, ambiguous := e.candidateAtCWD(arg.value, cwd, cwdUncertain)
+			protected := false
+			if !ambiguous {
+				if dereferenceCommandLine {
+					protected = e.boundaries.protectsDereferencedRecursiveDelete(candidate)
+				} else {
+					protected = e.boundaries.protectsRecursiveDelete(candidate)
+				}
+			}
+			if ambiguous {
+				result.addGap(gap("dynamic_path", "A relative find target depends on a prior current-directory change."))
+			} else if protected {
+				return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
+			}
 		}
 	}
 	return result
+}
+
+func findHasNarrowingExpression(args []literalArg) bool {
+	index := 0
+	for index < len(args) {
+		if !args[index].static {
+			return true
+		}
+		switch args[index].value {
+		case "-H", "-L", "-P", "-E", "-X", "-x":
+			index++
+			continue
+		case "-D":
+			if index+1 >= len(args) || !args[index+1].static {
+				return true
+			}
+			index += 2
+			continue
+		}
+		if isGNUFindOptimizationOption(args[index].value) {
+			index++
+			continue
+		}
+		break
+	}
+	if index < len(args) && args[index].static && args[index].value == "--" {
+		index++
+	}
+	for index < len(args) {
+		arg := args[index]
+		if !arg.static {
+			return true
+		}
+		if strings.HasPrefix(arg.value, "-") || arg.value == "!" || arg.value == "(" {
+			break
+		}
+		index++
+	}
+	for ; index < len(args); index++ {
+		if !args[index].static {
+			return true
+		}
+		switch args[index].value {
+		case "-delete", "-depth":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func findDereferencesCommandLine(args []literalArg) bool {
+	dereference := false
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static || arg.value == "--" {
+			return dereference
+		}
+		switch arg.value {
+		case "-H", "-L":
+			dereference = true
+		case "-P":
+			dereference = false
+		case "-E", "-X", "-x":
+			continue
+		case "-D":
+			index++
+		default:
+			if !isGNUFindOptimizationOption(arg.value) {
+				return dereference
+			}
+		}
+	}
+	return dereference
+}
+
+func reviewedFindSearchPaths(args []literalArg) ([]literalArg, *contract.CoverageGap) {
+	index := 0
+	for index < len(args) {
+		if !args[index].static {
+			return nil, gap("dynamic_find_path", "A find search path contains runtime expansion or globbing.")
+		}
+		switch args[index].value {
+		case "-H", "-L", "-P", "-E", "-X", "-x":
+			index++
+			continue
+		case "-D":
+			if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+				return nil, gap("complex_find_options", "A find debug option is missing its literal value.")
+			}
+			index += 2
+			continue
+		}
+		if isGNUFindOptimizationOption(args[index].value) {
+			index++
+			continue
+		}
+		break
+	}
+	if index < len(args) && args[index].static && args[index].value == "--" {
+		index++
+	}
+	paths := make([]literalArg, 0, len(args)-index)
+	for ; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return paths, gap("dynamic_find_path", "A find search path contains runtime expansion or globbing.")
+		}
+		if strings.HasPrefix(arg.value, "-") || arg.value == "!" || arg.value == "(" {
+			break
+		}
+		paths = append(paths, arg)
+	}
+	return paths, nil
+}
+
+func isGNUFindOptimizationOption(value string) bool {
+	if len(value) != 3 || !strings.HasPrefix(value, "-O") {
+		return false
+	}
+	return value[2] >= '0' && value[2] <= '3'
 }
 
 func hasFindCommandAction(args []literalArg) bool {
@@ -1133,6 +1463,22 @@ func exactPWDWord(word *syntax.Word, cwd string) (string, bool) {
 	switch suffix.String() {
 	case "", "/", "/.", "/./":
 		return path.Clean(strings.ReplaceAll(cwd, `\`, "/")), true
+	default:
+		return "", false
+	}
+}
+
+func exactHomeWord(word *syntax.Word, home string) (string, bool) {
+	if word == nil || len(word.Parts) != 1 || home == "" {
+		return "", false
+	}
+	literal, ok := word.Parts[0].(*syntax.Lit)
+	if !ok {
+		return "", false
+	}
+	switch literal.Value {
+	case "~", "~/", "~/.", "~/./":
+		return home, true
 	default:
 		return "", false
 	}
@@ -1223,8 +1569,54 @@ func unwrapPOSIX(argv []literalArg, unwrapNohup bool) ([]literalArg, *contract.C
 				return current, gap("complex_command_wrapper", "A command wrapper is outside Ward classification."), false
 			}
 			current = current[i:]
+		case "exec":
+			i := 1
+			for i < len(current) {
+				if !current[i].static {
+					return current, gap("dynamic_wrapper", "An exec wrapper contains runtime expansion."), false
+				}
+				value := current[i].value
+				if value == "--" {
+					i++
+					break
+				}
+				switch value {
+				case "-c", "-l":
+					i++
+					continue
+				case "-a":
+					if i+1 >= len(current) || !current[i+1].static {
+						return current, gap("complex_command_wrapper", "An exec argv-zero override is missing or dynamic."), false
+					}
+					i += 2
+					continue
+				}
+				if strings.HasPrefix(value, "-") {
+					return current, gap("complex_command_wrapper", "An exec option is outside Ward wrapper classification."), false
+				}
+				break
+			}
+			if i >= len(current) {
+				return nil, nil, true
+			}
+			if !current[i].static || strings.HasPrefix(current[i].value, "-") {
+				return current, gap("complex_command_wrapper", "An exec command is outside Ward wrapper classification."), false
+			}
+			current = current[i:]
 		case "builtin":
 			return current, gap("builtin_dispatch", "A shell builtin dispatcher is outside Ward wrapper classification."), false
+		case "busybox":
+			if len(current) == 1 {
+				return current, nil, false
+			}
+			i := 1
+			if current[i].static && current[i].value == "--" {
+				i++
+			}
+			if i >= len(current) || !current[i].static || strings.HasPrefix(current[i].value, "-") {
+				return current, gap("complex_command_wrapper", "A BusyBox applet is outside Ward wrapper classification."), false
+			}
+			current = current[i:]
 		case "nohup":
 			if !unwrapNohup {
 				return current, gap("nohup_stdin_semantics", "Nohup stdin behavior is outside interactive-session classification."), false
@@ -1240,23 +1632,176 @@ func unwrapPOSIX(argv []literalArg, unwrapNohup bool) ([]literalArg, *contract.C
 				return current, gap("complex_nohup_wrapper", "A nohup wrapper is outside Ward classification."), false
 			}
 			current = current[i:]
+		case "timeout":
+			i := 1
+			for i < len(current) {
+				if !current[i].static {
+					return current, gap("dynamic_wrapper", "A timeout wrapper contains runtime expansion."), false
+				}
+				value := current[i].value
+				if value == "--" {
+					i++
+					break
+				}
+				if value == "--preserve-status" || value == "--foreground" || value == "--verbose" {
+					i++
+					continue
+				}
+				if value == "-s" || value == "--signal" || value == "-k" || value == "--kill-after" {
+					if i+1 >= len(current) || !current[i+1].static {
+						return current, gap("complex_timeout_wrapper", "A timeout option value is missing or dynamic."), false
+					}
+					i += 2
+					continue
+				}
+				if strings.HasPrefix(value, "--signal=") || strings.HasPrefix(value, "--kill-after=") {
+					i++
+					continue
+				}
+				break
+			}
+			if i >= len(current) || !current[i].static || !reviewedTimeoutDuration(current[i].value) {
+				return current, gap("complex_timeout_wrapper", "A timeout duration is missing or outside Ward classification."), false
+			}
+			i++
+			if i >= len(current) {
+				return current, nil, false
+			}
+			current = current[i:]
+		case "nice":
+			i := 1
+			if i < len(current) && current[i].static && current[i].value == "--" {
+				i++
+			} else if i < len(current) && current[i].static && (current[i].value == "-n" || current[i].value == "--adjustment") {
+				if i+1 >= len(current) || !current[i+1].static || !signedDecimal(current[i+1].value) {
+					return current, gap("complex_nice_wrapper", "A nice adjustment is missing or invalid."), false
+				}
+				i += 2
+			} else if i < len(current) && current[i].static && strings.HasPrefix(current[i].value, "--adjustment=") {
+				if !signedDecimal(strings.TrimPrefix(current[i].value, "--adjustment=")) {
+					return current, gap("complex_nice_wrapper", "A nice adjustment is invalid."), false
+				}
+				i++
+			} else if i < len(current) && current[i].static && len(current[i].value) > 1 && current[i].value[0] == '-' && signedDecimal(current[i].value) {
+				i++
+			}
+			if i >= len(current) {
+				return current, nil, false
+			}
+			current = current[i:]
+		case "setsid":
+			i := 1
+			for i < len(current) && current[i].static {
+				if current[i].value == "--" {
+					i++
+					break
+				}
+				if current[i].value == "-f" || current[i].value == "--fork" || current[i].value == "-w" || current[i].value == "--wait" || current[i].value == "-c" || current[i].value == "--ctty" {
+					i++
+					continue
+				}
+				break
+			}
+			if i >= len(current) {
+				return current, nil, false
+			}
+			if !current[i].static || strings.HasPrefix(current[i].value, "-") {
+				return current, gap("complex_setsid_wrapper", "A setsid wrapper is outside Ward classification."), false
+			}
+			current = current[i:]
+		case "time":
+			i := 1
+			if i < len(current) && current[i].static && (current[i].value == "--" || current[i].value == "-p" || current[i].value == "--portability") {
+				i++
+			}
+			if i >= len(current) {
+				return current, nil, false
+			}
+			if !current[i].static || strings.HasPrefix(current[i].value, "-") {
+				return current, gap("complex_time_wrapper", "A time wrapper is outside Ward classification."), false
+			}
+			current = current[i:]
 		case "sudo":
 			if len(current) == 1 {
 				return current, nil, false
 			}
-			if current[1].static && current[1].value == "--" {
-				current = current[2:]
-				continue
+			i := 1
+			for i < len(current) {
+				if !current[i].static {
+					return current, gap("complex_sudo_wrapper", "A sudo option contains runtime expansion."), false
+				}
+				value := current[i].value
+				if value == "--" {
+					i++
+					break
+				}
+				if isAssignment(value) || value == "-n" || value == "--non-interactive" {
+					i++
+					continue
+				}
+				if value == "-u" || value == "--user" {
+					if i+1 >= len(current) || !current[i+1].static {
+						return current, gap("complex_sudo_wrapper", "A sudo user option is missing or dynamic."), false
+					}
+					i += 2
+					continue
+				}
+				if strings.HasPrefix(value, "--user=") && len(value) > len("--user=") {
+					i++
+					continue
+				}
+				if strings.HasPrefix(value, "-") {
+					return current, gap("complex_sudo_wrapper", "Sudo options are outside Ward wrapper classification."), false
+				}
+				break
 			}
-			if !current[1].static || strings.HasPrefix(current[1].value, "-") {
-				return current, gap("complex_sudo_wrapper", "Sudo options are not interpreted by Ward."), false
+			if i >= len(current) {
+				return current, nil, false
 			}
-			current = current[1:]
+			current = current[i:]
 		default:
 			return current, nil, false
 		}
 	}
 	return current, nil, false
+}
+
+func reviewedTimeoutDuration(value string) bool {
+	if value == "" {
+		return false
+	}
+	digits := 0
+	dotSeen := false
+	for index, char := range value {
+		if char >= '0' && char <= '9' {
+			digits++
+			continue
+		}
+		if char == '.' && !dotSeen && index > 0 {
+			dotSeen = true
+			continue
+		}
+		return index == len(value)-1 && digits > 0 && strings.ContainsRune("smhd", char)
+	}
+	return digits > 0
+}
+
+func signedDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	if value[0] == '+' || value[0] == '-' {
+		value = value[1:]
+	}
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isAssignment(value string) bool {
@@ -1282,7 +1827,7 @@ func posixExecutableBase(value string) string {
 }
 
 func nestedShellScript(base string, args []literalArg) (nested bool, script string, known bool) {
-	if base != "bash" && base != "sh" && base != "zsh" {
+	if base != "bash" && base != "sh" && base != "zsh" && base != "dash" && base != "ksh" && base != "mksh" {
 		return false, "", false
 	}
 	parsed := parseShellInvocation(base, args)
@@ -1340,418 +1885,99 @@ func isOpaqueCommandDispatcher(base string) bool {
 	}
 }
 
-func (e *Evaluator) matchAdditiveCommand(argv []literalArg, caseFold bool) (ruleID string, matched, ambiguous bool) {
-	if len(argv) == 0 || !argv[0].static {
-		return "", false, true
-	}
-	base := posixExecutableBase(argv[0].value)
-	if caseFold {
-		base = executableBase(argv[0].value)
-	}
-	for _, rule := range e.commandRules {
-		executableMatch := base == rule.Executable
-		if caseFold {
-			executableMatch = strings.EqualFold(base, rule.Executable)
-		}
-		if !executableMatch || len(argv)-1 < len(rule.ArgsPrefix) {
-			continue
-		}
-		match := true
-		for i, expected := range rule.ArgsPrefix {
-			actual := argv[i+1]
-			if !actual.static {
-				ambiguous = true
-				match = false
-				break
-			}
-			if actual.value != expected {
-				match = false
-				break
-			}
-		}
-		if match {
-			return rule.ID, true, ambiguous
-		}
-	}
-	return "", false, ambiguous
-}
-
-func isFileAccessCommand(base string) bool {
-	switch base {
-	case "cat", "nl", "xxd", "head", "tail", "less", "more",
-		"strings", "od", "hexdump", "base64", "cp", "mv",
-		"scp", "install", "dd", "tee", "chmod", "chown", "touch",
-		"truncate", "stat", "file", "realpath", "readlink":
-		return true
-	default:
-		return false
-	}
-}
-
-func (e *Evaluator) evaluateRsyncFileOptions(args []literalArg, cwd string) scanResult {
-	result := scanResult{gap: gap("complex_file_operands", "Rsync filter and transfer operands are not fully classified.")}
+func (e *Evaluator) evaluateDeleteTargets(args []literalArg, cwd string, cwdUncertain bool) scanResult {
+	result := scanResult{}
+	optionsDone := false
 	for _, arg := range args {
 		if !arg.static {
-			return result
-		}
-	}
-	operands := make([]string, 0, len(args))
-	optionsDone := false
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if !arg.static {
-			return result
-		}
-		value := arg.value
-		if optionsDone || value == "-" || !strings.HasPrefix(value, "-") {
-			operands = append(operands, value)
 			continue
 		}
-		if value == "--" {
+		if !optionsDone && arg.value == "--" {
 			optionsDone = true
 			continue
 		}
-		if name, assigned, found := strings.Cut(value, "="); found {
-			switch {
-			case stringIn(name, rsyncPathValueOptions()):
-				if assigned == "" {
-					return result
-				}
-				if ruleID, protected := e.matchProtectedPath(assigned, cwd, false); protected {
-					return denied(ruleID, secretReason)
-				}
-				continue
-			case stringIn(name, rsyncNonPathValueOptions()):
-				if assigned == "" {
-					return result
-				}
-				if isRsyncRemoteShellOption(name) {
-					if ruleID, protected := e.matchRsyncRemoteShellPath(assigned, cwd); protected {
-						return denied(ruleID, secretReason)
-					}
-				}
-				continue
-			default:
-				return result
-			}
-		}
-		if stringIn(value, rsyncPathValueOptions()) || stringIn(value, rsyncNonPathValueOptions()) {
-			if i+1 >= len(args) || !args[i+1].static || args[i+1].value == "" {
-				return result
-			}
-			i++
-			if stringIn(value, rsyncPathValueOptions()) {
-				if ruleID, protected := e.matchProtectedPath(args[i].value, cwd, false); protected {
-					return denied(ruleID, secretReason)
-				}
-			} else if isRsyncRemoteShellOption(value) {
-				if ruleID, protected := e.matchRsyncRemoteShellPath(args[i].value, cwd); protected {
-					return denied(ruleID, secretReason)
-				}
-			}
+		if !optionsDone && strings.HasPrefix(arg.value, "-") {
 			continue
 		}
-		if name, assigned, attached := rsyncAttachedShortValue(value); attached {
-			if assigned == "" {
-				return result
-			}
-			if stringIn(name, rsyncPathValueOptions()) {
-				if ruleID, protected := e.matchProtectedPath(assigned, cwd, false); protected {
-					return denied(ruleID, secretReason)
-				}
-			} else if isRsyncRemoteShellOption(name) {
-				if ruleID, protected := e.matchRsyncRemoteShellPath(assigned, cwd); protected {
-					return denied(ruleID, secretReason)
-				}
-			}
+		protected, ambiguous := e.classifyCriticalMutationTarget(arg.value, cwd, cwdUncertain)
+		if ambiguous {
+			result.addGap(gap("dynamic_path", "A relative deletion target depends on a prior current-directory change."))
 			continue
 		}
-		if strings.HasPrefix(value, "--") {
-			if !stringIn(value, rsyncBooleanOptions()) {
-				return result
-			}
-			continue
-		}
-		if !rsyncShortFlagsOnly(value) {
-			return result
-		}
-	}
-	if len(operands) < 2 {
-		return result
-	}
-	for _, candidate := range operands {
-		if rsyncRemoteOperand(candidate) {
-			continue
-		}
-		if ruleID, protected := e.matchProtectedPath(candidate, cwd, false); protected {
-			return denied(ruleID, secretReason)
-		}
-	}
-	return result
-}
-
-func rsyncAttachedShortValue(value string) (name, assigned string, ok bool) {
-	if len(value) <= 2 || value[0] != '-' || value[1] == '-' {
-		return "", "", false
-	}
-	for index, flag := range value[1:] {
-		candidate := "-" + string(flag)
-		if stringIn(candidate, rsyncPathValueOptions()) || stringIn(candidate, rsyncNonPathValueOptions()) {
-			byteIndex := index + 2
-			return candidate, strings.TrimPrefix(value[byteIndex:], "="), true
-		}
-		if !strings.ContainsRune("aAbcDdFghHiIJKklLmnopPqRrstuvWxXyz", flag) {
-			return "", "", false
-		}
-	}
-	return "", "", false
-}
-
-func isRsyncRemoteShellOption(value string) bool {
-	return value == "-e" || value == "--rsh"
-}
-
-func (e *Evaluator) matchRsyncRemoteShellPath(value, cwd string) (string, bool) {
-	if value == "" || strings.ContainsAny(value, " \t\r\n'\"`$;&|<>(){}") {
-		return "", false
-	}
-	return e.matchProtectedPath(value, cwd, false)
-}
-
-func rsyncPathValueOptions() []string {
-	return []string{
-		"-T",
-		"--backup-dir", "--compare-dest", "--copy-dest", "--exclude-from", "--files-from",
-		"--include-from", "--link-dest", "--log-file", "--only-write-batch", "--partial-dir",
-		"--password-file", "--read-batch", "--temp-dir", "--write-batch",
-	}
-}
-
-func rsyncNonPathValueOptions() []string {
-	return []string{
-		"-B", "-e", "-f", "-M",
-		"--block-size", "--bwlimit", "--checksum-choice", "--chmod", "--compress-choice",
-		"--compress-level", "--contimeout", "--exclude", "--filter", "--groupmap", "--include",
-		"--max-delete", "--max-size", "--min-size", "--out-format", "--port", "--remote-option",
-		"--rsh", "--rsync-path", "--skip-compress", "--suffix", "--timeout", "--usermap",
-	}
-}
-
-func rsyncBooleanOptions() []string {
-	return []string{
-		"--acls", "--append", "--append-verify", "--archive", "--backup", "--checksum",
-		"--compress", "--copy-dirlinks", "--copy-links", "--copy-unsafe-links", "--delete",
-		"--delete-after", "--delete-before", "--delete-delay", "--delete-during", "--delete-excluded",
-		"--devices", "--dirs", "--dry-run", "--existing", "--fake-super", "--force", "--group",
-		"--hard-links", "--human-readable", "--ignore-errors", "--ignore-existing", "--itemize-changes",
-		"--keep-dirlinks", "--links", "--numeric-ids", "--one-file-system", "--owner", "--perms",
-		"--preallocate", "--progress", "--protect-args", "--quiet", "--recursive", "--relative",
-		"--remove-source-files", "--safe-links", "--sparse", "--specials", "--stats", "--times",
-		"--update", "--verbose", "--whole-file", "--xattrs",
-	}
-}
-
-func rsyncShortFlagsOnly(value string) bool {
-	if len(value) < 2 || value[0] != '-' || value[1] == '-' {
-		return false
-	}
-	for _, flag := range value[1:] {
-		if !strings.ContainsRune("aAbcDdFghHiIJKklLmnopPqRrstuvWxXyz", flag) {
-			return false
-		}
-	}
-	return true
-}
-
-func rsyncRemoteOperand(value string) bool {
-	lower := strings.ToLower(value)
-	if strings.HasPrefix(lower, "rsync://") {
-		return true
-	}
-	colon := strings.IndexByte(value, ':')
-	if colon <= 0 {
-		return false
-	}
-	if colon == 1 && len(value) >= 3 && (value[2] == '/' || value[2] == '\\') {
-		return false
-	}
-	return !strings.ContainsAny(value[:colon], "/\\")
-}
-
-func isPatternFileCommand(base string) bool {
-	switch base {
-	case "grep", "rg", "awk", "sed":
-		return true
-	default:
-		return false
-	}
-}
-
-func (e *Evaluator) evaluatePatternFileCommand(base string, args []literalArg, cwd string) scanResult {
-	result := scanResult{gap: gap("complex_file_operands", "Pattern and input-file operands are not fully classified for this command.")}
-	if base == "grep" || base == "rg" {
-		if parsed, classified := parseReviewedPatternOperands(base, args); classified {
-			for _, candidate := range append(parsed.patternFiles, parsed.paths...) {
-				if ruleID, protected := e.matchProtectedPath(candidate, cwd, false); protected {
-					return denied(ruleID, secretReason)
-				}
-			}
-		}
-	}
-	return result
-}
-
-type reviewedPatternOperands struct {
-	patternFiles []string
-	paths        []string
-}
-
-func parseReviewedPatternOperands(base string, args []literalArg) (reviewedPatternOperands, bool) {
-	parsed := reviewedPatternOperands{}
-	positionals := make([]string, 0, len(args))
-	optionsDone := false
-	patternOption := false
-	for index := 0; index < len(args); index++ {
-		arg := args[index]
-		if !arg.static {
-			return reviewedPatternOperands{}, false
-		}
-		value := arg.value
-		if !optionsDone && value == "--" {
-			optionsDone = true
-			continue
-		}
-		if !optionsDone && value != "-" && strings.HasPrefix(value, "-") {
-			if reviewedPatternBooleanOption(base, value) || reviewedPatternShortCluster(base, value) {
-				continue
-			}
-			name, attached, option := reviewedPatternValueOption(base, value)
-			if !option {
-				return reviewedPatternOperands{}, false
-			}
-			candidate := attached
-			if candidate == "" {
-				if index+1 >= len(args) || !args[index+1].static {
-					return reviewedPatternOperands{}, false
-				}
-				index++
-				candidate = args[index].value
-			}
-			patternOption = true
-			if name == "file" {
-				parsed.patternFiles = append(parsed.patternFiles, candidate)
-			}
-			continue
-		}
-		positionals = append(positionals, value)
-	}
-	if patternOption {
-		parsed.paths = positionals
-		return parsed, true
-	}
-	if len(positionals) >= 2 {
-		parsed.paths = positionals[1:]
-	}
-	return parsed, true
-}
-
-func reviewedPatternBooleanOption(base, value string) bool {
-	if stringIn(value, []string{
-		"-F", "--fixed-strings", "-H", "--with-filename", "-i", "--ignore-case",
-		"-n", "--line-number", "-q", "--quiet", "-v", "--invert-match",
-		"-w", "--word-regexp", "-x", "--line-regexp",
-	}) {
-		return true
-	}
-	switch base {
-	case "grep":
-		return stringIn(value, []string{"-h", "--no-filename", "-s", "--no-messages"})
-	case "rg":
-		return stringIn(value, []string{
-			"-I", "--no-filename", "-s", "--case-sensitive", "-S", "--smart-case",
-			"--hidden", "-U", "--multiline", "--multiline-dotall", "--no-ignore",
-		})
-	default:
-		return false
-	}
-}
-
-func reviewedPatternShortCluster(base, value string) bool {
-	if len(value) < 3 || value[0] != '-' || value[1] == '-' {
-		return false
-	}
-	allowed := "FHinqvwx"
-	if base == "grep" {
-		allowed += "hs"
-	} else if base == "rg" {
-		allowed += "ISsU"
-	}
-	for _, flag := range value[1:] {
-		if !strings.ContainsRune(allowed, flag) {
-			return false
-		}
-	}
-	return true
-}
-
-func reviewedPatternValueOption(base, value string) (name, attached string, ok bool) {
-	switch {
-	case value == "-f" || value == "--file":
-		return "file", "", true
-	case strings.HasPrefix(value, "--file=") && len(value) > len("--file="):
-		return "file", strings.TrimPrefix(value, "--file="), true
-	case value == "-e" || value == "--regexp":
-		return "regexp", "", true
-	case strings.HasPrefix(value, "--regexp=") && len(value) > len("--regexp="):
-		return "regexp", strings.TrimPrefix(value, "--regexp="), true
-	}
-	if len(value) > 2 && value[0] == '-' && value[1] != '-' {
-		allowed := "FHinqvwx"
-		if base == "grep" {
-			allowed += "hs"
-		} else if base == "rg" {
-			allowed += "ISsU"
-		}
-		for index, flag := range value[1:] {
-			if flag == 'f' || flag == 'e' {
-				byteIndex := index + 2
-				kind := "regexp"
-				if flag == 'f' {
-					kind = "file"
-				}
-				attached := value[byteIndex:]
-				if base == "rg" {
-					if attached == "=" {
-						return "", "", false
-					}
-					attached = strings.TrimPrefix(attached, "=")
-				}
-				return kind, attached, true
-			}
-			if !strings.ContainsRune(allowed, flag) {
-				return "", "", false
-			}
-		}
-	}
-	return "", "", false
-}
-
-func (e *Evaluator) evaluateDeleteTargets(args []literalArg, cwd string) scanResult {
-	for _, arg := range args {
-		if !arg.static || strings.HasPrefix(arg.value, "-") {
-			continue
-		}
-		if ruleID, protected := e.matchProtectedPath(arg.value, cwd, true); protected {
-			return denied(ruleID, secretReason)
-		}
-		if isProtectedDeleteTarget(arg.value) {
+		if protected {
 			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
 		}
 	}
-	return scanResult{}
+	return result
 }
 
-func (e *Evaluator) evaluateMoveAncestors(args []literalArg, cwd string) scanResult {
+func (e *Evaluator) evaluateParentRemovalTargets(args []literalArg, cwd string, cwdUncertain bool) scanResult {
+	result := scanResult{}
+	optionsDone := false
+	for _, arg := range args {
+		if !arg.static {
+			result.addGap(gap("dynamic_path", "A parent-removal target contains runtime expansion."))
+			continue
+		}
+		if !optionsDone && arg.value == "--" {
+			optionsDone = true
+			continue
+		}
+		if !optionsDone && strings.HasPrefix(arg.value, "-") {
+			continue
+		}
+		candidate, ambiguous := e.candidateAtCWD(arg.value, cwd, cwdUncertain)
+		if ambiguous {
+			result.addGap(gap("dynamic_path", "A relative parent-removal target depends on a prior current-directory change."))
+			continue
+		}
+		cleanedOperand := path.Clean(strings.ReplaceAll(arg.value, `\`, "/"))
+		reachesParent := e.boundaries.isAbsoluteCandidate(arg.value) || cleanedOperand == ".." || strings.HasPrefix(cleanedOperand, "../")
+		protected := e.boundaries.protectsCriticalMetadata(candidate)
+		if reachesParent {
+			protected = e.boundaries.protectsParentRemoval(candidate)
+		}
+		if protected {
+			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
+		}
+	}
+	return result
+}
+
+func rmdirParentsEnabled(args []literalArg) bool {
+	parents := false
+	for _, arg := range args {
+		if !arg.static {
+			return false
+		}
+		if arg.value == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg.value, "-") || arg.value == "-" {
+			continue
+		}
+		switch arg.value {
+		case "-p", "--parents":
+			parents = true
+		case "-v", "--verbose", "--ignore-fail-on-non-empty":
+			continue
+		default:
+			if strings.HasPrefix(arg.value, "--") {
+				return false
+			}
+			for _, flag := range arg.value[1:] {
+				if flag == 'p' {
+					parents = true
+				} else if flag != 'v' {
+					return false
+				}
+			}
+		}
+	}
+	return parents
+}
+
+func (e *Evaluator) evaluateMoveAncestors(args []literalArg, cwd string, cwdUncertain bool) scanResult {
 	operands := make([]literalArg, 0, len(args))
 	optionsDone := false
 	for _, arg := range args {
@@ -1770,10 +1996,10 @@ func (e *Evaluator) evaluateMoveAncestors(args []literalArg, cwd string) scanRes
 				continue
 			}
 			if arg.value == "-t" || arg.value == "--target-directory" {
-				return e.evaluateMoveTargetDirectory(args, cwd)
+				return e.evaluateMoveTargetDirectory(args, cwd, cwdUncertain)
 			}
 			if strings.HasPrefix(arg.value, "--target-directory=") && len(arg.value) > len("--target-directory=") {
-				return e.evaluateMoveTargetDirectory(args, cwd)
+				return e.evaluateMoveTargetDirectory(args, cwd, cwdUncertain)
 			}
 			return scanResult{gap: gap("complex_move_operands", "A move option is outside Ward source classification.")}
 		}
@@ -1782,16 +2008,23 @@ func (e *Evaluator) evaluateMoveAncestors(args []literalArg, cwd string) scanRes
 	if len(operands) < 2 {
 		return scanResult{}
 	}
+	result := scanResult{}
 	for _, source := range operands[:len(operands)-1] {
-		if ruleID, protected := e.matchProtectedPath(source.value, cwd, true); protected {
-			return denied(ruleID, secretReason)
+		protected, ambiguous := e.classifyCriticalRelocationTarget(source.value, cwd, cwdUncertain)
+		if ambiguous {
+			result.addGap(gap("dynamic_path", "A relative move source depends on a prior current-directory change."))
+			continue
+		}
+		if protected {
+			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
 		}
 	}
-	return scanResult{}
+	return result
 }
 
-func (e *Evaluator) evaluateMoveTargetDirectory(args []literalArg, cwd string) scanResult {
+func (e *Evaluator) evaluateMoveTargetDirectory(args []literalArg, cwd string, cwdUncertain bool) scanResult {
 	optionsDone := false
+	result := scanResult{}
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if !arg.static {
@@ -1818,98 +2051,36 @@ func (e *Evaluator) evaluateMoveTargetDirectory(args []literalArg, cwd string) s
 				return scanResult{gap: gap("complex_move_operands", "A move option is outside Ward source classification.")}
 			}
 		}
-		if ruleID, protected := e.matchProtectedPath(arg.value, cwd, true); protected {
-			return denied(ruleID, secretReason)
+		protected, ambiguous := e.classifyCriticalRelocationTarget(arg.value, cwd, cwdUncertain)
+		if ambiguous {
+			result.addGap(gap("dynamic_path", "A relative move source depends on a prior current-directory change."))
+			continue
+		}
+		if protected {
+			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
 		}
 	}
-	return scanResult{}
+	return result
 }
 
-func (e *Evaluator) secretTransferPath(base string, args []literalArg, cwd string) (string, bool) {
-	switch base {
-	case "curl":
-		for i, arg := range args {
-			if !arg.static {
-				continue
-			}
-			value := arg.value
-			if value == "-T" || value == "--upload-file" {
-				if i+1 < len(args) && args[i+1].static {
-					if ruleID, protected := e.matchProtectedPath(args[i+1].value, cwd, false); protected {
-						return ruleID, true
-					}
-				}
-			}
-			if value == "-d" || value == "--data" || value == "--data-binary" || value == "--data-ascii" ||
-				value == "--data-urlencode" || value == "--json" || value == "-F" || value == "--form" {
-				if i+1 < len(args) && args[i+1].static {
-					if candidate := transferCandidate(args[i+1].value); candidate != "" {
-						if ruleID, protected := e.matchProtectedPath(candidate, cwd, false); protected {
-							return ruleID, true
-						}
-					}
-				}
-			}
-			if strings.HasPrefix(value, "--upload-file=") {
-				if ruleID, protected := e.matchProtectedPath(strings.TrimPrefix(value, "--upload-file="), cwd, false); protected {
-					return ruleID, true
-				}
-			}
-			for _, prefix := range []string{"--data=", "--data-binary=", "--data-ascii=", "--data-urlencode=", "--json=", "--form="} {
-				if strings.HasPrefix(value, prefix) {
-					if candidate := transferCandidate(strings.TrimPrefix(value, prefix)); candidate != "" {
-						if ruleID, protected := e.matchProtectedPath(candidate, cwd, false); protected {
-							return ruleID, true
-						}
-					}
-				}
-			}
-		}
-	case "wget":
-		for i, arg := range args {
-			if !arg.static {
-				continue
-			}
-			if arg.value == "--post-file" && i+1 < len(args) && args[i+1].static {
-				if ruleID, protected := e.matchProtectedPath(args[i+1].value, cwd, false); protected {
-					return ruleID, true
-				}
-			}
-			if strings.HasPrefix(arg.value, "--post-file=") {
-				if ruleID, protected := e.matchProtectedPath(strings.TrimPrefix(arg.value, "--post-file="), cwd, false); protected {
-					return ruleID, true
-				}
-			}
-		}
-	}
-	return "", false
-}
-
-func transferCandidate(value string) string {
-	if before, _, found := strings.Cut(value, ";"); found {
-		value = before
-	}
-	if _, after, found := strings.Cut(value, "@"); found {
-		return after
-	}
-	if _, after, found := strings.Cut(value, "<"); found {
-		return after
-	}
-	return ""
-}
-
-func catastrophicRM(args []literalArg, cwd string) bool {
+func (e *Evaluator) catastrophicRM(args []literalArg, cwd string, cwdUncertain bool) bool {
 	if !hasRecursiveRMFlag(args) {
 		return false
 	}
+	optionsDone := false
 	for _, arg := range args {
-		if !arg.static && isRootGlob(arg.value) {
-			return true
-		}
-		if !arg.static || strings.HasPrefix(arg.value, "-") {
+		if !arg.static {
 			continue
 		}
-		if isCatastrophicTarget(arg.value, cwd) {
+		if !optionsDone && arg.value == "--" {
+			optionsDone = true
+			continue
+		}
+		if !optionsDone && strings.HasPrefix(arg.value, "-") {
+			continue
+		}
+		protected, ambiguous := e.classifyRecursiveDeleteTarget(arg.value, cwd, cwdUncertain)
+		if !ambiguous && protected {
 			return true
 		}
 	}
@@ -1933,6 +2104,9 @@ func hasRecursiveRMFlag(args []literalArg) bool {
 		if !arg.static {
 			continue
 		}
+		if arg.value == "--" {
+			break
+		}
 		if arg.value == "--recursive" || strings.HasPrefix(arg.value, "-") && !strings.HasPrefix(arg.value, "--") && strings.ContainsAny(arg.value[1:], "rR") {
 			return true
 		}
@@ -1940,116 +2114,229 @@ func hasRecursiveRMFlag(args []literalArg) bool {
 	return false
 }
 
-func isRootGlob(value string) bool {
-	switch value {
-	case "/*", "/.*", "/.?*", "/.??*", "/?*", "/??*", "/{*,.*}", "/{.*,*}":
-		return true
-	default:
-		return false
+func (e *Evaluator) candidateAtCWD(candidate, cwd string, cwdUncertain bool) (string, bool) {
+	if e.boundaries.isAbsoluteCandidate(candidate) {
+		return candidate, false
 	}
+	if cwdUncertain {
+		return "", true
+	}
+	return path.Join(strings.ReplaceAll(cwd, `\`, "/"), candidate), false
 }
 
-func catastrophicFind(args []literalArg, cwd string) bool {
-	deleteSeen := false
-	for _, arg := range args {
-		if arg.static && arg.value == "-delete" {
-			deleteSeen = true
-		}
-	}
-	if !deleteSeen || len(args) == 0 {
-		return false
-	}
-	return args[0].static && isCatastrophicTarget(args[0].value, cwd)
+func (e *Evaluator) classifyCriticalMutationTarget(candidate, cwd string, cwdUncertain bool) (protected, ambiguous bool) {
+	resolved, ambiguous := e.candidateAtCWD(candidate, cwd, cwdUncertain)
+	return !ambiguous && e.boundaries.protectsCriticalMetadata(resolved), ambiguous
 }
 
-func isCatastrophicTarget(value, cwd string) bool {
-	normalized := path.Clean(strings.ReplaceAll(strings.TrimSpace(value), `\`, "/"))
-	normalizedCWD := path.Clean(strings.ReplaceAll(strings.TrimSpace(cwd), `\`, "/"))
-	switch normalized {
-	case "/", ".", "..", "~", "~/", ".git":
-		return true
-	}
-	if normalized == normalizedCWD || isProtectedDeleteTarget(normalized) {
-		return true
-	}
-	if isCommonHomeRoot(normalized) {
-		return true
-	}
-	resolved := normalized
-	if !path.IsAbs(resolved) && !strings.HasPrefix(resolved, "~/") {
-		resolved = path.Clean(path.Join(normalizedCWD, resolved))
-	}
-	if path.IsAbs(resolved) && !isCleanupTarget(resolved) {
-		if !pathWithin(resolved, normalizedCWD) || pathWithin(normalizedCWD, resolved) {
-			return true
-		}
-	}
-	return false
+func (e *Evaluator) classifyCriticalRelocationTarget(candidate, cwd string, cwdUncertain bool) (protected, ambiguous bool) {
+	resolved, ambiguous := e.candidateAtCWD(candidate, cwd, cwdUncertain)
+	return !ambiguous && e.boundaries.protectsCriticalRelocation(resolved), ambiguous
 }
 
-func isProtectedDeleteTarget(value string) bool {
-	normalized := strings.ToLower(path.Clean(strings.ReplaceAll(strings.TrimSpace(value), `\`, "/")))
-	if normalized == ".git" || strings.HasPrefix(normalized, ".git/") || strings.Contains(normalized, "/.git/") || strings.HasSuffix(normalized, "/.git") {
-		return true
-	}
-	return normalized == "~/.local/state/ward" || strings.HasPrefix(normalized, "~/.local/state/ward/") ||
-		strings.Contains(normalized, "/.local/state/ward/") || strings.HasSuffix(normalized, "/.local/state/ward") ||
-		strings.Contains(normalized, "/ward/state/v1/") || strings.HasSuffix(normalized, "/ward/state/v1")
-}
-
-func isCommonHomeRoot(value string) bool {
-	parts := strings.Split(strings.Trim(value, "/"), "/")
-	if len(parts) == 1 && parts[0] == "root" && strings.HasPrefix(value, "/") {
-		return true
-	}
-	if len(parts) == 2 && strings.HasPrefix(value, "/") && (strings.EqualFold(parts[0], "home") || strings.EqualFold(parts[0], "users")) {
-		return true
-	}
-	return len(parts) == 3 && len(parts[0]) == 2 && parts[0][1] == ':' && strings.EqualFold(parts[1], "users")
-}
-
-func isCleanupTarget(value string) bool {
-	lower := strings.ToLower(path.Clean(value))
-	if lower == "/tmp" || lower == "/private/tmp" || lower == "/var/tmp" {
-		return true
-	}
-	for _, prefix := range []string{"/tmp/", "/private/tmp/", "/var/tmp/"} {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	for _, marker := range []string{"/.cache/", "/cache/", "/generated/", "/library/caches/", "/appdata/local/temp/"} {
-		if strings.Contains(lower+"/", marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func pathWithin(candidate, root string) bool {
-	candidate = path.Clean(candidate)
-	root = strings.TrimSuffix(path.Clean(root), "/")
-	return candidate == root || strings.HasPrefix(candidate, root+"/")
+func (e *Evaluator) classifyRecursiveDeleteTarget(candidate, cwd string, cwdUncertain bool) (protected, ambiguous bool) {
+	resolved, ambiguous := e.candidateAtCWD(candidate, cwd, cwdUncertain)
+	return !ambiguous && e.boundaries.protectsRecursiveDelete(resolved), ambiguous
 }
 
 func destructiveGit(args []literalArg) bool {
 	if len(args) == 0 || !args[0].static {
 		return false
 	}
-	subcommand := args[0].value
-	switch subcommand {
+	switch args[0].value {
 	case "reset":
-		return hasLiteral(args[1:], "--hard")
+		return destructiveGitReset(args[1:])
 	case "clean":
-		return hasForceFlag(args[1:]) && hasDirectoryFlag(args[1:]) &&
-			!hasDryRunFlag(args[1:])
+		return destructiveGitClean(args[1:])
 	case "push":
-		return !hasDryRunFlag(args[1:]) &&
-			(hasForceFlag(args[1:]) || hasLiteralPrefix(args[1:], "--force-with-lease") ||
-				hasLiteral(args[1:], "--mirror") || hasForcedRefspec(args[1:]))
+		return destructiveGitPush(args[1:])
 	default:
 		return false
 	}
+}
+
+func destructiveGitReset(args []literalArg) bool {
+	mode := ""
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return false
+		}
+		value := arg.value
+		if value == "--" {
+			break
+		}
+		if !strings.HasPrefix(value, "-") || value == "-" {
+			continue
+		}
+		switch value {
+		case "-h", "--help":
+			return false
+		case "--hard", "--soft", "--mixed", "--merge", "--keep", "-p", "--patch":
+			if mode != "" && mode != value {
+				return false
+			}
+			mode = value
+		case "-q", "--quiet", "--no-refresh", "--refresh", "-N", "--intent-to-add",
+			"--no-intent-to-add", "--pathspec-file-nul", "--recurse-submodules", "--no-recurse-submodules":
+			continue
+		case "--pathspec-from-file":
+			if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+				return false
+			}
+			index++
+		default:
+			if literalOptionAssignment(value, "--pathspec-from-file") ||
+				strings.HasPrefix(value, "--recurse-submodules=") && len(value) > len("--recurse-submodules=") {
+				continue
+			}
+			return false
+		}
+	}
+	return mode == "--hard"
+}
+
+func destructiveGitClean(args []literalArg) bool {
+	force, directories, dryRun := false, false, false
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return false
+		}
+		value := arg.value
+		if value == "--" {
+			break
+		}
+		if !strings.HasPrefix(value, "-") || value == "-" {
+			continue
+		}
+		switch value {
+		case "-h", "--help":
+			return false
+		case "--force":
+			force = true
+		case "--directories":
+			directories = true
+		case "--dry-run":
+			dryRun = true
+		case "--interactive", "--quiet":
+			continue
+		case "--exclude", "-e":
+			if index+1 >= len(args) || !args[index+1].static {
+				return false
+			}
+			index++
+		default:
+			if strings.HasPrefix(value, "--exclude=") && len(value) > len("--exclude=") {
+				continue
+			}
+			if strings.HasPrefix(value, "--") || !parseGitCleanShortOptions(value, &force, &directories, &dryRun) {
+				return false
+			}
+			if strings.Contains(value[1:], "e") && strings.HasSuffix(value, "e") {
+				if index+1 >= len(args) || !args[index+1].static {
+					return false
+				}
+				index++
+			}
+		}
+	}
+	return force && directories && !dryRun
+}
+
+func parseGitCleanShortOptions(value string, force, directories, dryRun *bool) bool {
+	if len(value) < 2 || value[0] != '-' || strings.HasPrefix(value, "--") {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		switch value[index] {
+		case 'f':
+			*force = true
+		case 'd':
+			*directories = true
+		case 'n':
+			*dryRun = true
+		case 'i', 'q', 'x', 'X':
+			continue
+		case 'e':
+			// -e consumes the remainder of this token, or the next token when
+			// it is the final short option.
+			return true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func destructiveGitPush(args []literalArg) bool {
+	force, mirror, dryRun, repositorySeen, forcedRefspec := false, false, false, false, false
+	terminated := false
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return false
+		}
+		value := arg.value
+		if !terminated && value == "--" {
+			terminated = true
+			continue
+		}
+		if !terminated && strings.HasPrefix(value, "-") && value != "-" {
+			switch value {
+			case "-h", "--help":
+				return false
+			case "-f", "--force":
+				force = true
+			case "--mirror":
+				mirror = true
+			case "-n", "--dry-run":
+				dryRun = true
+			case "--repo", "--receive-pack", "--exec", "--push-option", "-o":
+				if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+					return false
+				}
+				if value == "--repo" {
+					repositorySeen = true
+				}
+				index++
+			case "--all", "--branches", "--tags", "--follow-tags", "--atomic", "--delete", "--prune",
+				"--porcelain", "--quiet", "-q", "--verbose", "-v", "--set-upstream", "-u",
+				"--no-verify", "--ipv4", "-4", "--ipv6", "-6", "--force-if-includes",
+				"--force-with-lease":
+				continue
+			default:
+				name, assigned, hasAssignment := strings.Cut(value, "=")
+				switch name {
+				case "--repo", "--receive-pack", "--exec", "--push-option":
+					if !hasAssignment || assigned == "" {
+						return false
+					}
+					if name == "--repo" {
+						repositorySeen = true
+					}
+					continue
+				case "--force-with-lease", "--signed", "--recurse-submodules":
+					if hasAssignment && assigned != "" {
+						continue
+					}
+				}
+				if strings.HasPrefix(value, "-o") && len(value) > 2 {
+					continue
+				}
+				return false
+			}
+			continue
+		}
+		if !repositorySeen {
+			repositorySeen = true
+			continue
+		}
+		if len(value) > 1 && strings.HasPrefix(value, "+") {
+			forcedRefspec = true
+		}
+	}
+	return !dryRun && (force || mirror || forcedRefspec)
 }
 
 func destructiveTerraform(args []literalArg) bool {
@@ -2057,7 +2344,7 @@ func destructiveTerraform(args []literalArg) bool {
 		return false
 	}
 	if args[0].value == "destroy" {
-		return true
+		return !terraformDestroyInformational(args[1:])
 	}
 	if args[0].value != "apply" {
 		return false
@@ -2100,6 +2387,29 @@ func destructiveTerraform(args []literalArg) bool {
 	return seen && destroyMode
 }
 
+func terraformDestroyInformational(args []literalArg) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return false
+		}
+		if arg.value == "--" {
+			return false
+		}
+		if terraformApplyValueOption(arg.value) {
+			if index+1 >= len(args) || !args[index+1].static {
+				return false
+			}
+			index++
+			continue
+		}
+		if arg.value == "-help" || arg.value == "--help" || arg.value == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
 func terraformApplyBooleanOption(value string) bool {
 	return stringIn(value, []string{
 		"-auto-approve", "-compact-warnings", "-input", "-json", "-lock", "-no-color", "-refresh",
@@ -2122,53 +2432,6 @@ func terraformApplyAssignedOption(value string) bool {
 		return assigned == "true" || assigned == "false"
 	}
 	return terraformApplyValueOption(name)
-}
-
-func hasForcedRefspec(args []literalArg) bool {
-	for _, arg := range args {
-		if arg.static && len(arg.value) > 1 && strings.HasPrefix(arg.value, "+") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasDirectoryFlag(args []literalArg) bool {
-	for _, arg := range args {
-		if !arg.static {
-			continue
-		}
-		if arg.value == "--directories" || arg.value == "-d" ||
-			strings.HasPrefix(arg.value, "-") && !strings.HasPrefix(arg.value, "--") && strings.Contains(arg.value[1:], "d") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasDryRunFlag(args []literalArg) bool {
-	for _, arg := range args {
-		if !arg.static {
-			continue
-		}
-		if arg.value == "--dry-run" || arg.value == "-n" ||
-			strings.HasPrefix(arg.value, "-") && !strings.HasPrefix(arg.value, "--") && strings.Contains(arg.value[1:], "n") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasForceFlag(args []literalArg) bool {
-	for _, arg := range args {
-		if !arg.static {
-			continue
-		}
-		if arg.value == "--force" || arg.value == "-f" || strings.HasPrefix(arg.value, "-") && !strings.HasPrefix(arg.value, "--") && strings.Contains(arg.value[1:], "f") {
-			return true
-		}
-	}
-	return false
 }
 
 func destructiveDocker(args []literalArg) (bool, *contract.CoverageGap) {
@@ -2284,6 +2547,14 @@ func destructiveComposeDown(args []literalArg, dryRun bool) (bool, *contract.Cov
 			index++
 		default:
 			name, assigned, found := strings.Cut(value, "=")
+			if found && (name == "--volumes" || name == "-v") {
+				parsed, valid := composeDryRunValue(assigned)
+				if !valid {
+					return false, gap("unsupported_compose_option", "A Docker Compose volumes value is outside Ward classification.")
+				}
+				volumes = parsed
+				continue
+			}
 			if found && name == "--dry-run" {
 				parsed, valid := composeDryRunValue(assigned)
 				if !valid {

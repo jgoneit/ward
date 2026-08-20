@@ -1,36 +1,43 @@
 # Audit evidence
 
-Ward audit data is intentionally less informative than a command transcript.
-It is designed to answer “what decision class was observed?” without retaining
-the material that made the request sensitive.
+Ward audit is a sparse record of attributable PreToolUse vetoes and evaluator
+errors, not a command transcript and not proof of execution.
 
-Stored values include schema/version, time, phase, decision, host disposition,
-tool family, rule/risk IDs, static coverage-gap codes, policy digest, and
-HMAC-derived project, request, session, turn, and tool identifiers. Stored
-values exclude raw commands, patches, file paths, environment variables, tool
-responses, stdout/stderr, transcript paths, and secrets.
+New writers accept only:
+
+- `phase = pre`;
+- `host_disposition = unknown`;
+- `ward_decision = deny | error`;
+- no coverage-gap detail.
+
+An ordinary `defer` never opens the audit store. PermissionRequest and
+PostToolUse are not recorded by the ambient kernel.
+
+`ward-audit-event/v1` remains a historical superset. Older authenticated chains
+containing defer, permission-request, or post events continue to verify,
+display, and contribute to historical statistics; Ward never rewrites them.
+
+Stored values include schema/version, time, decision, static rule/risk IDs,
+engine version, policy digest, and HMAC-derived project/request/session/turn/tool
+identifiers. Raw commands, patches, paths, environment variables, tool output,
+transcript paths, and secrets are never stored.
 
 Each JSONL record includes the previous record MAC. `ward audit verify`
-recomputes the chain and detects reordering, modification, malformed records,
-unsafe state permissions, and tail truncation relative to the retained signed
-head. It cannot distinguish restoration of an older, internally valid snapshot
-from current state. Preventing valid-snapshot rollback requires an external
-monotonic anchor. This is tamper evidence, not protection against an attacker
-who can replace the state key and every record.
+detects reordering, modification, malformed records, unsafe state permissions,
+and truncation relative to the retained signed head. It cannot distinguish an
+older internally valid snapshot from current state without an external
+monotonic anchor.
 
-By default Ward rotates on UTC day or 8 MiB and diagnoses targets of 30 days,
-64 MiB per project, and 512 MiB total. `ward audit prune --dry-run` previews
-the eligible authenticated prefix. Mutation is disabled in the development
-build because the flat segment/head layout cannot make replacement and reader
-pinning crash-safe on every target platform. A generation-manifest storage
-contract and crash-point tests are required before release.
+An audit append failure never changes an established deny and cannot turn a
+defer into a deny. A failed append can therefore leave that exceptional event
+absent from the chain. Persistent missing, unsafe, or invalid storage is
+reported by Doctor; transient contention is not itself durable evidence. The
+one-event-per-deny/error release check applies while the initialized audit
+store is healthy, and separate fault tests prove that audit failure cannot
+remove the enforcement response or delay it beyond Ward's bounded local audit
+budget.
 
-Audit failure never changes an established `deny` into another result. It also
-does not turn a `defer` into a deny; Ward warns and Doctor reports failure so an
-availability problem cannot become a new human bottleneck.
-
-An append can be durable before its signed head update. Verification fails in
-that state instead of ignoring the tail. `ward audit repair --dry-run` can
-preview, and an explicit `ward audit repair` can perform, only a forward head
-advance after the complete tail authenticates and extends the prior signed
-head. Invalid records, divergent chains, and backward repairs stay failed.
+`ward audit repair` is forward-only: it can advance a stale signed head over an
+already authenticated tail after a crash. It cannot rewrite events or repair a
+bad MAC. Public pruning is excluded from v0.1; Doctor and stats retain size
+visibility while real sparse-event volume is measured.

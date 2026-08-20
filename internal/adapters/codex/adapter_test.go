@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -330,6 +331,50 @@ func TestDecodeAcceptsFuturePermissionModeWithinMetadataLimit(t *testing.T) {
 	}
 }
 
+func TestDecodeSessionStartUsesMinimalProjection(t *testing.T) {
+	raw := []byte(`{
+  "session_id":"session-1","transcript_path":null,"cwd":"/workspace",
+  "hook_event_name":"SessionStart","source":"resume","model":"gpt-test","permission_mode":"default","future":{"secret":"ignored"}
+}`)
+	got, err := DecodeSessionStart(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionID != "session-1" || got.CWD != "/workspace" || got.Source != "resume" {
+		t.Fatalf("session invocation = %#v", got)
+	}
+}
+
+func TestDecodeSessionStartRejectsMalformedOrMismatchedPayload(t *testing.T) {
+	for name, raw := range map[string]string{
+		"missing source":     `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"SessionStart","model":"m","permission_mode":"default"}`,
+		"missing model":      `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"SessionStart","source":"startup","permission_mode":"default"}`,
+		"missing permission": `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"SessionStart","source":"startup","model":"m"}`,
+		"event mismatch":     `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"PreToolUse","source":"startup","model":"m","permission_mode":"default"}`,
+		"duplicate key":      `{"session_id":"s","session_id":"x","transcript_path":null,"cwd":"/w","hook_event_name":"SessionStart","source":"startup","model":"m","permission_mode":"default"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeSessionStart([]byte(raw)); err == nil {
+				t.Fatal("DecodeSessionStart() accepted malformed payload")
+			}
+		})
+	}
+}
+
+func TestDestructiveToolMatcherHasOnlyCanonicalAmbientNames(t *testing.T) {
+	matcher := regexp.MustCompile(DestructiveToolMatcher)
+	for _, name := range []string{"Bash", "PowerShell", "pwsh", "cmd", "cmd.exe", "apply_patch", "delete_file", "move_file", "mcp__filesystem__delete_file", "mcp__filesystem__move_file"} {
+		if !matcher.MatchString(name) {
+			t.Errorf("matcher omitted %q", name)
+		}
+	}
+	for _, name := range []string{"Read", "Write", "mcp__filesystem__read_file", "mcp__github__delete_file", "BashExtra", ""} {
+		if matcher.MatchString(name) {
+			t.Errorf("matcher included %q", name)
+		}
+	}
+}
+
 func TestDecodeRejectsOversizedMetadata(t *testing.T) {
 	payload := officialFixture(EventPreToolUse)
 	payload["permission_mode"] = strings.Repeat("x", maxMetadataBytes+1)
@@ -339,6 +384,24 @@ func TestDecodeRejectsOversizedMetadata(t *testing.T) {
 	}
 	if _, err := Decode(raw, EventPreToolUse); !errors.Is(err, ErrInvalidPayload) {
 		t.Fatalf("Decode() error = %v, want invalid payload", err)
+	}
+}
+
+func TestDecodeRejectsRelativeCWDForToolAndSessionEvents(t *testing.T) {
+	toolPayload := officialFixture(EventPreToolUse)
+	toolPayload["cwd"] = "."
+	raw, _ := json.Marshal(toolPayload)
+	if _, err := Decode(raw, EventPreToolUse); err == nil {
+		t.Fatal("relative PreToolUse cwd was accepted")
+	}
+
+	sessionPayload := map[string]any{
+		"session_id": "session-1", "transcript_path": nil, "cwd": ".",
+		"hook_event_name": EventSessionStart, "source": "startup", "model": "gpt-test", "permission_mode": "default",
+	}
+	raw, _ = json.Marshal(sessionPayload)
+	if _, err := DecodeSessionStart(raw); err == nil {
+		t.Fatal("relative SessionStart cwd was accepted")
 	}
 }
 

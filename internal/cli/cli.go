@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,7 +24,6 @@ import (
 	"github.com/jgoneit/ward/internal/evaluator"
 	"github.com/jgoneit/ward/internal/integration"
 	wardpaths "github.com/jgoneit/ward/internal/paths"
-	"github.com/jgoneit/ward/internal/policy"
 	"github.com/jgoneit/ward/internal/version"
 )
 
@@ -39,9 +37,25 @@ const (
 	exitDoctor   = 6
 
 	maxInputBytes = 2 << 20
+
+	// Codex gives installed hooks two seconds. Sparse audit work must leave
+	// enough time for the adapter to return the deny (or silent error defer),
+	// even when another process holds an audit lock.
+	preToolAuditBudget = 250 * time.Millisecond
+	// SessionStart uses a larger read-only budget, but still returns a redacted
+	// check ID comfortably before the installed two-second hook timeout.
+	sessionStartDoctorBudget = time.Second
+	// Audit gets only half of the SessionStart budget so a contended store can
+	// return the specific redacted check ID before the outer Doctor deadline.
+	sessionStartAuditBudget = 250 * time.Millisecond
 )
 
-var executablePath = os.Executable
+var (
+	executablePath       = os.Executable
+	sessionDoctor        = sessionDoctorCheckIDs
+	newHookAuditStore    = audit.OpenStoreContext
+	openDoctorAuditStore = audit.OpenStoreContext
+)
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -58,8 +72,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runEvaluate(args[1:], stdin, stdout, stderr)
 	case "hook":
 		return runHook(ctx, args[1:], stdin, stdout, stderr)
-	case "policy":
-		return runPolicy(args[1:], stdout, stderr)
 	case "codex":
 		return runCodex(args[1:], stdout, stderr)
 	case "doctor":
@@ -96,17 +108,11 @@ func runEvaluate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ward evaluate: malformed ward-request/v1")
 		return exitContract
 	}
-	loadedPolicy, _, err := loadUserPolicy()
-	if err != nil {
-		fmt.Fprintln(stderr, "ward evaluate: user policy is invalid")
-		return exitPolicy
+	engine, _, err := evaluatorForRequest(request)
+	decision := contract.ErrorDecision("engine_init", "Ward evaluator initialization failed.")
+	if err == nil {
+		decision = engine.Evaluate(request)
 	}
-	engine, err := evaluator.New(loadedPolicy)
-	if err != nil {
-		fmt.Fprintln(stderr, "ward evaluate: evaluator initialization failed")
-		return exitPolicy
-	}
-	decision := engine.Evaluate(request)
 	if *asJSON {
 		if err := writeJSON(stdout, decision); err != nil {
 			return exitRuntime
@@ -122,40 +128,47 @@ func runHook(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		fmt.Fprintln(stderr, "ward hook: expected one Codex hook name")
 		return exitUsage
 	}
-	event, phase, disposition, ok := hookName(args[0])
-	if !ok {
+	switch args[0] {
+	case "codex-permission-request", "codex-post-tool-use":
+		// Hidden transition handlers for existing installations. New
+		// integrations never register them and they intentionally do no work.
+		return exitOK
+	case "codex-session-start":
+		return runSessionStart(ctx, stdin, stdout)
+	case "codex-pre-tool-use":
+		// Continue below.
+	default:
 		fmt.Fprintln(stderr, "ward hook: unsupported hook name")
 		return exitUsage
 	}
 	raw, err := io.ReadAll(io.LimitReader(stdin, maxInputBytes+1))
 	if err != nil || len(raw) > maxInputBytes {
-		return emitStaticHookDeny(event, stdout, stderr)
+		return exitOK
 	}
-	invocation, err := codex.Decode(raw, event)
+	invocation, err := codex.Decode(raw, codex.EventPreToolUse)
 	if err != nil {
-		return emitStaticHookDeny(event, stdout, stderr)
+		return exitOK
 	}
 
-	loadedPolicy, policyMaterial, policyErr := loadUserPolicy()
-	var decision contract.Decision
-	if event == codex.EventPostToolUse {
-		decision = contract.Decision{Schema: contract.DecisionSchemaV1}
-	} else {
-		if policyErr != nil {
-			decision = contract.ErrorDecision("policy_invalid", "Ward policy integrity check failed.")
-		} else if engine, engineErr := evaluator.New(loadedPolicy); engineErr != nil {
-			decision = contract.ErrorDecision("engine_init", "Ward evaluator initialization failed.")
-		} else {
-			decision = engine.Evaluate(invocation.Request)
-		}
+	engine, policyMaterial, engineErr := evaluatorForRequest(invocation.Request)
+	decision := contract.ErrorDecision("engine_init", "Ward evaluator initialization failed.")
+	if engineErr == nil {
+		decision = engine.Evaluate(invocation.Request)
 	}
-
-	if err := recordHookAudit(ctx, invocation, phase, disposition, decision, policyMaterial); err != nil {
-		fmt.Fprintln(stderr, "ward: audit unavailable; run ward doctor")
+	if decision.Outcome == contract.OutcomeDefer {
+		return exitOK
 	}
-	output, err := codex.Output(event, decision)
+	if decision.Outcome == contract.OutcomeDeny || decision.Outcome == contract.OutcomeError {
+		auditCtx, cancel := context.WithTimeout(ctx, preToolAuditBudget)
+		// Record is context-aware up to the append commit point. Once bytes are
+		// appended it completes the tiny rollback/head critical section before
+		// returning, so the CLI never exits with audit mutation in flight.
+		_ = recordHookAudit(auditCtx, invocation, decision, policyMaterial)
+		cancel()
+	}
+	output, err := codex.Output(codex.EventPreToolUse, decision)
 	if err != nil {
-		return emitStaticHookDeny(event, stdout, stderr)
+		return exitOK
 	}
 	if len(output) > 0 {
 		if _, err := stdout.Write(append(output, '\n')); err != nil {
@@ -165,49 +178,46 @@ func runHook(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	return exitOK
 }
 
-func emitStaticHookDeny(event string, stdout, stderr io.Writer) int {
-	output, err := codex.StaticDeny(event)
-	if err != nil {
-		fmt.Fprintln(stderr, "ward: hook integrity failure")
+func runSessionStart(ctx context.Context, stdin io.Reader, stdout io.Writer) int {
+	raw, err := io.ReadAll(io.LimitReader(stdin, maxInputBytes+1))
+	failed := []string(nil)
+	if err != nil || len(raw) > maxInputBytes {
+		failed = []string{"session.payload"}
+	} else if invocation, decodeErr := codex.DecodeSessionStart(raw); decodeErr != nil {
+		failed = []string{"session.payload"}
+	} else {
+		doctorCtx, cancel := context.WithTimeout(ctx, sessionStartDoctorBudget)
+		done := make(chan []string, 1)
+		go func() { done <- sessionDoctor(doctorCtx, invocation.CWD) }()
+		select {
+		case failed = <-done:
+		case <-doctorCtx.Done():
+			failed = []string{"doctor.timeout"}
+		}
+		cancel()
+	}
+	output, err := codex.SessionStartHealthOutput(failed)
+	if err != nil || len(output) == 0 {
+		return exitOK
+	}
+	if _, err := stdout.Write(append(output, '\n')); err != nil {
 		return exitRuntime
 	}
-	if len(output) > 0 {
-		if _, err := stdout.Write(append(output, '\n')); err != nil {
-			return exitRuntime
-		}
-	}
 	return exitOK
 }
 
-func hookName(name string) (string, audit.Phase, audit.HostDisposition, bool) {
-	switch name {
-	case "codex-pre-tool-use":
-		return codex.EventPreToolUse, audit.PhasePre, audit.HostUnknown, true
-	case "codex-permission-request":
-		return codex.EventPermissionRequest, audit.PhasePermissionRequest, audit.HostApprovalRequested, true
-	case "codex-post-tool-use":
-		return codex.EventPostToolUse, audit.PhasePost, audit.HostPostObserved, true
-	default:
-		return "", "", "", false
+func recordHookAudit(ctx context.Context, invocation codex.Invocation, decision contract.Decision, policyMaterial []byte) error {
+	lockTimeout, ok := boundedLockTimeout(ctx, preToolAuditBudget)
+	if !ok {
+		return ctx.Err()
 	}
-}
-
-func recordHookAudit(ctx context.Context, invocation codex.Invocation, phase audit.Phase, disposition audit.HostDisposition, decision contract.Decision, policyMaterial []byte) error {
-	store, err := audit.NewStore(audit.Options{})
+	store, err := newHookAuditStore(ctx, audit.Options{LockTimeout: lockTimeout})
 	if err != nil {
 		return err
 	}
 	correlationInput, err := json.Marshal(invocation.Request.Input)
 	if err != nil {
 		return err
-	}
-	auditDecision := audit.Decision("")
-	if phase != audit.PhasePost {
-		auditDecision = audit.Decision(decision.Outcome)
-	}
-	coverageGapCode := ""
-	if decision.CoverageGap != nil {
-		coverageGapCode = decision.CoverageGap.Code
 	}
 	toolKind := audit.ToolUnknown
 	switch invocation.Request.Tool {
@@ -226,8 +236,8 @@ func recordHookAudit(ctx context.Context, invocation codex.Invocation, phase aud
 	}
 	return store.Record(ctx, audit.RecordInput{
 		CWD:              invocation.Request.CWD,
-		Phase:            phase,
-		HostDisposition:  disposition,
+		Phase:            audit.PhasePre,
+		HostDisposition:  audit.HostUnknown,
 		SessionID:        invocation.SessionID,
 		TurnID:           invocation.TurnID,
 		ToolUseID:        invocation.ToolUseID,
@@ -235,93 +245,80 @@ func recordHookAudit(ctx context.Context, invocation codex.Invocation, phase aud
 		ToolKind:         toolKind,
 		ToolInput:        invocation.RawToolInput,
 		CorrelationInput: correlationInput,
-		Decision:         auditDecision,
+		Decision:         audit.Decision(decision.Outcome),
 		RuleID:           decision.RuleID,
 		RiskClass:        riskClass(decision.RuleID),
-		CoverageGapCode:  coverageGapCode,
 		PermissionMode:   invocation.PermissionMode,
 		PolicyMaterial:   policyMaterial,
 		EngineVersion:    version.Version,
 	})
 }
 
+func evaluatorForRequest(request contract.Request) (*evaluator.Evaluator, []byte, error) {
+	userPaths, err := wardpaths.ResolveUser()
+	if err != nil {
+		return nil, nil, err
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	binary, err := executablePath()
+	if err != nil {
+		return nil, nil, err
+	}
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(binary); resolveErr == nil {
+		binary = resolved
+	}
+	controlPaths := []string{
+		binary,
+		userPaths.ConfigFile,
+		userPaths.HooksFile,
+		userPaths.PolicyFile,
+		stateDir,
+	}
+	boundaries, err := evaluator.ResolveBoundarySet(evaluator.BoundaryOptions{
+		CWD:              request.CWD,
+		WardControlPaths: controlPaths,
+	})
+	if err != nil {
+		return nil, boundaryPolicyMaterial(controlPaths), err
+	}
+	engine, err := evaluator.New(boundaries)
+	return engine, boundaryPolicyMaterial(controlPaths), err
+}
+
+func boundaryPolicyMaterial(paths []string) []byte {
+	normalized := make([]string, 0, len(paths))
+	for _, candidate := range paths {
+		candidate = filepath.Clean(candidate)
+		if runtime.GOOS == "windows" {
+			candidate = strings.ToLower(candidate)
+		}
+		normalized = append(normalized, candidate)
+	}
+	sort.Strings(normalized)
+	digest := sha256.Sum256([]byte(strings.Join(normalized, "\x00")))
+	material := append([]byte("ward-kernel-policy/v1\x00"), digest[:]...)
+	return material
+}
+
 func riskClass(ruleID string) string {
 	upper := strings.ToUpper(ruleID)
 	switch {
-	case strings.Contains(upper, "SECRET"):
-		return "secret"
 	case strings.Contains(upper, "DELETE"), strings.Contains(upper, "FILESYSTEM"):
 		return "catastrophic-delete"
 	case strings.Contains(upper, "GIT"):
 		return "destructive-git"
-	case strings.Contains(upper, "INTERACTIVE"):
-		return "interactive-session"
 	case strings.Contains(upper, "DATABASE"), strings.Contains(upper, "SCHEMA"), strings.Contains(upper, "INFRASTRUCTURE"), strings.Contains(upper, "TERRAFORM"), strings.Contains(upper, "KUBECTL"), strings.Contains(upper, "DOCKER"):
 		return "external-destruction"
-	case strings.HasPrefix(upper, "CUSTOM_"):
-		return "additive-policy"
 	default:
 		return ""
 	}
-}
-
-func runPolicy(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "validate" {
-		fmt.Fprintln(stderr, "ward policy: expected validate")
-		return exitUsage
-	}
-	flags := flag.NewFlagSet("policy validate", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	file := flags.String("file", "", "additive policy file")
-	asJSON := flags.Bool("json", false, "emit JSON")
-	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
-		return exitUsage
-	}
-	loaded := policy.Default()
-	material := []byte("ward-policy/v1:embedded-baseline")
-	if *file != "" {
-		raw, err := os.ReadFile(*file)
-		if err != nil {
-			fmt.Fprintln(stderr, "ward policy validate: policy file unavailable")
-			return exitPolicy
-		}
-		loaded, err = policy.LoadAdditive(bytes.NewReader(raw))
-		if err != nil {
-			fmt.Fprintln(stderr, "ward policy validate: invalid additive policy")
-			return exitPolicy
-		}
-		material = append(material, raw...)
-		loaded, material, err = bindRuntimeCredentialPolicy(loaded, material)
-		if err != nil {
-			fmt.Fprintln(stderr, "ward policy validate: credential path policy unavailable")
-			return exitPolicy
-		}
-	} else {
-		var err error
-		loaded, material, err = loadUserPolicy()
-		if err != nil {
-			fmt.Fprintln(stderr, "ward policy validate: invalid active additive policy")
-			return exitPolicy
-		}
-	}
-	if !loaded.Valid() {
-		fmt.Fprintln(stderr, "ward policy validate: invalid policy")
-		return exitPolicy
-	}
-	digest := sha256.Sum256(material)
-	result := map[string]any{
-		"schema": "ward-policy-validation/v1",
-		"valid":  true,
-		"digest": hex.EncodeToString(digest[:]),
-	}
-	if *asJSON {
-		if err := writeJSON(stdout, result); err != nil {
-			return exitRuntime
-		}
-	} else {
-		fmt.Fprintf(stdout, "PASS policy valid (%s)\n", result["digest"])
-	}
-	return exitOK
 }
 
 func runCodex(args []string, stdout, stderr io.Writer) int {
@@ -330,24 +327,27 @@ func runCodex(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	action := args[0]
+	compatArgs, validProfile := consumeLegacyProfileArgs(args[1:])
+	if !validProfile {
+		fmt.Fprintln(stderr, "ward codex: the hidden compatibility profile must be baseline")
+		return exitUsage
+	}
 	flags := flag.NewFlagSet("codex "+action, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	scope := flags.String("scope", "user", "installation scope")
-	profile := flags.String("profile", "baseline", "Ward profile")
-	migrate := flags.Bool("migrate-permissions", false, "replace legacy sandbox_mode")
+	migrate := false
+	if action == "install" {
+		flags.BoolVar(&migrate, "migrate-permissions", false, "replace legacy sandbox_mode")
+	}
 	dryRun := flags.Bool("dry-run", false, "report without writing")
-	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+	if err := flags.Parse(compatArgs); err != nil || flags.NArg() != 0 {
 		return exitUsage
 	}
-	if *scope != "user" || *profile != "baseline" {
-		fmt.Fprintln(stderr, "ward codex: v0.1 supports only --scope user --profile baseline")
+	if *scope != "user" {
+		fmt.Fprintln(stderr, "ward codex: v0.1 supports only --scope user")
 		return exitUsage
 	}
-	if action == "uninstall" && *migrate {
-		fmt.Fprintln(stderr, "ward codex uninstall: --migrate-permissions is not valid")
-		return exitUsage
-	}
-	options, err := integrationOptions(*migrate, *dryRun)
+	options, err := integrationOptions(migrate, *dryRun)
 	if err != nil {
 		fmt.Fprintln(stderr, "ward codex: could not resolve user paths")
 		return exitRuntime
@@ -384,6 +384,37 @@ func runCodex(args []string, stdout, stderr io.Writer) int {
 		return exitDoctor
 	}
 	return writeIntegrationResult(stdout, action, result)
+}
+
+// consumeLegacyProfileArgs accepts the v1 spelling without registering it on
+// the public FlagSet, so `--profile baseline` remains a quiet transition input
+// and never appears in v0.1 help or documentation.
+func consumeLegacyProfileArgs(args []string) ([]string, bool) {
+	cleaned := make([]string, 0, len(args))
+	seen := false
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		value, matched := "", false
+		switch {
+		case argument == "--profile":
+			if index+1 >= len(args) {
+				return nil, false
+			}
+			index++
+			value, matched = args[index], true
+		case strings.HasPrefix(argument, "--profile="):
+			value, matched = strings.TrimPrefix(argument, "--profile="), true
+		}
+		if matched {
+			if seen || value != "baseline" {
+				return nil, false
+			}
+			seen = true
+			continue
+		}
+		cleaned = append(cleaned, argument)
+	}
+	return cleaned, true
 }
 
 func integrationOptions(migrate, dryRun bool) (integration.Options, error) {
@@ -454,32 +485,14 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return exitUsage
 	}
-	options, err := integrationOptions(false, true)
-	if err != nil {
-		fmt.Fprintln(stderr, "ward doctor: could not resolve user paths")
-		return exitDoctor
-	}
 	cwd := *project
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	options.Paths.CredentialTopologyIncomplete = projectTopologyIncomplete(cwd, options.Paths.CredentialFiles, options.Paths.CredentialDirectories)
-	options.Paths.StateTopologyIncomplete = projectTopologyIncomplete(cwd, []string{options.Paths.StateDir}, []string{filepath.Dir(options.Paths.StateDir)})
-	report := integration.Doctor(options)
-	report.Checks = append(report.Checks,
-		doctorPolicyCheck(),
-		doctorAuditCheck(ctx, options.Paths.StateDir, cwd),
-		doctorPlatformCheck(),
-		doctorCodexVersionCheck(ctx),
-		doctorSyntheticCheck(),
-		doctorNativePermissionCheck(ctx),
-	)
-	report.Healthy = true
-	for _, check := range report.Checks {
-		if check.Status == integration.CheckFail {
-			report.Healthy = false
-			break
-		}
+	report, err := buildDoctorReport(ctx, cwd, true)
+	if err != nil {
+		fmt.Fprintln(stderr, "ward doctor: could not resolve user paths")
+		return exitDoctor
 	}
 	if *asJSON {
 		if err := writeJSON(stdout, report); err != nil {
@@ -494,6 +507,70 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return exitDoctor
 	}
 	return exitOK
+}
+
+func buildDoctorReport(ctx context.Context, cwd string, includeNativeProbe bool) (integration.DoctorReport, error) {
+	return buildDoctorReportWithAuditBudget(ctx, cwd, includeNativeProbe, 0)
+}
+
+func buildDoctorReportWithAuditBudget(ctx context.Context, cwd string, includeNativeProbe bool, auditLockBudget time.Duration) (integration.DoctorReport, error) {
+	options, err := integrationOptions(false, true)
+	if err != nil {
+		return integration.DoctorReport{}, err
+	}
+	options.Paths.StateTopologyIncomplete = projectTopologyIncomplete(cwd, []string{options.Paths.StateDir}, []string{filepath.Dir(options.Paths.StateDir)})
+	options.Paths.ControlTopologyIncomplete = projectTopologyIncomplete(
+		cwd,
+		[]string{options.Paths.ConfigFile, options.Paths.HooksFile, options.Paths.BinaryPath},
+		[]string{filepath.Dir(options.Paths.BinaryPath), filepath.Dir(options.Paths.UserPolicyPath)},
+	)
+	options.Paths.HomeWorkspaceTopology = sameCanonicalPath(cwd, options.Paths.HomeDir)
+	report := integration.Doctor(options)
+	report.Checks = append(report.Checks,
+		doctorAuditCheck(ctx, options.Paths.StateDir, cwd, auditLockBudget),
+		doctorPlatformCheck(),
+		doctorSyntheticCheck(),
+	)
+	if includeNativeProbe {
+		report.Checks = append(report.Checks,
+			doctorCodexVersionCheck(ctx),
+			doctorNativePermissionCheck(ctx),
+		)
+	}
+	report.Healthy = true
+	for _, check := range report.Checks {
+		if check.Status == integration.CheckFail {
+			report.Healthy = false
+			break
+		}
+	}
+	return report, nil
+}
+
+func sameCanonicalPath(left, right string) bool {
+	left, right = canonicalExistingPath(left), canonicalExistingPath(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func sessionDoctorCheckIDs(ctx context.Context, cwd string) []string {
+	report, err := buildDoctorReportWithAuditBudget(ctx, cwd, false, sessionStartAuditBudget)
+	if err != nil {
+		return []string{"doctor.runtime"}
+	}
+	var ids []string
+	for _, check := range report.Checks {
+		if check.Status == integration.CheckFail ||
+			(check.Status == integration.CheckWarn && strings.HasSuffix(check.ID, "_topology")) {
+			ids = append(ids, check.ID)
+		}
+	}
+	return ids
 }
 
 // projectTopologyIncomplete reports only relocation paths available through
@@ -567,16 +644,12 @@ func pathContains(parent, child string) bool {
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
-func doctorPolicyCheck() integration.Check {
-	loaded, _, err := loadUserPolicy()
-	if err != nil || !loaded.Valid() {
-		return integration.Check{ID: "policy", Status: integration.CheckFail, Message: "embedded or additive policy is invalid"}
+func doctorAuditCheck(ctx context.Context, stateDir, project string, lockBudget time.Duration) integration.Check {
+	lockTimeout, ok := boundedLockTimeout(ctx, lockBudget)
+	if !ok {
+		return integration.Check{ID: "audit", Status: integration.CheckFail, Message: "audit verification timed out"}
 	}
-	return integration.Check{ID: "policy", Status: integration.CheckPass, Message: "embedded baseline and additive policy are valid"}
-}
-
-func doctorAuditCheck(ctx context.Context, stateDir, project string) integration.Check {
-	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
+	store, err := openDoctorAuditStore(ctx, audit.Options{StateDir: stateDir, LockTimeout: lockTimeout})
 	if err != nil {
 		return integration.Check{ID: "audit", Status: integration.CheckFail, Message: "audit state is missing or unsafe"}
 	}
@@ -592,6 +665,25 @@ func doctorAuditCheck(ctx context.Context, stateDir, project string) integration
 		return integration.Check{ID: "audit", Status: integration.CheckFail, Message: "audit chain is valid but a retention size limit is exceeded"}
 	}
 	return integration.Check{ID: "audit", Status: integration.CheckPass, Message: "audit key, permissions, retained chain, and size limits are valid"}
+}
+
+// boundedLockTimeout caps lock acquisition by both the operation's local
+// budget and any earlier caller deadline. A zero maximum preserves the audit
+// package's normal timeout for trusted CLI calls without a deadline.
+func boundedLockTimeout(ctx context.Context, maximum time.Duration) (time.Duration, bool) {
+	if ctx.Err() != nil {
+		return 0, false
+	}
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, false
+		}
+		if maximum <= 0 || remaining < maximum {
+			maximum = remaining
+		}
+	}
+	return maximum, true
 }
 
 func doctorPlatformCheck() integration.Check {
@@ -637,23 +729,31 @@ func versionAtLeast(value string, wantMajor, wantMinor, wantPatch int) bool {
 }
 
 func doctorSyntheticCheck() integration.Check {
-	engine, err := evaluator.New(policy.Default())
+	boundaries, err := evaluator.ResolveBoundarySet(evaluator.BoundaryOptions{
+		CWD:     "/ward-doctor",
+		HomeDir: "/ward-home",
+		GOOS:    "linux",
+	})
+	if err != nil {
+		return integration.Check{ID: "evaluator.synthetic", Status: integration.CheckFail, Message: "synthetic boundary could not initialize"}
+	}
+	engine, err := evaluator.New(boundaries)
 	if err != nil {
 		return integration.Check{ID: "evaluator.synthetic", Status: integration.CheckFail, Message: "evaluator could not initialize"}
 	}
 	base := contract.Request{Schema: contract.RequestSchemaV1, Host: "doctor", Event: codex.EventPreToolUse, Tool: "bash", CWD: "/ward-doctor"}
-	secret := base
-	secret.Input.Command = "cat .env"
+	destructive := base
+	destructive.Input.Command = "rm -rf ."
 	ordinary := base
 	ordinary.Input.Command = "rm build/old.o"
-	secretDecision := engine.Evaluate(secret)
+	destructiveDecision := engine.Evaluate(destructive)
 	ordinaryDecision := engine.Evaluate(ordinary)
-	denyOutput, denyErr := codex.Output(codex.EventPreToolUse, secretDecision)
+	denyOutput, denyErr := codex.Output(codex.EventPreToolUse, destructiveDecision)
 	deferOutput, deferErr := codex.Output(codex.EventPreToolUse, ordinaryDecision)
-	if secretDecision.Outcome != contract.OutcomeDeny || ordinaryDecision.Outcome != contract.OutcomeDefer || denyErr != nil || deferErr != nil || len(denyOutput) == 0 || len(deferOutput) != 0 || bytes.Contains(denyOutput, []byte(`"allow"`)) || bytes.Contains(denyOutput, []byte(`"ask"`)) {
+	if destructiveDecision.Outcome != contract.OutcomeDeny || ordinaryDecision.Outcome != contract.OutcomeDefer || denyErr != nil || deferErr != nil || len(denyOutput) == 0 || len(deferOutput) != 0 || bytes.Contains(denyOutput, []byte(`"allow"`)) || bytes.Contains(denyOutput, []byte(`"ask"`)) {
 		return integration.Check{ID: "evaluator.synthetic", Status: integration.CheckFail, Message: "synthetic deny/defer adapter round-trip failed"}
 	}
-	return integration.Check{ID: "evaluator.synthetic", Status: integration.CheckPass, Message: "synthetic secret deny and ordinary defer round-trip passed"}
+	return integration.Check{ID: "evaluator.synthetic", Status: integration.CheckPass, Message: "synthetic catastrophic deny and ordinary defer round-trip passed"}
 }
 
 func doctorNativePermissionCheck(ctx context.Context) integration.Check {
@@ -701,22 +801,26 @@ func doctorNativePermissionCheck(ctx context.Context) integration.Check {
 
 func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "ward audit: expected show, verify, stats, prune, or repair")
+		fmt.Fprintln(stderr, "ward audit: expected show, verify, stats, or repair")
 		return exitUsage
 	}
 	subcommand := args[0]
 	flags := flag.NewFlagSet("audit "+subcommand, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	project := flags.String("project", "", "project path")
-	since := flags.Duration("since", 0, "lookback duration")
-	before := flags.Duration("before", 0, "prune events older than duration")
-	limit := flags.Int("limit", 0, "maximum events")
-	dryRun := flags.Bool("dry-run", false, "report prune without writing")
+	var since time.Duration
+	if subcommand == "show" || subcommand == "stats" {
+		flags.DurationVar(&since, "since", 0, "lookback duration")
+	}
+	var dryRun bool
+	if subcommand == "repair" {
+		flags.BoolVar(&dryRun, "dry-run", false, "preview repair without writing")
+	}
 	asJSON := flags.Bool("json", false, "emit JSON")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
 		return exitUsage
 	}
-	if subcommand != "show" && subcommand != "verify" && subcommand != "stats" && subcommand != "prune" && subcommand != "repair" {
+	if subcommand != "show" && subcommand != "verify" && subcommand != "stats" && subcommand != "repair" {
 		fmt.Fprintln(stderr, "ward audit: unsupported subcommand")
 		return exitUsage
 	}
@@ -729,9 +833,9 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "ward audit: state is missing or unsafe")
 		return exitAudit
 	}
-	filter := audit.Filter{Limit: *limit}
-	if *since > 0 {
-		filter.Since = time.Now().Add(-*since)
+	filter := audit.Filter{}
+	if since > 0 {
+		filter.Since = time.Now().Add(-since)
 	}
 	var payload any
 	switch subcommand {
@@ -741,28 +845,11 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		payload, err = store.Verify(ctx, cwd)
 	case "stats":
 		payload, err = store.Stats(ctx, cwd, filter)
-	case "prune":
-		if *before > 0 {
-			cutoff := time.Now().Add(-*before)
-			if *dryRun {
-				events, showErr := store.Show(ctx, cwd, audit.Filter{Until: cutoff})
-				err = showErr
-				payload = map[string]any{"schema": "ward-audit-prune-preview/v1", "dry_run": true, "would_remove": len(events)}
-			} else {
-				payload, err = store.Prune(ctx, cwd, cutoff)
-			}
-		} else {
-			payload, err = store.PruneRetention(ctx, cwd, *dryRun)
-		}
 	case "repair":
-		payload, err = store.RecoverHead(ctx, cwd, *dryRun)
+		payload, err = store.RecoverHead(ctx, cwd, dryRun)
 	}
 	if err != nil {
-		if errors.Is(err, audit.ErrPruneDisabled) {
-			fmt.Fprintln(stderr, "ward audit: mutation pruning is disabled in this development build; use --dry-run")
-		} else {
-			fmt.Fprintln(stderr, "ward audit: integrity or I/O failure")
-		}
+		fmt.Fprintln(stderr, "ward audit: integrity or I/O failure")
 		return exitAudit
 	}
 	if *asJSON || subcommand == "show" || subcommand == "stats" {
@@ -775,63 +862,6 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}
 	}
 	return exitOK
-}
-
-func loadUserPolicy() (policy.Policy, []byte, error) {
-	material := []byte("ward-policy/v1:embedded-baseline")
-	userPaths, err := wardpaths.ResolveUser()
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	raw, err := os.ReadFile(userPaths.PolicyFile)
-	if errors.Is(err, os.ErrNotExist) {
-		return bindResolvedCredentialPolicy(policy.Default(), material, userPaths.CredentialFiles)
-	}
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	loaded, err := policy.LoadAdditive(bytes.NewReader(raw))
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	return bindResolvedCredentialPolicy(loaded, append(material, raw...), userPaths.CredentialFiles)
-}
-
-func bindRuntimeCredentialPolicy(base policy.Policy, material []byte) (policy.Policy, []byte, error) {
-	userPaths, err := wardpaths.ResolveUser()
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	return bindResolvedCredentialPolicy(base, material, userPaths.CredentialFiles)
-}
-
-func bindResolvedCredentialPolicy(base policy.Policy, material []byte, credentials []string) (policy.Policy, []byte, error) {
-	loaded, err := policy.WithExactProtectedPaths(base, credentials)
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	normalized := make([]string, 0, len(credentials))
-	seen := make(map[string]struct{}, len(credentials))
-	for _, candidate := range credentials {
-		clean := filepath.Clean(candidate)
-		if runtime.GOOS == "windows" {
-			clean = strings.ToLower(clean)
-		}
-		if _, exists := seen[clean]; exists {
-			continue
-		}
-		seen[clean] = struct{}{}
-		normalized = append(normalized, clean)
-	}
-	sort.Strings(normalized)
-	encoded, err := json.Marshal(normalized)
-	if err != nil {
-		return policy.Policy{}, nil, err
-	}
-	digest := sha256.Sum256(append([]byte("ward-runtime-credential-paths/v1\x00"), encoded...))
-	material = append(material, []byte("\x00ward-runtime-credential-paths-digest/v1\x00")...)
-	material = append(material, digest[:]...)
-	return loaded, material, nil
 }
 
 func readBoundedInput(path string, stdin io.Reader) ([]byte, error) {
@@ -875,5 +905,5 @@ func writeJSON(writer io.Writer, value any) error {
 }
 
 func writeUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: ward <evaluate|hook|policy|codex|doctor|audit> [options]")
+	fmt.Fprintln(writer, "usage: ward <evaluate|hook|codex|doctor|audit> [options]")
 }

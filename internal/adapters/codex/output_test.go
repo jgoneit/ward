@@ -45,7 +45,7 @@ func TestOutputDeferIsExactlyNoStdout(t *testing.T) {
 	}
 }
 
-func TestOutputEvaluatorErrorIsStaticDeny(t *testing.T) {
+func TestOutputEvaluatorErrorIsExactlyNoStdout(t *testing.T) {
 	decision := contract.Decision{
 		Schema:    contract.DecisionSchemaV1,
 		Outcome:   contract.OutcomeError,
@@ -58,13 +58,8 @@ func TestOutputEvaluatorErrorIsStaticDeny(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(out), staticDenyReason) {
-			t.Fatalf("error output lacks static reason: %s", out)
-		}
-		for _, leaked := range []string{"SECRET VALUE", "attacker-controlled", "details"} {
-			if strings.Contains(string(out), leaked) {
-				t.Fatalf("error output leaked %q: %s", leaked, out)
-			}
+		if len(out) != 0 {
+			t.Fatalf("error output = %q, want no stdout", out)
 		}
 	}
 }
@@ -81,12 +76,66 @@ func TestOutputPostToolUseNeverBlocks(t *testing.T) {
 	}
 }
 
-func TestOutputUnknownDecisionSchemaFailsClosed(t *testing.T) {
+func TestOutputUnknownDecisionSchemaMakesNoPermissionDecision(t *testing.T) {
 	out, err := Output(EventPreToolUse, contract.Decision{Schema: "future", Outcome: contract.OutcomeDefer})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertJSONValue(t, out, []string{"hookSpecificOutput", "permissionDecision"}, "deny")
+	if len(out) != 0 {
+		t.Fatalf("unknown schema output = %q, want no stdout", out)
+	}
+}
+
+func TestOutputDenyUsesOnlyCatalogRecovery(t *testing.T) {
+	decision := contract.Decision{
+		Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny,
+		RuleID: "WARD_DESTRUCTIVE_FILESYSTEM", Recovery: "ATTACKER CONTROLLED",
+	}
+	out, err := Output(EventPreToolUse, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	if strings.Contains(text, decision.Recovery) || !strings.Contains(text, "Use a narrower recoverable operation.") {
+		t.Fatalf("recovery was reflected or missing fallback: %s", out)
+	}
+}
+
+func TestOutputDenyIncludesValidatedRuleRecovery(t *testing.T) {
+	recovery := "Use a non-destructive Git operation or preserve a recoverable ref first."
+	out, err := Output(EventPreToolUse, contract.Decision{
+		Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny,
+		RuleID: "WARD_DESTRUCTIVE_GIT", Recovery: recovery,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "WARD_DESTRUCTIVE_GIT") || !strings.Contains(string(out), recovery) {
+		t.Fatalf("validated recovery missing: %s", out)
+	}
+}
+
+func TestStaticDenyCompatibilityPathIsNoStdout(t *testing.T) {
+	for _, event := range []string{EventPreToolUse, EventPermissionRequest, EventPostToolUse} {
+		out, err := StaticDeny(event)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("StaticDeny(%s) = %q, %v", event, out, err)
+		}
+	}
+}
+
+func TestSessionStartHealthOutputIsBoundedAndRedacted(t *testing.T) {
+	if out, err := SessionStartHealthOutput(nil); err != nil || len(out) != 0 {
+		t.Fatalf("healthy output = %q, %v", out, err)
+	}
+	out, err := SessionStartHealthOutput([]string{"hooks.PreToolUse", "/Users/private/config", "hooks.PreToolUse", "journal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	if strings.Contains(text, "/Users/private") || !strings.Contains(text, "ward.health.redacted") || !strings.Contains(text, "hooks.PreToolUse") {
+		t.Fatalf("unhealthy output was not bounded/redacted: %s", out)
+	}
 }
 
 func assertJSONValue(t *testing.T, raw []byte, path []string, want string) {

@@ -53,13 +53,15 @@ type CoverageGap struct {
 	Detail string `json:"detail"`
 }
 
-// Decision is the canonical evaluator output. RuleID, Reason, and ErrorCode
-// come from static catalogs so decisions do not reflect sensitive input.
+// Decision is the canonical evaluator output. RuleID, Reason, Recovery, and
+// ErrorCode come from static catalogs so decisions do not reflect sensitive
+// input.
 type Decision struct {
 	Schema      string       `json:"schema"`
 	Outcome     Outcome      `json:"outcome"`
 	RuleID      string       `json:"rule_id,omitempty"`
 	Reason      string       `json:"reason,omitempty"`
+	Recovery    string       `json:"recovery,omitempty"`
 	ErrorCode   string       `json:"error_code,omitempty"`
 	CoverageGap *CoverageGap `json:"coverage_gap,omitempty"`
 }
@@ -131,13 +133,17 @@ func validatePath(candidate string) error {
 }
 
 // Deny constructs a static hard-deny decision.
-func Deny(ruleID, reason string) Decision {
-	return Decision{
+func Deny(ruleID, reason string, recovery ...string) Decision {
+	decision := Decision{
 		Schema:  DecisionSchemaV1,
 		Outcome: OutcomeDeny,
 		RuleID:  ruleID,
 		Reason:  reason,
 	}
+	if len(recovery) > 0 {
+		decision.Recovery = recovery[0]
+	}
+	return decision
 }
 
 // Defer constructs a recognized no-veto decision. Host policy remains

@@ -29,7 +29,9 @@ var (
 type Phase string
 
 const (
-	PhasePre               Phase = "pre"
+	PhasePre Phase = "pre"
+	// PhasePermissionRequest and PhasePost remain part of the historical v1
+	// read contract. The current sparse writer accepts PhasePre only.
 	PhasePermissionRequest Phase = "permission_request"
 	PhasePost              Phase = "post"
 )
@@ -45,7 +47,9 @@ const (
 type Decision string
 
 const (
-	DecisionDeny  Decision = "deny"
+	DecisionDeny Decision = "deny"
+	// DecisionDefer remains part of the historical v1 read contract. The
+	// current sparse writer accepts DecisionDeny and DecisionError only.
 	DecisionDefer Decision = "defer"
 	DecisionError Decision = "error"
 )
@@ -119,9 +123,11 @@ const (
 	CoverageGapUnknown                        CoverageGapCode = "unknown"
 )
 
-// RecordInput contains transient hook data. CWD, raw identifiers, ToolInput,
-// and CorrelationInput are used only to derive keyed fingerprints; they are
-// never stored in an Event. A nil CorrelationInput falls back to ToolInput.
+// RecordInput contains transient hook data for a current sparse audit write.
+// Record accepts only a Pre phase with unknown host disposition, a deny or
+// error decision, and no coverage gap. CWD, raw identifiers, ToolInput, and
+// CorrelationInput are used only to derive keyed fingerprints; they are never
+// stored in an Event. A nil CorrelationInput falls back to ToolInput.
 //
 // Record returns an audit error independently of Decision. Callers retain full
 // ownership of the evaluator decision, so an audit failure cannot turn a deny

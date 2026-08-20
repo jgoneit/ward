@@ -394,7 +394,9 @@ func (s *Store) existingProject(ctx context.Context, cwd string) (projectState, 
 }
 
 func (s *Store) readLocked(ctx context.Context, project projectState) (chainState, error) {
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return chainState{}, err
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return chainState{}, err
@@ -404,5 +406,5 @@ func (s *Store) readLocked(ctx context.Context, project projectState) (chainStat
 		return chainState{}, err
 	}
 	defer lock.release()
-	return s.readVerifiedLog(project)
+	return s.readVerifiedLogContext(ctx, project)
 }

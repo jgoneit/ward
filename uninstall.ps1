@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 $codexDir = if ($env:CODEX_HOME) { [System.IO.Path]::GetFullPath($env:CODEX_HOME) } else { [System.IO.Path]::GetFullPath((Join-Path $HOME '.codex')) }
 $homeDir = [System.IO.Path]::GetFullPath($HOME)
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
@@ -24,6 +25,8 @@ while ($true) {
     $controlCursor = $controlParent.FullName
 }
 $binary = Join-Path $InstallDir 'ward.exe'
+$hooksFile = Join-Path $codexDir 'hooks.json'
+$configFile = Join-Path $codexDir 'config.toml'
 if (Test-Path -LiteralPath $binary) {
     $item = Get-Item -Force -LiteralPath $binary
     if (-not $item.PSIsContainer -and $item.LinkType) {
@@ -35,6 +38,33 @@ if (Test-Path -LiteralPath $binary) {
     Remove-Item -LiteralPath $binary
     Write-Output "removed $binary"
 } else {
-    throw "Ward uninstaller: binary not found at $binary; reinstall the same version before removing the Codex integration"
+    $wardRefs = $false
+    if (Test-Path -LiteralPath $hooksFile) {
+        $hooksItem = Get-Item -Force -LiteralPath $hooksFile
+        if ($hooksItem.PSIsContainer) {
+            $wardRefs = $true
+        }
+        else {
+            $hooksText = Get-Content -Raw -LiteralPath $hooksFile
+            $escapedBinary = $binary.Replace('\', '\\')
+            $wardRefs = $hooksText.Contains($binary) -or $hooksText.Contains($escapedBinary) -or $hooksText -match 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)'
+        }
+    }
+    if (Test-Path -LiteralPath $configFile) {
+        $configItem = Get-Item -Force -LiteralPath $configFile
+        if ($configItem.PSIsContainer) {
+            $wardRefs = $true
+        }
+        else {
+            $configText = Get-Content -Raw -LiteralPath $configFile
+            if ($configText -match '# >>> ward (default permissions|permission profile) v[12] >>>|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions\s*=\s*"ward-baseline"|\[permissions\.ward-baseline\]') {
+                $wardRefs = $true
+            }
+        }
+    }
+    if ($wardRefs) {
+        throw "Ward uninstaller: binary is missing at $binary while Ward hook or config references remain; reinstall the same version, then retry"
+    }
+    Write-Output 'Ward integration is already absent; no Ward hook or config references were found.'
 }
 Write-Output 'Ward audit state and key were preserved.'

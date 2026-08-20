@@ -6,6 +6,8 @@ install_dir=${WARD_INSTALL_DIR:-"$codex_dir/ward/bin"}
 codex_dir=${codex_dir%/}
 install_dir=${install_dir%/}
 binary="$install_dir/ward"
+hooks_file="$codex_dir/hooks.json"
+config_file="$codex_dir/config.toml"
 
 case "$codex_dir" in
   /*) ;;
@@ -50,8 +52,24 @@ if [ -e "$binary" ] || [ -L "$binary" ]; then
   rm -f "$binary"
   printf 'removed %s\n' "$binary"
 else
-	printf 'Ward uninstaller: binary not found at %s; reinstall the same version before removing the Codex integration\n' "$binary" >&2
-	exit 1
+	ward_refs=0
+	if [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; then
+		ward_refs=1
+	elif [ -f "$hooks_file" ]; then
+		if LC_ALL=C grep -Fq "$binary" "$hooks_file" || LC_ALL=C grep -Eq 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)' "$hooks_file"; then
+			ward_refs=1
+		fi
+	fi
+	if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
+		ward_refs=1
+	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq '# >>> ward (default permissions|permission profile) v[12] >>>|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions[[:space:]]*=[[:space:]]*"ward-baseline"|\[permissions\.ward-baseline\]' "$config_file"; then
+		ward_refs=1
+	fi
+	if [ "$ward_refs" -eq 1 ]; then
+		printf 'Ward uninstaller: binary is missing at %s while Ward hook or config references remain; reinstall the same version, then retry\n' "$binary" >&2
+		exit 1
+	fi
+	printf '%s\n' 'Ward integration is already absent; no Ward hook or config references were found.'
 fi
 
 printf '%s\n' 'Ward audit state and key were preserved.'

@@ -10,6 +10,7 @@
     "outcome": { "enum": ["deny", "defer", "error"] },
     "rule_id": { "type": "string", "minLength": 1 },
     "reason": { "type": "string", "minLength": 1 },
+    "recovery": { "type": "string", "minLength": 1 },
     "error_code": { "type": "string", "minLength": 1 },
     "coverage_gap": {
       "type": "object",

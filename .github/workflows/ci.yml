@@ -23,10 +23,15 @@ jobs:
           cache: true
       - name: Test
         run: go test ./...
+      - name: Race
+        if: runner.os == 'Linux'
+        run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: go build ./cmd/ward
+      - name: Safe Pre process performance
+        run: go run ./scripts/bench-pre-hook.go
       - name: Validate POSIX scripts
         if: runner.os != 'Windows'
         shell: sh

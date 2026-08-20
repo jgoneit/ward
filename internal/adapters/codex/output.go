@@ -4,17 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/jgoneit/ward/internal/contract"
 )
 
 const (
-	staticDenyReason = "Ward blocked this request because it could not be evaluated safely."
-	policyDenyReason = "Ward blocked this request by policy."
+	policyDenyReason      = "Ward blocked this request by policy."
+	maxSessionHealthIDs   = 8
+	maxSessionHealthBytes = 512
 )
 
-var safeRuleID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,96}$`)
+var (
+	safeRuleID  = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,96}$`)
+	safeCheckID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+)
 
 // Output translates a Ward decision to Codex hook stdout. A nil or empty byte
 // slice means the hook must write nothing. Ward intentionally never emits
@@ -28,38 +33,86 @@ func Output(event string, decision contract.Decision) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported Codex hook event %q", event)
 	}
 	if decision.Schema != contract.DecisionSchemaV1 {
-		return marshalDeny(event, staticDenyReason)
+		return nil, nil
 	}
 
 	switch decision.Outcome {
 	case contract.OutcomeDefer:
 		return nil, nil
 	case contract.OutcomeDeny:
-		return marshalDeny(event, policyMessage(decision.RuleID))
+		return marshalDeny(event, policyMessage(decision.RuleID, decision.Recovery))
 	case contract.OutcomeError:
-		return marshalDeny(event, staticDenyReason)
+		return nil, nil
 	default:
-		// Unknown outcomes fail closed and must never become an implicit
-		// allow because the wire contract evolved unexpectedly.
-		return marshalDeny(event, staticDenyReason)
-	}
-}
-
-// StaticDeny is used when payload decoding or evaluator invocation fails
-// before a normal Ward Decision exists.
-func StaticDeny(event string) ([]byte, error) {
-	if event == EventPostToolUse {
 		return nil, nil
 	}
-	return marshalDeny(event, staticDenyReason)
 }
 
-func policyMessage(ruleID string) string {
-	ruleID = strings.TrimSpace(ruleID)
-	if safeRuleID.MatchString(ruleID) {
-		return policyDenyReason + " Rule: " + ruleID + "."
+// StaticDeny is retained for CLI source compatibility. Runtime adapter errors
+// must not invent a permission decision, so it now produces exactly no stdout.
+func StaticDeny(event string) ([]byte, error) {
+	if event == EventPostToolUse || event == EventPreToolUse || event == EventPermissionRequest {
+		return nil, nil
 	}
-	return policyDenyReason
+	return nil, fmt.Errorf("unsupported Codex hook event %q", event)
+}
+
+// SessionStartHealthOutput emits no bytes for a healthy installation. For an
+// unhealthy installation it exposes only a sorted, bounded set of safe Doctor
+// check identifiers; paths, commands, and diagnostic messages never enter the
+// model context.
+func SessionStartHealthOutput(failedCheckIDs []string) ([]byte, error) {
+	if len(failedCheckIDs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(failedCheckIDs))
+	ids := make([]string, 0, min(len(failedCheckIDs), maxSessionHealthIDs))
+	for _, candidate := range failedCheckIDs {
+		candidate = strings.TrimSpace(candidate)
+		if !safeCheckID.MatchString(candidate) {
+			candidate = "ward.health.redacted"
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ids = append(ids, candidate)
+	}
+	sort.Strings(ids)
+	if len(ids) > maxSessionHealthIDs {
+		ids = ids[:maxSessionHealthIDs]
+	}
+	message := "Ward health warning: " + strings.Join(ids, ",") + ". Use the Ward session-health workflow."
+	if len(message) > maxSessionHealthBytes {
+		message = message[:maxSessionHealthBytes]
+	}
+	return json.Marshal(struct {
+		SystemMessage string `json:"systemMessage"`
+	}{SystemMessage: message})
+}
+
+func policyMessage(ruleID, recovery string) string {
+	ruleID = strings.TrimSpace(ruleID)
+	guidance := staticRecovery(ruleID, recovery)
+	if safeRuleID.MatchString(ruleID) {
+		return policyDenyReason + " Rule: " + ruleID + ". Recovery: " + guidance
+	}
+	return policyDenyReason + " Recovery: " + guidance
+}
+
+// staticRecovery accepts only evaluator catalog strings. Unknown or modified
+// values are replaced by a rule-scoped constant and never reflected verbatim.
+func staticRecovery(ruleID, candidate string) string {
+	catalog := map[string]string{
+		"WARD_DESTRUCTIVE_FILESYSTEM":     "Use a narrower target or a recoverable filesystem operation.",
+		"WARD_DESTRUCTIVE_GIT":            "Use a non-destructive Git operation or preserve a recoverable ref first.",
+		"WARD_DESTRUCTIVE_DATABASE":       "Use a scoped migration or another reversible database operation.",
+		"WARD_DESTRUCTIVE_INFRASTRUCTURE": "Use a plan or dry-run and target a narrower recoverable resource.",
+	}
+	if expected, ok := catalog[ruleID]; ok && (candidate == "" || candidate == expected) {
+		return expected
+	}
+	return "Use a narrower recoverable operation."
 }
 
 func marshalDeny(event, message string) ([]byte, error) {

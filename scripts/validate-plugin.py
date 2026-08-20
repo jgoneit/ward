@@ -49,5 +49,11 @@ if frontmatter.get("name") != "ward" or not frontmatter.get("description"):
     fail("Ward skill needs name and description")
 if "Ward must never output `permissionDecision: allow` or `ask`" not in skill_text:
     fail("Ward skill must explicitly forbid allow and ask hook decisions")
+if "On an ordinary `defer`, do nothing" not in skill_text:
+    fail("Ward skill must stay inactive for ordinary defer requests")
+if "Ward emits no permission decision and defers to the Host" not in skill_text:
+    fail("Ward skill must preserve fail-open-to-Host error semantics")
+if "retry it without asking the user" not in skill_text:
+    fail("Ward skill must guide autonomous recovery after a deny")
 
 print("PASS: Ward plugin and skill contracts are valid")

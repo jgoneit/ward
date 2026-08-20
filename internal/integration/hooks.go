@@ -8,66 +8,323 @@ import (
 	"io"
 	pathpkg "path"
 	"strings"
+
+	codexadapter "github.com/jgoneit/ward/internal/adapters/codex"
 )
 
-const allToolMatcher = "*"
+const (
+	hookTimeoutSeconds  = 2
+	sessionStartMatcher = `^(?:startup|resume|clear)$`
+	legacyAllMatcher    = "*"
+)
 
 type hookSpec struct {
+	Event      string
+	Subcommand string
+	Matcher    string
+}
+
+var wardHookSpecs = []hookSpec{
+	{Event: codexadapter.EventSessionStart, Subcommand: "codex-session-start", Matcher: sessionStartMatcher},
+	{Event: codexadapter.EventPreToolUse, Subcommand: "codex-pre-tool-use", Matcher: codexadapter.DestructiveToolMatcher},
+}
+
+type legacyHookSpec struct {
 	Event         string
 	Subcommand    string
 	StatusMessage string
 }
 
-var wardHookSpecs = []hookSpec{
-	{Event: "PreToolUse", Subcommand: "codex-pre-tool-use", StatusMessage: "Ward: evaluating tool request"},
-	{Event: "PermissionRequest", Subcommand: "codex-permission-request", StatusMessage: "Ward: evaluating permission request"},
-	{Event: "PostToolUse", Subcommand: "codex-post-tool-use", StatusMessage: "Ward: recording tool result"},
+// legacyWardHookSpecs describes the exact v1 three-hook installation. It is
+// removal-only: v2 never installs PermissionRequest or PostToolUse.
+var legacyWardHookSpecs = []legacyHookSpec{
+	{Event: codexadapter.EventPreToolUse, Subcommand: "codex-pre-tool-use", StatusMessage: "Ward: evaluating tool request"},
+	{Event: codexadapter.EventPermissionRequest, Subcommand: "codex-permission-request", StatusMessage: "Ward: evaluating permission request"},
+	{Event: codexadapter.EventPostToolUse, Subcommand: "codex-post-tool-use", StatusMessage: "Ward: recording tool result"},
 }
 
 func mergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
-	root, err := decodeJSONObject(original)
+	root, hooks, err := decodeHookRoot(original)
 	if err != nil {
-		return nil, false, fmt.Errorf("parse hooks.json: %w", err)
+		return nil, false, err
 	}
-
-	hooks := map[string]json.RawMessage{}
-	if raw, ok := root["hooks"]; ok {
-		if err := json.Unmarshal(raw, &hooks); err != nil || hooks == nil {
-			return nil, false, fmt.Errorf("%w: hooks must be an object", ErrConflict)
+	changed := false
+	for _, event := range managedHookEvents() {
+		groups, err := decodeGroups(hooks[event])
+		if err != nil {
+			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
+		}
+		next, eventChanged, err := removeOwnedLegacyGroups(groups, event, binaryPath)
+		if err != nil {
+			return nil, false, err
+		}
+		if eventChanged {
+			changed = true
+			setGroups(hooks, event, next)
 		}
 	}
-
-	changed := false
 	for _, spec := range wardHookSpecs {
 		groups, err := decodeGroups(hooks[spec.Event])
 		if err != nil {
 			return nil, false, fmt.Errorf("parse %s hooks: %w", spec.Event, err)
 		}
-		command := hookCommand(binaryPath, spec.Subcommand)
-		count, conflicting := countWardHandlers(groups, spec.StatusMessage, command)
-		if conflicting || count > 1 {
+		count, conflict := countDesiredHandlers(groups, spec, binaryPath)
+		if conflict || count > 1 {
 			return nil, false, fmt.Errorf("%w: ambiguous Ward %s handler", ErrConflict, spec.Event)
 		}
 		if count == 1 {
 			continue
 		}
-
-		group, err := newWardGroup(command, spec.StatusMessage)
+		group, err := newWardGroup(hookCommand(binaryPath, spec.Subcommand), spec.Matcher)
 		if err != nil {
 			return nil, false, err
 		}
 		groups = append(groups, group)
-		encoded, err := json.Marshal(groups)
-		if err != nil {
-			return nil, false, err
-		}
-		hooks[spec.Event] = encoded
+		setGroups(hooks, spec.Event, groups)
 		changed = true
 	}
-
 	if !changed {
 		return original, false, nil
 	}
+	return encodeHookRoot(root, hooks)
+}
+
+func unmergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
+	root, hooks, err := decodeHookRoot(original)
+	if err != nil {
+		return nil, false, err
+	}
+	changed := false
+	for _, event := range managedHookEvents() {
+		groups, err := decodeGroups(hooks[event])
+		if err != nil {
+			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
+		}
+		next, removed, err := removeWardGroups(groups, event, binaryPath, true)
+		if err != nil {
+			return nil, false, err
+		}
+		if removed > 1 {
+			return nil, false, fmt.Errorf("%w: duplicate Ward %s handlers", ErrConflict, event)
+		}
+		if removed > 0 {
+			changed = true
+			setGroups(hooks, event, next)
+		}
+	}
+	if !changed {
+		return original, false, nil
+	}
+	return encodeHookRoot(root, hooks)
+}
+
+func containsWardHandler(original []byte, binaryPath string) (bool, error) {
+	_, hooks, err := decodeHookRoot(original)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range managedHookEvents() {
+		groups, err := decodeGroups(hooks[event])
+		if err != nil {
+			return false, err
+		}
+		for _, rawGroup := range groups {
+			group, err := decodeGroup(rawGroup)
+			if err != nil {
+				return false, err
+			}
+			handlers, err := decodeHandlers(group["hooks"])
+			if err != nil {
+				return false, err
+			}
+			for _, rawHandler := range handlers {
+				legacy, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
+				if err != nil {
+					return false, err
+				}
+				if legacy || desired || conflict {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+func removeOwnedLegacyGroups(groups []json.RawMessage, event, binaryPath string) ([]json.RawMessage, bool, error) {
+	next, removed, err := removeWardGroups(groups, event, binaryPath, false)
+	if err != nil {
+		return nil, false, err
+	}
+	if removed > 1 {
+		return nil, false, fmt.Errorf("%w: duplicate legacy Ward %s handlers", ErrConflict, event)
+	}
+	return next, removed > 0, nil
+}
+
+// removeWardGroups removes exact v1 handlers, and optionally exact v2
+// handlers. Unrelated handlers in a shared group are preserved.
+func removeWardGroups(groups []json.RawMessage, event, binaryPath string, includeDesired bool) ([]json.RawMessage, int, error) {
+	next := make([]json.RawMessage, 0, len(groups))
+	removed := 0
+	for _, rawGroup := range groups {
+		group, err := decodeGroup(rawGroup)
+		if err != nil {
+			return nil, 0, err
+		}
+		handlers, err := decodeHandlers(group["hooks"])
+		if err != nil {
+			return nil, 0, err
+		}
+		kept := make([]json.RawMessage, 0, len(handlers))
+		removedFromGroup := 0
+		for _, rawHandler := range handlers {
+			ownedLegacy, ownedDesired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
+			if err != nil {
+				return nil, 0, err
+			}
+			if conflict {
+				return nil, 0, fmt.Errorf("%w: modified Ward %s handler", ErrConflict, event)
+			}
+			if ownedLegacy || (includeDesired && ownedDesired) {
+				removed++
+				removedFromGroup++
+				continue
+			}
+			kept = append(kept, rawHandler)
+		}
+		if removedFromGroup == 0 {
+			next = append(next, rawGroup)
+			continue
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		encoded, err := json.Marshal(kept)
+		if err != nil {
+			return nil, 0, err
+		}
+		group["hooks"] = encoded
+		encodedGroup, err := json.Marshal(group)
+		if err != nil {
+			return nil, 0, err
+		}
+		next = append(next, encodedGroup)
+	}
+	return next, removed, nil
+}
+
+func countDesiredHandlers(groups []json.RawMessage, spec hookSpec, binaryPath string) (int, bool) {
+	count := 0
+	for _, rawGroup := range groups {
+		group, err := decodeGroup(rawGroup)
+		if err != nil {
+			return count, true
+		}
+		handlers, err := decodeHandlers(group["hooks"])
+		if err != nil {
+			return count, true
+		}
+		for _, rawHandler := range handlers {
+			_, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), spec.Event, binaryPath)
+			if err != nil || conflict {
+				return count, true
+			}
+			if desired {
+				count++
+			}
+		}
+	}
+	return count, false
+}
+
+func classifyWardHandler(raw json.RawMessage, matcher, event, binaryPath string) (legacy, desired, conflict bool, err error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return false, false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+	}
+	var handler struct {
+		Type          string `json:"type"`
+		Command       string `json:"command"`
+		Timeout       int    `json:"timeout"`
+		StatusMessage string `json:"statusMessage"`
+	}
+	if err := json.Unmarshal(raw, &handler); err != nil {
+		return false, false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+	}
+	wardCommand := false
+	for _, spec := range legacyWardHookSpecs {
+		if handler.Command != hookCommand(binaryPath, spec.Subcommand) {
+			continue
+		}
+		wardCommand = true
+		if spec.Event == event && handler.Type == "command" && handler.Timeout == 10 && handler.StatusMessage == spec.StatusMessage && len(fields) == 4 && matcher == legacyAllMatcher {
+			return true, false, false, nil
+		}
+	}
+	for _, spec := range wardHookSpecs {
+		if handler.Command != hookCommand(binaryPath, spec.Subcommand) {
+			continue
+		}
+		wardCommand = true
+		if spec.Event == event && handler.Type == "command" && handler.Timeout == hookTimeoutSeconds && handler.StatusMessage == "" && len(fields) == 3 && matcher == spec.Matcher {
+			return false, true, false, nil
+		}
+	}
+	if wardCommand || looksLikeWardHookCommand(handler.Command) || strings.HasPrefix(handler.StatusMessage, "Ward:") {
+		return false, false, true, nil
+	}
+	return false, false, false, nil
+}
+
+func looksLikeWardHookCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	executable := ""
+	for _, spec := range wardHookSpecs {
+		suffix := " hook " + spec.Subcommand
+		if strings.HasSuffix(command, suffix) {
+			executable = strings.TrimSpace(strings.TrimSuffix(command, suffix))
+			break
+		}
+	}
+	if executable == "" {
+		for _, spec := range legacyWardHookSpecs {
+			suffix := " hook " + spec.Subcommand
+			if strings.HasSuffix(command, suffix) {
+				executable = strings.TrimSpace(strings.TrimSuffix(command, suffix))
+				break
+			}
+		}
+	}
+	if len(executable) >= 2 && (executable[0] == '\'' && executable[len(executable)-1] == '\'' || executable[0] == '"' && executable[len(executable)-1] == '"') {
+		executable = executable[1 : len(executable)-1]
+	}
+	if executable == "" || strings.ContainsAny(executable, "\r\n\t") || strings.Contains(executable, " ") {
+		return false
+	}
+	base := pathpkg.Base(strings.ReplaceAll(executable, `\`, "/"))
+	return base == "ward" || strings.EqualFold(base, "ward.exe")
+}
+
+func managedHookEvents() []string {
+	return []string{codexadapter.EventSessionStart, codexadapter.EventPreToolUse, codexadapter.EventPermissionRequest, codexadapter.EventPostToolUse}
+}
+
+func decodeHookRoot(original []byte) (map[string]json.RawMessage, map[string]json.RawMessage, error) {
+	root, err := decodeJSONObject(original)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse hooks.json: %w", err)
+	}
+	hooks := map[string]json.RawMessage{}
+	if raw, ok := root["hooks"]; ok {
+		if err := json.Unmarshal(raw, &hooks); err != nil || hooks == nil {
+			return nil, nil, fmt.Errorf("%w: hooks must be an object", ErrConflict)
+		}
+	}
+	return root, hooks, nil
+}
+
+func encodeHookRoot(root, hooks map[string]json.RawMessage) ([]byte, bool, error) {
 	encodedHooks, err := json.Marshal(hooks)
 	if err != nil {
 		return nil, false, err
@@ -80,105 +337,13 @@ func mergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
 	return append(out, '\n'), true, nil
 }
 
-func unmergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
-	root, err := decodeJSONObject(original)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse hooks.json: %w", err)
+func setGroups(hooks map[string]json.RawMessage, event string, groups []json.RawMessage) {
+	if len(groups) == 0 {
+		delete(hooks, event)
+		return
 	}
-	rawHooks, ok := root["hooks"]
-	if !ok {
-		return original, false, nil
-	}
-	hooks := map[string]json.RawMessage{}
-	if err := json.Unmarshal(rawHooks, &hooks); err != nil || hooks == nil {
-		return nil, false, fmt.Errorf("%w: hooks must be an object", ErrConflict)
-	}
-
-	changed := false
-	for _, spec := range wardHookSpecs {
-		groups, err := decodeGroups(hooks[spec.Event])
-		if err != nil {
-			return nil, false, fmt.Errorf("parse %s hooks: %w", spec.Event, err)
-		}
-		command := hookCommand(binaryPath, spec.Subcommand)
-		var next []json.RawMessage
-		removed := 0
-		for _, rawGroup := range groups {
-			group, err := decodeGroup(rawGroup)
-			if err != nil {
-				return nil, false, err
-			}
-			handlers, err := decodeHandlers(group["hooks"])
-			if err != nil {
-				return nil, false, err
-			}
-			kept := handlers[:0]
-			removedFromGroup := 0
-			for _, rawHandler := range handlers {
-				owned, conflict, err := isWardHandler(rawHandler, spec.StatusMessage, command)
-				if err != nil {
-					return nil, false, err
-				}
-				if conflict {
-					return nil, false, fmt.Errorf("%w: modified Ward %s handler", ErrConflict, spec.Event)
-				}
-				if owned {
-					if matcher(group) != allToolMatcher {
-						return nil, false, fmt.Errorf("%w: modified Ward %s matcher", ErrConflict, spec.Event)
-					}
-					removed++
-					removedFromGroup++
-					continue
-				}
-				kept = append(kept, rawHandler)
-			}
-			if len(kept) == 0 && removedFromGroup > 0 {
-				continue
-			}
-			if len(kept) != len(handlers) {
-				encoded, err := json.Marshal(kept)
-				if err != nil {
-					return nil, false, err
-				}
-				group["hooks"] = encoded
-				rawGroup, err = json.Marshal(group)
-				if err != nil {
-					return nil, false, err
-				}
-			}
-			next = append(next, rawGroup)
-		}
-		if removed > 1 {
-			return nil, false, fmt.Errorf("%w: duplicate Ward %s handlers", ErrConflict, spec.Event)
-		}
-		if removed == 0 {
-			continue
-		}
-		changed = true
-		if len(next) == 0 {
-			delete(hooks, spec.Event)
-		} else {
-			encoded, err := json.Marshal(next)
-			if err != nil {
-				return nil, false, err
-			}
-			hooks[spec.Event] = encoded
-		}
-	}
-
-	if !changed {
-		return original, false, nil
-	}
-	encodedHooks, err := json.Marshal(hooks)
-	if err != nil {
-		return nil, false, err
-	}
-	root["hooks"] = encodedHooks
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return nil, false, err
-	}
-	return append(out, '\n'), true, nil
+	encoded, _ := json.Marshal(groups)
+	hooks[event] = encoded
 }
 
 func decodeJSONObject(raw []byte) (map[string]json.RawMessage, error) {
@@ -290,74 +455,17 @@ func decodeHandlers(raw json.RawMessage) ([]json.RawMessage, error) {
 	return handlers, nil
 }
 
-func countWardHandlers(groups []json.RawMessage, status, command string) (int, bool) {
-	count := 0
-	for _, rawGroup := range groups {
-		group, err := decodeGroup(rawGroup)
-		if err != nil {
-			return count, true
-		}
-		handlers, err := decodeHandlers(group["hooks"])
-		if err != nil {
-			return count, true
-		}
-		for _, handler := range handlers {
-			owned, conflict, err := isWardHandler(handler, status, command)
-			if err != nil || conflict {
-				return count, true
-			}
-			if owned {
-				if matcher(group) != allToolMatcher {
-					return count, true
-				}
-				count++
-			}
-		}
-	}
-	return count, false
-}
-
-func isWardHandler(raw json.RawMessage, status, command string) (owned, conflict bool, err error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-		return false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
-	}
-	var handler struct {
-		Type          string `json:"type"`
-		Command       string `json:"command"`
-		Timeout       int    `json:"timeout"`
-		StatusMessage string `json:"statusMessage"`
-	}
-	if err := json.Unmarshal(raw, &handler); err != nil {
-		return false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
-	}
-	isWardLabel := handler.StatusMessage == status || strings.HasPrefix(handler.StatusMessage, "Ward:")
-	if !isWardLabel {
-		return false, false, nil
-	}
-	if handler.Type == "command" && handler.Command == command && handler.Timeout == 10 && handler.StatusMessage == status && len(fields) == 4 {
-		return true, false, nil
-	}
-	return false, true, nil
-}
-
-func matcher(group map[string]json.RawMessage) string {
+func groupMatcher(group map[string]json.RawMessage) string {
 	var value string
 	_ = json.Unmarshal(group["matcher"], &value)
 	return value
 }
 
-func newWardGroup(command, status string) (json.RawMessage, error) {
-	group := map[string]any{
-		"matcher": allToolMatcher,
-		"hooks": []map[string]any{{
-			"type":          "command",
-			"command":       command,
-			"timeout":       10,
-			"statusMessage": status,
-		}},
-	}
-	return json.Marshal(group)
+func newWardGroup(command, matcher string) (json.RawMessage, error) {
+	return json.Marshal(map[string]any{
+		"matcher": matcher,
+		"hooks":   []map[string]any{{"type": "command", "command": command, "timeout": hookTimeoutSeconds}},
+	})
 }
 
 func hookCommand(binaryPath, subcommand string) string {

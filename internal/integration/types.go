@@ -38,6 +38,13 @@ type Paths struct {
 	// diagnosing. They do not describe every ancestor below the user home.
 	CredentialTopologyIncomplete bool
 	StateTopologyIncomplete      bool
+	// ControlTopologyIncomplete is set by the caller when a project-writable
+	// ancestor can relocate Ward's dedicated config/hooks/binary anchors.
+	ControlTopologyIncomplete bool
+	// HomeWorkspaceTopology is true when the active workspace is HOME itself.
+	// Codex permission globs cannot simultaneously recurse through that root
+	// and exempt every Host-owned credential store below it.
+	HomeWorkspaceTopology bool
 }
 
 func (p Paths) journalFile() string {

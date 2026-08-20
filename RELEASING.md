@@ -1,30 +1,34 @@
 # Releasing Ward
 
-No release may skip the acceptance gates in this file.
+No release may skip these gates.
 
-## RC entry gate
+## RC entry
 
-- Isolated install, reinstall, uninstall, and doctor tests pass on macOS,
-  Linux/WSL, and native Windows.
-- Ward-added prompt count is zero and duplicate approval prompts are zero.
-- Secret access and catastrophic destruction fixtures have zero escapes.
+- Install, v1-to-v2 upgrade, reinstall, uninstall, SessionStart, and Doctor E2E
+  pass on macOS, Linux/WSL, and native Windows. Handler/profile tests that pipe
+  synthetic payloads do not substitute for one trusted real-Codex Hook dispatch
+  on each supported Host.
+- The installed definition contains exactly one narrow PreToolUse hook and one
+  SessionStart hook; Ward PermissionRequest/Post hooks are absent.
+- Ward-added and duplicate prompts are zero.
+- Safe defer output, model-visible context, and audit mutations are zero.
+- Protected-secret and defined catastrophic-destruction fixtures have zero
+  escapes within the documented 16-level native expansion bound. The
+  max-supported depth and max-plus-one behavior are recorded per platform.
 - Normal workflows have zero unresolved false deny.
-- Raw commands, paths, outputs, and canary secrets are absent from audit files.
-- Audit chain verification and Doctor have zero false PASS.
-- Cross-platform retention pruning uses a crash-safe generation contract;
-  preview-only or disabled mutation is not RC-complete.
+- With a healthy initialized store, each attributable deny/error produces one
+  sparse event containing no raw canary material; old v1 histories still
+  verify. Separate contention/corruption tests prove that audit failure cannot
+  suppress the enforcement response or delay it beyond the bounded local audit
+  budget.
+- Hook latency meets the documented p95 targets and the two-second timeout.
 - Twenty real Tasks finish without disabling Ward or asking a human to perform
   ordinary development work in Ward's place.
-- Guarded Plugin sessions report unavailable privileged diagnostics as `Not
-  run`, while the same Doctor and audit checks pass from a trusted Host-side or
-  local-terminal path.
-- A reviewed Host-side management capability makes Doctor and audit available
-  to the Plugin without weakening protected paths or adding a Ward-specific
-  prompt. Requiring the user to relay routine diagnostics from a terminal is
-  not RC-complete.
+- A denial with a safe alternative is recovered by the current Agent without a
+  new human prompt.
 
-Only then may `v0.1.0-rc.1` be created. Before RC, Harness Toolkit may pin a
-reviewed development commit only with Ward marked **Experimental**. That source
-pin does not activate Ward or imply that any RC gate passed. After the gates
-pass, a separate Toolkit update pins the reviewed release commit by exact Git
-SHA; Toolkit pins never follow a branch.
+Only then may `v0.1.0-rc.1` be created.
+
+Before RC, Harness Toolkit may pin a reviewed development commit only as an
+**Experimental** source module. That pin does not install Ward, activate Core,
+or imply that an RC gate passed. A release pin is a later exact-SHA update.

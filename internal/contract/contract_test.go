@@ -212,3 +212,22 @@ func TestDecisionJSONNeverHasAllowOutcome(t *testing.T) {
 		}
 	}
 }
+
+func TestDenyRecoveryRemainsWireOptional(t *testing.T) {
+	t.Parallel()
+
+	legacy, err := json.Marshal(Deny("WARD_TEST", "Denied by test."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacy), `"recovery"`) {
+		t.Fatalf("legacy deny unexpectedly requires recovery: %s", legacy)
+	}
+	current, err := json.Marshal(Deny("WARD_TEST", "Denied by test.", "Use a reversible test operation."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(current), `"recovery":"Use a reversible test operation."`) {
+		t.Fatalf("deny recovery was not serialized: %s", current)
+	}
+}
