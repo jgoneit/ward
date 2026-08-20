@@ -38,10 +38,13 @@ const (
 
 	maxInputBytes = 2 << 20
 
-	// Codex gives installed hooks two seconds. Sparse audit work must leave
-	// enough time for the adapter to return the deny (or silent error defer),
-	// even when another process holds an audit lock.
-	preToolAuditBudget = 250 * time.Millisecond
+	// Codex gives installed hooks two seconds. A healthy Windows store can need
+	// several protected-DACL writes for its first project, so the total sparse
+	// audit attempt gets one second while lock contention remains capped at the
+	// much smaller budget below. This still leaves time to return the deny (or
+	// silent error defer) before the Host timeout.
+	preToolAuditBudget     = time.Second
+	preToolAuditLockBudget = 250 * time.Millisecond
 	// SessionStart uses a larger read-only budget, but still returns a redacted
 	// check ID comfortably before the installed two-second hook timeout.
 	sessionStartDoctorBudget = time.Second
@@ -207,7 +210,7 @@ func runSessionStart(ctx context.Context, stdin io.Reader, stdout io.Writer) int
 }
 
 func recordHookAudit(ctx context.Context, invocation codex.Invocation, decision contract.Decision, policyMaterial []byte) error {
-	lockTimeout, ok := boundedLockTimeout(ctx, preToolAuditBudget)
+	lockTimeout, ok := boundedLockTimeout(ctx, preToolAuditLockBudget)
 	if !ok {
 		return ctx.Err()
 	}

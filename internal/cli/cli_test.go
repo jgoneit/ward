@@ -147,7 +147,11 @@ func TestDenyHookWritesOneRedactedAuditEvent(t *testing.T) {
 	}
 	raw := mustHookPayload(t, project, "rm -rf .")
 	var out, errOut bytes.Buffer
+	started := time.Now()
 	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(raw), &out, &errOut)
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("deny Hook returned in %s, beyond the Host timeout", elapsed)
+	}
 	if code != exitOK || out.Len() == 0 || errOut.Len() != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
@@ -189,7 +193,11 @@ func TestEvaluatorErrorDefersToHostAndWritesOneErrorEvent(t *testing.T) {
 	t.Cleanup(func() { executablePath = previous })
 
 	var out, errOut bytes.Buffer
+	started := time.Now()
 	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(mustHookPayload(t, project, "printf ordinary")), &out, &errOut)
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("error Hook returned in %s, beyond the Host timeout", elapsed)
+	}
 	if code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
@@ -271,8 +279,8 @@ func TestPreHookAuditContentionStaysInsideHostBudget(t *testing.T) {
 			if (out.Len() > 0) != test.wantOutput {
 				t.Fatalf("stdout=%q wantOutput=%t", out.String(), test.wantOutput)
 			}
-			if lockTimeout <= 0 || lockTimeout > preToolAuditBudget {
-				t.Fatalf("audit lock timeout=%s budget=%s", lockTimeout, preToolAuditBudget)
+			if lockTimeout <= 0 || lockTimeout > preToolAuditLockBudget {
+				t.Fatalf("audit lock timeout=%s budget=%s", lockTimeout, preToolAuditLockBudget)
 			}
 			if elapsed >= time.Second {
 				t.Fatalf("hook returned in %s, too close to the two-second Host timeout", elapsed)
