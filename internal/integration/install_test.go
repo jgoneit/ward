@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/jgoneit/ward/internal/audit"
 )
 
 func TestInstallDryRunDoesNotCreateAnything(t *testing.T) {
@@ -352,7 +354,7 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 	hooks := legacyHooksFixture(t, options.Paths.BinaryPath, originalHooks)
 	writeFixtureFile(t, options.Paths.ConfigFile, working)
 	writeFixtureFile(t, options.Paths.HooksFile, hooks)
-	if err := os.MkdirAll(options.Paths.StateDir, 0o700); err != nil {
+	if err := prepareStateDirectory(options.Paths.StateDir); err != nil {
 		t.Fatal(err)
 	}
 	journal := integrationJournal{
@@ -365,7 +367,11 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeFixtureFile(t, options.Paths.journalFile(), raw)
+	journalPath := options.Paths.journalFile()
+	writeFixtureFile(t, journalPath, raw)
+	if err := audit.SecurePrivateFile(journalPath); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func fixtureOptions(t *testing.T) Options {
