@@ -3,12 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jgoneit/ward/internal/audit"
 	"github.com/jgoneit/ward/internal/integration"
@@ -17,403 +22,516 @@ import (
 func TestVersion(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := Run(context.Background(), []string{"--version"}, strings.NewReader(""), &out, &errOut)
-	if code != 0 || !strings.HasPrefix(out.String(), "ward ") || errOut.Len() != 0 {
+	if code != exitOK || !strings.HasPrefix(out.String(), "ward ") || errOut.Len() != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
 }
 
-func TestMalformedPreHookReturnsStaticDeny(t *testing.T) {
-	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, strings.NewReader(`{"bad":true}`), &out, &errOut)
-	if code != 0 {
-		t.Fatalf("code=%d stderr=%q", code, errOut.String())
-	}
-	var value map[string]any
-	if err := json.Unmarshal(out.Bytes(), &value); err != nil {
-		t.Fatalf("output is not JSON: %v (%q)", err, out.String())
-	}
-	if strings.Contains(out.String(), "allow") || strings.Contains(out.String(), "ask") {
-		t.Fatalf("unsafe hook output: %s", out.String())
-	}
-}
-
-func TestMalformedPostHookProducesNoOutput(t *testing.T) {
-	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"hook", "codex-post-tool-use"}, strings.NewReader(`{"bad":true}`), &out, &errOut)
-	if code != 0 || out.Len() != 0 {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
-	}
-}
-
-func TestUnknownCommandIsUsageError(t *testing.T) {
-	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"unknown"}, strings.NewReader(""), &out, &errOut)
-	if code != exitUsage {
-		t.Fatalf("code=%d, want %d", code, exitUsage)
-	}
-}
-
-func TestPolicyValidateUsesActiveUserPolicyByDefault(t *testing.T) {
-	_, codexHome := isolatedUserEnvironment(t)
-	policyPath := filepath.Join(codexHome, "ward", "policy.toml")
-	if err := os.MkdirAll(filepath.Dir(policyPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(policyPath, []byte("schema = 'ward.policy.v1'\n[allow]\npaths = ['**/.env']\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"policy", "validate", "--json"}, strings.NewReader(""), &out, &errOut)
-	if code != exitPolicy {
-		t.Fatalf("code=%d, want %d; stdout=%q stderr=%q", code, exitPolicy, out.String(), errOut.String())
-	}
-}
-
-func TestEvaluateAndHookUseEnvironmentResolvedCredentialPath(t *testing.T) {
+func TestEvaluateDeniesCatastrophicDeleteAndDefersSecretRead(t *testing.T) {
 	root, _ := isolatedUserEnvironment(t)
 	project := filepath.Join(root, "project")
-	credential := filepath.Join(root, "custom-gh", "hosts.yml")
-	for _, directory := range []string{project, filepath.Dir(credential)} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		command string
+		want    string
+	}{
+		{"rm -rf .", "deny"},
+		{"cat .env", "defer"},
+		{"bash", "defer"},
+	} {
+		request := map[string]any{
+			"schema": "ward-request/v1",
+			"host":   "test",
+			"event":  "PreToolUse",
+			"tool":   "bash",
+			"cwd":    project,
+			"input":  map[string]any{"command": test.command},
+		}
+		raw, err := json.Marshal(request)
+		if err != nil {
 			t.Fatal(err)
 		}
+		var out, errOut bytes.Buffer
+		code := Run(context.Background(), []string{"evaluate", "--input", "-", "--json"}, bytes.NewReader(raw), &out, &errOut)
+		if code != exitOK || errOut.Len() != 0 {
+			t.Fatalf("%q code=%d stdout=%q stderr=%q", test.command, code, out.String(), errOut.String())
+		}
+		var decision map[string]any
+		if err := json.Unmarshal(out.Bytes(), &decision); err != nil || decision["outcome"] != test.want {
+			t.Fatalf("%q decision=%#v err=%v", test.command, decision, err)
+		}
 	}
-	t.Setenv("GH_CONFIG_DIR", filepath.Dir(credential))
+}
 
-	request := map[string]any{
-		"schema": "ward-request/v1",
-		"host":   "test",
-		"event":  "PreToolUse",
-		"tool":   "bash",
-		"cwd":    project,
-		"input":  map[string]any{"command": "cat " + credential},
+func TestMalformedPreHookDefersSilentlyWithoutAuditIdentity(t *testing.T) {
+	isolatedUserEnvironment(t)
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, strings.NewReader(`{"bad":true}`), &out, &errOut)
+	if code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
-	rawRequest, err := json.Marshal(request)
+	stateDir, err := audit.DefaultStateDir()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("malformed hook created audit identity: %v", err)
+	}
+}
+
+func TestMalformedSessionStartReturnsOneRedactedWarningWithoutAuditIdentity(t *testing.T) {
+	isolatedUserEnvironment(t)
 	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"evaluate", "--input", "-", "--json"}, bytes.NewReader(rawRequest), &out, &errOut); code != exitOK {
-		t.Fatalf("evaluate code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	code := Run(context.Background(), []string{"hook", "codex-session-start"}, strings.NewReader(`{"private-canary":"value"}`), &out, &errOut)
+	if code != exitOK || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
-	var decision map[string]any
-	if err := json.Unmarshal(out.Bytes(), &decision); err != nil || decision["outcome"] != "deny" {
-		t.Fatalf("evaluate decision=%#v err=%v", decision, err)
+	if bytes.Count(out.Bytes(), []byte{'\n'}) != 1 || !strings.Contains(out.String(), "session.payload") || strings.Contains(out.String(), "private-canary") {
+		t.Fatalf("malformed SessionStart warning is missing, repeated, or unredacted: %q", out.String())
 	}
-	if strings.Contains(out.String(), credential) {
-		t.Fatalf("evaluate output reflected credential path: %q", out.String())
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("malformed SessionStart created audit identity: %v", err)
+	}
+}
+
+func TestLegacyPermissionAndPostHooksAreQuietNoOps(t *testing.T) {
+	isolatedUserEnvironment(t)
+	for _, name := range []string{"codex-permission-request", "codex-post-tool-use"} {
+		var out, errOut bytes.Buffer
+		code := Run(context.Background(), []string{"hook", name}, strings.NewReader("not-json"), &out, &errOut)
+		if code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
+			t.Fatalf("%s code=%d stdout=%q stderr=%q", name, code, out.String(), errOut.String())
+		}
+	}
+}
+
+func TestSafePreHookThousandCallsAreSilentAuditFreeAndFast(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.NewStore(audit.Options{StateDir: stateDir}); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, stateDir)
+	raw := mustHookPayload(t, project, "printf ordinary")
+	durations := make([]time.Duration, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		var out, errOut bytes.Buffer
+		started := time.Now()
+		code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(raw), &out, &errOut)
+		durations = append(durations, time.Since(started))
+		if code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
+			t.Fatalf("iteration %d code=%d stdout=%q stderr=%q", i, code, out.String(), errOut.String())
+		}
+	}
+	after := snapshotTree(t, stateDir)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("defer mutated audit state\nbefore=%#v\nafter=%#v", before, after)
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	p95 := durations[(len(durations)*95)/100]
+	limit := 50 * time.Millisecond
+	if runtime.GOOS == "windows" {
+		limit = 100 * time.Millisecond
+	}
+	if p95 > limit {
+		t.Fatalf("safe Pre p95=%s exceeds %s", p95, limit)
+	}
+}
+
+func TestDenyHookWritesOneRedactedAuditEvent(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project-private-canary")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.NewStore(audit.Options{StateDir: stateDir}); err != nil {
+		t.Fatal(err)
+	}
+	raw := mustHookPayload(t, project, "rm -rf .")
+	var out, errOut bytes.Buffer
+	started := time.Now()
+	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(raw), &out, &errOut)
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("deny Hook returned in %s, beyond the Host timeout", elapsed)
+	}
+	if code != exitOK || out.Len() == 0 || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	var hookOutput map[string]any
+	if err := json.Unmarshal(out.Bytes(), &hookOutput); err != nil {
+		t.Fatalf("deny output is not JSON: %v", err)
+	}
+	if strings.Contains(out.String(), project) || strings.Contains(out.String(), "rm -rf") ||
+		strings.Contains(out.String(), `"allow"`) || strings.Contains(out.String(), `"ask"`) {
+		t.Fatalf("unsafe deny output: %s", out.String())
 	}
 
+	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Show(context.Background(), project, audit.Filter{})
+	if err != nil || len(events) != 1 || events[0].Decision != audit.DecisionDeny {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+	assertTreeExcludes(t, stateDir, project, "rm -rf", `"tool_name"`, `"command"`)
+}
+
+func TestEvaluatorErrorDefersToHostAndWritesOneErrorEvent(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.NewStore(audit.Options{StateDir: stateDir}); err != nil {
+		t.Fatal(err)
+	}
+	previous := executablePath
+	executablePath = func() (string, error) { return "", errors.New("synthetic executable failure") }
+	t.Cleanup(func() { executablePath = previous })
+
+	var out, errOut bytes.Buffer
+	started := time.Now()
+	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(mustHookPayload(t, project, "printf ordinary")), &out, &errOut)
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("error Hook returned in %s, beyond the Host timeout", elapsed)
+	}
+	if code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Show(context.Background(), project, audit.Filter{})
+	if err != nil || len(events) != 1 || events[0].Decision != audit.DecisionError {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+}
+
+func TestDenyHookDoesNotReinitializeMissingInstalledAuditIdentity(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.NewStore(audit.Options{StateDir: stateDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stateDir, stateDir+".moved"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(mustHookPayload(t, project, "rm -rf /")), &out, &errOut)
+	if code != exitOK || out.Len() == 0 || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if _, err := os.Lstat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deny Hook recreated missing audit identity: %v", err)
+	}
+}
+
+func TestPreHookAuditContentionStaysInsideHostBudget(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		command    string
+		engineFail bool
+		wantOutput bool
+	}{
+		{name: "deny", command: "rm -rf .", wantOutput: true},
+		{name: "error", command: "printf ordinary", engineFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, _ := isolatedUserEnvironment(t)
+			project := filepath.Join(root, "project")
+			if err := os.MkdirAll(project, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if test.engineFail {
+				previous := executablePath
+				executablePath = func() (string, error) { return "", errors.New("synthetic executable failure") }
+				t.Cleanup(func() { executablePath = previous })
+			}
+
+			previousStore := newHookAuditStore
+			var lockTimeout time.Duration
+			newHookAuditStore = func(_ context.Context, options audit.Options) (*audit.Store, error) {
+				lockTimeout = options.LockTimeout
+				time.Sleep(options.LockTimeout)
+				return nil, audit.ErrLockTimeout
+			}
+			t.Cleanup(func() { newHookAuditStore = previousStore })
+
+			started := time.Now()
+			var out, errOut bytes.Buffer
+			code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(mustHookPayload(t, project, test.command)), &out, &errOut)
+			elapsed := time.Since(started)
+			if code != exitOK || errOut.Len() != 0 {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+			}
+			if (out.Len() > 0) != test.wantOutput {
+				t.Fatalf("stdout=%q wantOutput=%t", out.String(), test.wantOutput)
+			}
+			if lockTimeout <= 0 || lockTimeout > preToolAuditLockBudget {
+				t.Fatalf("audit lock timeout=%s budget=%s", lockTimeout, preToolAuditLockBudget)
+			}
+			if elapsed >= time.Second {
+				t.Fatalf("hook returned in %s, too close to the two-second Host timeout", elapsed)
+			}
+		})
+	}
+}
+
+func TestSessionStartHealthyIsSilentAndUnhealthyIsBounded(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project-private-canary")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	payload := map[string]any{
 		"session_id":      "session",
 		"transcript_path": nil,
 		"cwd":             project,
-		"hook_event_name": "PreToolUse",
+		"hook_event_name": "SessionStart",
 		"model":           "gpt-test",
 		"permission_mode": "default",
-		"turn_id":         "turn",
-		"tool_name":       "Bash",
-		"tool_use_id":     "tool-use",
-		"tool_input":      map[string]any{"command": "cat " + credential},
+		"source":          "startup",
 	}
-	rawHook, err := json.Marshal(payload)
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
+	}
+	previous := sessionDoctor
+	t.Cleanup(func() { sessionDoctor = previous })
+
+	sessionDoctor = func(context.Context, string) []string { return nil }
+	var out, errOut bytes.Buffer
+	if code := Run(context.Background(), []string{"hook", "codex-session-start"}, bytes.NewReader(raw), &out, &errOut); code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("healthy code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+
+	sessionDoctor = func(context.Context, string) []string {
+		return []string{"control.hooks", "audit", project}
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(rawHook), &out, &errOut); code != exitOK {
-		t.Fatalf("hook code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	if code := Run(context.Background(), []string{"hook", "codex-session-start"}, bytes.NewReader(raw), &out, &errOut); code != exitOK || out.Len() == 0 || errOut.Len() != 0 {
+		t.Fatalf("unhealthy code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
-	var hookOutput map[string]any
-	if err := json.Unmarshal(out.Bytes(), &hookOutput); err != nil {
-		t.Fatalf("hook output=%#v err=%v", hookOutput, err)
-	}
-	specific, ok := hookOutput["hookSpecificOutput"].(map[string]any)
-	if !ok || specific["permissionDecision"] != "deny" {
-		t.Fatalf("hook output=%#v err=%v", hookOutput, err)
-	}
-	if strings.Contains(out.String(), credential) {
-		t.Fatalf("hook output reflected credential path: %q", out.String())
+	if strings.Contains(out.String(), project) || !strings.Contains(out.String(), "control.hooks") || !strings.Contains(out.String(), "audit") {
+		t.Fatalf("unbounded health output: %q", out.String())
 	}
 }
 
-func TestPolicyMaterialBindsCredentialSetWithoutRawPaths(t *testing.T) {
+func TestSessionStartAuditContentionReturnsRedactedIDWithinBudget(t *testing.T) {
 	root, _ := isolatedUserEnvironment(t)
-	first := filepath.Join(root, "first-secret-location")
-	second := filepath.Join(root, "second-secret-location")
-	t.Setenv("GH_CONFIG_DIR", first)
-	_, firstMaterial, err := loadUserPolicy()
+	project := filepath.Join(root, "project-private-canary")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"session_id":      "session",
+		"transcript_path": nil,
+		"cwd":             project,
+		"hook_event_name": "SessionStart",
+		"model":           "gpt-test",
+		"permission_mode": "default",
+		"source":          "startup",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GH_CONFIG_DIR", second)
-	_, secondMaterial, err := loadUserPolicy()
-	if err != nil {
+
+	var installOut, installErr bytes.Buffer
+	if code := Run(context.Background(), []string{"codex", "install", "--scope", "user"}, strings.NewReader(""), &installOut, &installErr); code != exitOK {
+		t.Fatalf("install code=%d stdout=%q stderr=%q", code, installOut.String(), installErr.String())
+	}
+	var healthyOut, healthyErr bytes.Buffer
+	if code := Run(context.Background(), []string{"hook", "codex-session-start"}, bytes.NewReader(raw), &healthyOut, &healthyErr); code != exitOK || healthyOut.Len() != 0 || healthyErr.Len() != 0 {
+		t.Fatalf("healthy SessionStart code=%d stdout=%q stderr=%q", code, healthyOut.String(), healthyErr.String())
+	}
+
+	previousStore := openDoctorAuditStore
+	var lockTimeout time.Duration
+	openDoctorAuditStore = func(_ context.Context, options audit.Options) (*audit.Store, error) {
+		lockTimeout = options.LockTimeout
+		time.Sleep(options.LockTimeout)
+		return nil, audit.ErrLockTimeout
+	}
+	t.Cleanup(func() { openDoctorAuditStore = previousStore })
+
+	started := time.Now()
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"hook", "codex-session-start"}, bytes.NewReader(raw), &out, &errOut)
+	elapsed := time.Since(started)
+	if code != exitOK || out.Len() == 0 || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if lockTimeout <= 0 || lockTimeout > sessionStartDoctorBudget {
+		t.Fatalf("doctor audit lock timeout=%s budget=%s", lockTimeout, sessionStartDoctorBudget)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("SessionStart returned in %s, too close to the two-second Host timeout", elapsed)
+	}
+	if !strings.Contains(out.String(), "audit") || strings.Contains(out.String(), project) {
+		t.Fatalf("SessionStart warning was not redacted: %q", out.String())
+	}
+}
+
+func TestSessionDoctorDoesNotRequireCodexCLIOnHookPATH(t *testing.T) {
+	root, _ := isolatedUserEnvironment(t)
+	project := filepath.Join(root, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(firstMaterial, secondMaterial) {
-		t.Fatal("policy material did not change with the runtime credential set")
+	var out, errOut bytes.Buffer
+	if code := Run(context.Background(), []string{"codex", "install", "--scope", "user"}, strings.NewReader(""), &out, &errOut); code != exitOK {
+		t.Fatalf("install code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
-	for _, rawPath := range []string{first, second} {
-		if bytes.Contains(firstMaterial, []byte(rawPath)) || bytes.Contains(secondMaterial, []byte(rawPath)) {
-			t.Fatalf("policy material retained raw credential path %q", rawPath)
+	t.Setenv("PATH", filepath.Join(root, "path-without-codex"))
+	if ids := sessionDoctorCheckIDs(context.Background(), project); len(ids) != 0 {
+		t.Fatalf("healthy SessionStart depended on Codex CLI PATH: %v", ids)
+	}
+}
+
+func TestRemovedPolicyAndPruneCommandsAreUsageErrors(t *testing.T) {
+	for _, args := range [][]string{{"policy", "validate"}, {"audit", "prune", "--dry-run"}} {
+		var out, errOut bytes.Buffer
+		code := Run(context.Background(), args, strings.NewReader(""), &out, &errOut)
+		if code != exitUsage {
+			t.Fatalf("%v code=%d stdout=%q stderr=%q", args, code, out.String(), errOut.String())
+		}
+	}
+	var out, errOut bytes.Buffer
+	if code := Run(context.Background(), []string{"help"}, strings.NewReader(""), &out, &errOut); code != exitOK {
+		t.Fatalf("help code=%d", code)
+	}
+	for _, forbidden := range []string{"policy", "prune", "PermissionRequest", "PostToolUse"} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("public help contains %q: %s", forbidden, out.String())
 		}
 	}
 }
 
-func TestVersionAtLeast(t *testing.T) {
-	for _, test := range []struct {
-		value string
-		want  bool
-	}{
-		{"0.138.0", true},
-		{"0.147.0", true},
-		{"1.0.0", true},
-		{"0.137.9", false},
-		{"not-a-version", false},
+func TestLegacyBaselineProfileIsAcceptedButHidden(t *testing.T) {
+	isolatedUserEnvironment(t)
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"codex", "install", "--scope", "user", "--profile", "baseline", "--dry-run"}, strings.NewReader(""), &out, &errOut)
+	if code != exitOK || errOut.Len() != 0 {
+		t.Fatalf("compatibility profile code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run(context.Background(), []string{"codex", "install", "--help"}, strings.NewReader(""), &out, &errOut)
+	if code != exitUsage || strings.Contains(errOut.String(), "profile") {
+		t.Fatalf("public help exposed compatibility profile: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+
+	for _, args := range [][]string{
+		{"codex", "install", "--profile", "other", "--dry-run"},
+		{"codex", "install", "--profile=baseline", "--profile", "baseline", "--dry-run"},
 	} {
-		if got := versionAtLeast(test.value, 0, 138, 0); got != test.want {
-			t.Errorf("versionAtLeast(%q) = %v, want %v", test.value, got, test.want)
+		out.Reset()
+		errOut.Reset()
+		if code := Run(context.Background(), args, strings.NewReader(""), &out, &errOut); code != exitUsage {
+			t.Fatalf("invalid compatibility args %v code=%d stdout=%q stderr=%q", args, code, out.String(), errOut.String())
 		}
+	}
+}
+
+func TestActionSpecificHelpDoesNotAdvertiseIgnoredFlags(t *testing.T) {
+	for name, args := range map[string][]string{
+		"uninstall": {"codex", "uninstall", "--help"},
+		"verify":    {"audit", "verify", "--help"},
+		"repair":    {"audit", "repair", "--help"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			if code := Run(context.Background(), args, strings.NewReader(""), &out, &errOut); code != exitUsage {
+				t.Fatalf("help code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+			}
+			for _, forbidden := range map[string][]string{
+				"uninstall": {"migrate-permissions", "profile"},
+				"verify":    {"since", "dry-run", "limit"},
+				"repair":    {"since", "limit"},
+			}[name] {
+				if strings.Contains(errOut.String(), forbidden) {
+					t.Fatalf("help exposed %q: %s", forbidden, errOut.String())
+				}
+			}
+		})
 	}
 }
 
 func TestSyntheticDoctorCheckPasses(t *testing.T) {
 	check := doctorSyntheticCheck()
-	if check.Status != "pass" {
+	if check.Status != integration.CheckPass {
 		t.Fatalf("doctorSyntheticCheck() = %#v", check)
 	}
 }
 
-func TestRiskClassCoversStableRuleFamilies(t *testing.T) {
+func TestRiskClassCoversRetainedRuleFamilies(t *testing.T) {
 	tests := map[string]string{
-		"WARD_SECRET_PATH":                "secret",
 		"WARD_DESTRUCTIVE_FILESYSTEM":     "catastrophic-delete",
 		"WARD_DESTRUCTIVE_GIT":            "destructive-git",
-		"WARD_INTERACTIVE_SESSION":        "interactive-session",
 		"WARD_DESTRUCTIVE_DATABASE":       "external-destruction",
 		"WARD_DESTRUCTIVE_INFRASTRUCTURE": "external-destruction",
-		"CUSTOM_NO_PRODUCTION_WIPE":       "additive-policy",
+		"WARD_INTERACTIVE_SESSION":        "",
+		"WARD_SECRET_PATH":                "",
 	}
 	for ruleID, want := range tests {
 		if got := riskClass(ruleID); got != want {
-			t.Errorf("riskClass(%q) = %q, want %q", ruleID, got, want)
+			t.Errorf("riskClass(%q)=%q want %q", ruleID, got, want)
 		}
 	}
 }
 
-func TestHookAuditPersistsOnlyFingerprints(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "project-private-name")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
+func TestBoundaryPolicyMaterialChangesWithoutRawPaths(t *testing.T) {
+	first := []string{"/private/first-control"}
+	second := []string{"/private/second-control"}
+	firstMaterial := boundaryPolicyMaterial(first)
+	secondMaterial := boundaryPolicyMaterial(second)
+	if bytes.Equal(firstMaterial, secondMaterial) {
+		t.Fatal("boundary policy material did not change")
 	}
-	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
-	t.Setenv("APPDATA", filepath.Join(root, "appdata"))
-	t.Setenv("LOCALAPPDATA", filepath.Join(root, "localappdata"))
-
-	const inputCanary = "WARD_RAW_COMMAND_CANARY_d0c2e4"
-	const responseCanary = "WARD_RAW_RESPONSE_CANARY_a19b73"
-	payload := map[string]any{
-		"session_id":      "session-secret-id",
-		"transcript_path": nil,
-		"cwd":             project,
-		"hook_event_name": "PreToolUse",
-		"model":           "gpt-test",
-		"permission_mode": "default",
-		"turn_id":         "turn-secret-id",
-		"tool_name":       "Bash",
-		"tool_use_id":     "tool-secret-id",
-		"tool_input":      map[string]any{"command": "printf " + inputCanary + " ordinary.txt"},
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(raw), &out, &errOut); code != 0 || out.Len() != 0 || errOut.Len() != 0 {
-		t.Fatalf("pre hook code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
-	}
-
-	payload["hook_event_name"] = "PostToolUse"
-	payload["tool_response"] = map[string]any{"output": responseCanary}
-	raw, err = json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out.Reset()
-	errOut.Reset()
-	if code := Run(context.Background(), []string{"hook", "codex-post-tool-use"}, bytes.NewReader(raw), &out, &errOut); code != 0 || out.Len() != 0 || errOut.Len() != 0 {
-		t.Fatalf("post hook code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
-	}
-
-	stateDir, err := audit.DefaultStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	verification, err := store.Verify(context.Background(), project)
-	if err != nil || !verification.Valid || verification.Records != 2 {
-		t.Fatalf("Verify() = %#v, %v", verification, err)
-	}
-	events, err := store.Show(context.Background(), project, audit.Filter{})
-	if err != nil || len(events) != 2 || events[0].Decision != audit.DecisionDefer || events[1].HostDisposition != audit.HostPostObserved {
-		t.Fatalf("Show() = %#v, %v", events, err)
-	}
-
-	if err := filepath.WalkDir(stateDir, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() || filepath.Base(path) == "master.key" {
-			return walkErr
+	for _, raw := range append(first, second...) {
+		if bytes.Contains(firstMaterial, []byte(raw)) || bytes.Contains(secondMaterial, []byte(raw)) {
+			t.Fatalf("boundary policy material retained raw path %q", raw)
 		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		for _, forbidden := range []string{inputCanary, responseCanary, project, "session-secret-id", "turn-secret-id", "tool-secret-id", `"tool_name"`, `"command"`} {
-			if bytes.Contains(data, []byte(forbidden)) {
-				t.Errorf("audit file %s persisted forbidden raw material %q", path, forbidden)
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-}
-
-func TestHookAuditPersistsStaticCoverageGapCode(t *testing.T) {
-	root, _ := isolatedUserEnvironment(t)
-	project := filepath.Join(root, "project")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	payload := map[string]any{
-		"session_id":      "session",
-		"transcript_path": nil,
-		"cwd":             project,
-		"hook_event_name": "PreToolUse",
-		"model":           "gpt-test",
-		"permission_mode": "default",
-		"turn_id":         "turn",
-		"tool_name":       "mcp__unknown__opaque",
-		"tool_use_id":     "tool-use",
-		"tool_input":      map[string]any{"opaque": "WARD_GAP_DETAIL_CANARY"},
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, bytes.NewReader(raw), &out, &errOut); code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
-		t.Fatalf("hook code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
-	}
-	stateDir, err := audit.DefaultStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err := store.Show(context.Background(), project, audit.Filter{})
-	if err != nil || len(events) != 1 {
-		t.Fatalf("Show() = %#v, %v", events, err)
-	}
-	if events[0].CoverageGapCode != audit.CoverageGapUnsupportedTool {
-		t.Fatalf("coverage gap = %q, want unsupported_tool", events[0].CoverageGapCode)
-	}
-	encoded, err := json.Marshal(events[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(encoded, []byte("WARD_GAP_DETAIL_CANARY")) {
-		t.Fatalf("audit event persisted raw coverage detail: %s", encoded)
-	}
-}
-
-func TestHookAuditCorrelatesPermissionDescriptionProjection(t *testing.T) {
-	root, _ := isolatedUserEnvironment(t)
-	project := filepath.Join(root, "project")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	base := map[string]any{
-		"session_id":      "session",
-		"transcript_path": nil,
-		"cwd":             project,
-		"model":           "gpt-test",
-		"permission_mode": "default",
-		"turn_id":         "turn",
-		"tool_name":       "Bash",
-	}
-	pre := make(map[string]any, len(base)+3)
-	for key, value := range base {
-		pre[key] = value
-	}
-	pre["hook_event_name"] = "PreToolUse"
-	pre["tool_use_id"] = "pre-tool-use"
-	pre["tool_input"] = map[string]any{"command": "printf ordinary"}
-	permission := make(map[string]any, len(base)+2)
-	for key, value := range base {
-		permission[key] = value
-	}
-	permission["hook_event_name"] = "PermissionRequest"
-	permission["tool_input"] = map[string]any{"command": "printf ordinary", "description": "host-only presentation"}
-
-	for _, invocation := range []struct {
-		name    string
-		payload map[string]any
-	}{
-		{"codex-pre-tool-use", pre},
-		{"codex-permission-request", permission},
-	} {
-		raw, err := json.Marshal(invocation.payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var out, errOut bytes.Buffer
-		if code := Run(context.Background(), []string{"hook", invocation.name}, bytes.NewReader(raw), &out, &errOut); code != exitOK || out.Len() != 0 || errOut.Len() != 0 {
-			t.Fatalf("%s code=%d stdout=%q stderr=%q", invocation.name, code, out.String(), errOut.String())
-		}
-	}
-	stateDir, err := audit.DefaultStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := audit.OpenStore(audit.Options{StateDir: stateDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err := store.Show(context.Background(), project, audit.Filter{})
-	if err != nil || len(events) != 2 {
-		t.Fatalf("Show() = %#v, %v", events, err)
-	}
-	if events[0].InputFingerprint == events[1].InputFingerprint {
-		t.Fatal("phase-specific input fingerprints unexpectedly collapsed")
-	}
-	if events[0].RequestFingerprint != events[1].RequestFingerprint {
-		t.Fatalf("request correlation broke: %q != %q", events[0].RequestFingerprint, events[1].RequestFingerprint)
 	}
 }
 
 func TestCodexInstallInitializesAuditBeforeIntegration(t *testing.T) {
 	_, codexHome := isolatedUserEnvironment(t)
-	preflight, err := integrationOptions(false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := integration.Install(preflight); err != nil {
-		t.Fatalf("integration preflight failed: %v", err)
-	}
-
 	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"codex", "install", "--scope", "user", "--profile", "baseline"}, strings.NewReader(""), &out, &errOut)
+	code := Run(context.Background(), []string{"codex", "install", "--scope", "user"}, strings.NewReader(""), &out, &errOut)
 	if code != exitOK {
 		t.Fatalf("install code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
@@ -442,11 +560,6 @@ func TestCodexInstallInitializesAuditBeforeIntegration(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stateDir, "master.key")); err != nil {
 		t.Fatalf("uninstall removed audit key: %v", err)
 	}
-	for _, path := range []string{filepath.Join(codexHome, "config.toml"), filepath.Join(codexHome, "hooks.json"), filepath.Join(stateDir, "integration-journal.json")} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("uninstall retained Ward-created integration path %s: %v", path, err)
-		}
-	}
 }
 
 func TestCodexInstallRefusesExistingStateWithoutAuditKey(t *testing.T) {
@@ -458,13 +571,17 @@ func TestCodexInstallRefusesExistingStateWithoutAuditKey(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-
 	var out, errOut bytes.Buffer
-	code := Run(context.Background(), []string{"codex", "install", "--scope", "user", "--profile", "baseline"}, strings.NewReader(""), &out, &errOut)
+	code := Run(context.Background(), []string{"codex", "install", "--scope", "user"}, strings.NewReader(""), &out, &errOut)
 	if code != exitDoctor {
-		t.Fatalf("install code=%d, want %d; stdout=%q stderr=%q", code, exitDoctor, out.String(), errOut.String())
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
-	for _, path := range []string{filepath.Join(codexHome, "config.toml"), filepath.Join(codexHome, "hooks.json"), filepath.Join(stateDir, "integration-journal.json"), filepath.Join(stateDir, "master.key")} {
+	for _, path := range []string{
+		filepath.Join(codexHome, "config.toml"),
+		filepath.Join(codexHome, "hooks.json"),
+		filepath.Join(stateDir, "integration-journal.json"),
+		filepath.Join(stateDir, "master.key"),
+	} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("failed install wrote %s: %v", path, err)
 		}
@@ -474,36 +591,111 @@ func TestCodexInstallRefusesExistingStateWithoutAuditKey(t *testing.T) {
 func TestProjectTopologyIncompleteOnlyForWritableWorkspaceAncestors(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
-	outside := filepath.Join(root, "user-config")
+	outside := filepath.Join(root, "state")
 	for _, directory := range []string{project, outside} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	outsideAnchor := filepath.Join(outside, "nested", "gh")
-	if projectTopologyIncomplete(project, []string{filepath.Join(outsideAnchor, "hosts.yml")}, []string{outsideAnchor}) {
-		t.Fatal("credential outside the workspace was reported as relocatable")
+	if projectTopologyIncomplete(project, []string{filepath.Join(outside, "ward", "v1")}, []string{filepath.Join(outside, "ward")}) {
+		t.Fatal("state outside workspace reported relocatable")
 	}
-
-	directAnchor := filepath.Join(project, "gh")
-	if projectTopologyIncomplete(project, []string{filepath.Join(directAnchor, "hosts.yml")}, []string{directAnchor}) {
-		t.Fatal("read-only direct child anchor was reported as relocatable")
+	direct := filepath.Join(project, "ward")
+	if projectTopologyIncomplete(project, []string{filepath.Join(direct, "v1")}, []string{direct}) {
+		t.Fatal("direct read-only anchor reported relocatable")
 	}
-
-	nestedAnchor := filepath.Join(project, "credential-parent", "gh")
-	if !projectTopologyIncomplete(project, []string{filepath.Join(nestedAnchor, "hosts.yml")}, []string{nestedAnchor}) {
+	nested := filepath.Join(project, "state-parent", "ward")
+	if !projectTopologyIncomplete(project, []string{filepath.Join(nested, "v1")}, []string{nested}) {
 		t.Fatal("writable workspace ancestor was not reported")
 	}
+}
 
-	nestedFile := filepath.Join(project, "credential-parent", "kubeconfig")
-	if !projectTopologyIncomplete(project, []string{nestedFile}, nil) {
-		t.Fatal("standalone credential below a writable workspace ancestor was not reported")
+func TestUnknownCommandIsUsageError(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := Run(context.Background(), []string{"unknown"}, strings.NewReader(""), &out, &errOut); code != exitUsage {
+		t.Fatalf("code=%d want=%d", code, exitUsage)
 	}
+}
 
-	directFile := filepath.Join(project, "kubeconfig")
-	if projectTopologyIncomplete(project, []string{directFile}, nil) {
-		t.Fatal("exact credential directly below the workspace root was reported as relocatable")
+func mustHookPayload(t *testing.T, cwd, command string) []byte {
+	t.Helper()
+	payload := map[string]any{
+		"session_id":      "session",
+		"transcript_path": nil,
+		"cwd":             cwd,
+		"hook_event_name": "PreToolUse",
+		"model":           "gpt-test",
+		"permission_mode": "default",
+		"turn_id":         "turn",
+		"tool_name":       "Bash",
+		"tool_use_id":     "tool-use",
+		"tool_input":      map[string]any{"command": command},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+type fileSnapshot struct {
+	Mode    os.FileMode
+	Size    int64
+	ModTime int64
+	Digest  [sha256.Size]byte
+}
+
+func snapshotTree(t *testing.T, root string) map[string]fileSnapshot {
+	t.Helper()
+	result := map[string]fileSnapshot{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		snapshot := fileSnapshot{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime().UnixNano()}
+		if !entry.IsDir() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			snapshot.Digest = sha256.Sum256(data)
+		}
+		result[relative] = snapshot
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func assertTreeExcludes(t *testing.T, root string, forbidden ...string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || filepath.Base(path) == "master.key" {
+			return walkErr
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, value := range forbidden {
+			if bytes.Contains(data, []byte(value)) {
+				t.Errorf("%s persisted forbidden raw material %q", path, value)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

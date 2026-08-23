@@ -13,11 +13,17 @@ import (
 )
 
 const (
-	selectorBegin = "# >>> ward default permissions v1 >>>"
-	selectorEnd   = "# <<< ward default permissions v1 <<<"
-	profileBegin  = "# >>> ward permission profile v1 >>>"
-	profileEnd    = "# <<< ward permission profile v1 <<<"
-	sandboxMarker = "# ward:migrated-sandbox-mode:v1"
+	selectorBegin      = "# >>> ward default permissions v2 >>>"
+	selectorEnd        = "# <<< ward default permissions v2 <<<"
+	profileBegin       = "# >>> ward permission profile v2 >>>"
+	profileEnd         = "# <<< ward permission profile v2 <<<"
+	sandboxMarker      = "# ward:migrated-sandbox-mode:v2"
+	sandboxTableMarker = "# ward:migrated-sandbox-workspace-write:v2"
+
+	legacySelectorBegin = "# >>> ward default permissions v1 >>>"
+	legacySelectorEnd   = "# <<< ward default permissions v1 <<<"
+	legacyProfileBegin  = "# >>> ward permission profile v1 >>>"
+	legacyProfileEnd    = "# <<< ward permission profile v1 <<<"
 )
 
 var (
@@ -26,10 +32,15 @@ var (
 )
 
 type configEdits struct {
-	SandboxOriginal    []byte `json:"sandbox_original,omitempty"`
-	SandboxReplacement []byte `json:"sandbox_replacement,omitempty"`
-	SelectorBlock      []byte `json:"selector_block,omitempty"`
-	ProfileAppend      []byte `json:"profile_append"`
+	SandboxOriginal         []byte `json:"sandbox_original,omitempty"`
+	SandboxReplacement      []byte `json:"sandbox_replacement,omitempty"`
+	SandboxTableOriginal    []byte `json:"sandbox_table_original,omitempty"`
+	SandboxTableReplacement []byte `json:"sandbox_table_replacement,omitempty"`
+	SelectorBlock           []byte `json:"selector_block,omitempty"`
+	SelectorOriginal        []byte `json:"selector_original,omitempty"`
+	SelectorReplacement     []byte `json:"selector_replacement,omitempty"`
+	ProfileAppend           []byte `json:"profile_append"`
+	ParentProfile           string `json:"parent_profile,omitempty"`
 }
 
 func installConfig(original []byte, options Options) ([]byte, configEdits, bool, error) {
@@ -43,80 +54,95 @@ func installConfig(original []byte, options Options) ([]byte, configEdits, bool,
 	if !validBareKey(profile) {
 		return nil, configEdits{}, false, fmt.Errorf("%w: invalid profile name %q", ErrConflict, profile)
 	}
-	newline := detectNewline(original)
-	networkEnabled := migratedLegacyNetworkEnabled(original)
-	profileBlock := permissionProfileBlock(newline, profile, options.Paths, networkEnabled)
-	selectorBlock := permissionSelectorBlock(newline, profile)
-
-	selectorBeginCount := bytes.Count(original, []byte(selectorBegin))
-	selectorEndCount := bytes.Count(original, []byte(selectorEnd))
-	profileBeginCount := bytes.Count(original, []byte(profileBegin))
-	profileEndCount := bytes.Count(original, []byte(profileEnd))
-	if selectorBeginCount > 1 || selectorEndCount > 1 || profileBeginCount > 1 || profileEndCount > 1 ||
-		selectorBeginCount != selectorEndCount || profileBeginCount != profileEndCount {
-		return nil, configEdits{}, false, fmt.Errorf("%w: incomplete Ward config marker", ErrConflict)
-	}
-	hasSelectorBegin := selectorBeginCount == 1
-	hasProfileBegin := profileBeginCount == 1
-	if hasProfileBegin {
-		if bytes.Count(original, profileBlock) != 1 {
-			return nil, configEdits{}, false, fmt.Errorf("%w: Ward permission profile was modified", ErrConflict)
-		}
-		if hasSelectorBegin && bytes.Count(original, selectorBlock) != 1 {
-			return nil, configEdits{}, false, fmt.Errorf("%w: Ward permission selector was modified", ErrConflict)
-		}
-		if hasActiveLegacySandbox(original) {
-			return nil, configEdits{}, false, ErrMigrationRequired
-		}
-		return original, configEdits{}, false, nil
-	}
-	if hasSelectorBegin {
-		return nil, configEdits{}, false, fmt.Errorf("%w: Ward selector exists without profile", ErrConflict)
+	if hasWardMarkers(original) {
+		return nil, configEdits{}, false, fmt.Errorf("%w: orphaned or legacy Ward config marker", ErrConflict)
 	}
 	if containsProfileHeader(original, profile) {
 		return nil, configEdits{}, false, fmt.Errorf("%w: permission profile %q already exists", ErrConflict, profile)
 	}
-	if containsSandboxWorkspaceWrite(original) {
-		return nil, configEdits{}, false, fmt.Errorf("%w: [sandbox_workspace_write] must be migrated manually", ErrConflict)
+
+	defaults := findAssignments(original, "default_permissions")
+	sandboxes := findAssignments(original, "sandbox_mode")
+	if len(defaults) > 1 || len(sandboxes) > 1 {
+		return nil, configEdits{}, false, fmt.Errorf("%w: duplicate permission authority assignment", ErrConflict)
+	}
+	if len(defaults) == 1 && !defaults[0].TopLevel {
+		return nil, configEdits{}, false, fmt.Errorf("%w: default_permissions is not top-level", ErrConflict)
+	}
+	if len(sandboxes) == 1 && !sandboxes[0].TopLevel {
+		return nil, configEdits{}, false, fmt.Errorf("%w: profile-scoped sandbox_mode must be migrated manually", ErrConflict)
+	}
+	if len(defaults) == 1 && len(sandboxes) == 1 {
+		return nil, configEdits{}, false, fmt.Errorf("%w: legacy sandbox and modern default_permissions are both active", ErrConflict)
 	}
 
+	newline := detectNewline(original)
 	working := append([]byte(nil), original...)
 	edits := configEdits{}
-	sandboxLines := findAssignments(working, "sandbox_mode")
-	if len(sandboxLines) > 1 {
-		return nil, edits, false, fmt.Errorf("%w: multiple sandbox_mode assignments", ErrConflict)
-	}
-	if len(sandboxLines) == 1 {
-		line := sandboxLines[0]
-		if !line.TopLevel {
-			return nil, edits, false, fmt.Errorf("%w: profile-scoped sandbox_mode must be migrated manually", ErrConflict)
-		}
-		if !options.MigratePermissions {
-			return nil, edits, false, ErrMigrationRequired
-		}
-		replacement := []byte(sandboxMarker + line.Newline)
-		edits.SandboxOriginal = append([]byte(nil), line.Raw...)
-		edits.SandboxReplacement = replacement
-		working = replaceRange(working, line.Start, line.End, replacement)
-	}
+	parent := ":workspace"
+	networkEnabled := false
 
-	defaults := findAssignments(working, "default_permissions")
-	if len(defaults) > 1 {
-		return nil, edits, false, fmt.Errorf("%w: multiple default_permissions assignments", ErrConflict)
-	}
 	if len(defaults) == 1 {
-		if !defaults[0].TopLevel {
-			return nil, edits, false, fmt.Errorf("%w: default_permissions is not top-level", ErrConflict)
+		selected, ok := parseTOMLString(defaults[0].Value)
+		if !ok || !validPermissionParent(selected, profile) {
+			return nil, edits, false, fmt.Errorf("%w: unsupported default_permissions parent %q", ErrConflict, selected)
 		}
-		value, ok := parseTOMLString(defaults[0].Value)
-		if !ok || value != profile {
-			return nil, edits, false, fmt.Errorf("%w: default_permissions already selects %q", ErrConflict, value)
+		if !strings.HasPrefix(selected, ":") && !containsProfileHeader(original, selected) {
+			return nil, edits, false, fmt.Errorf("%w: selected parent profile %q is not defined", ErrConflict, selected)
 		}
+		if !strings.HasPrefix(selected, ":") && !namedPermissionParentSafe(original, selected) {
+			return nil, edits, false, fmt.Errorf("%w: selected parent profile %q contains authority Ward cannot safely inherit", ErrConflict, selected)
+		}
+		parent = selected
+		replacement := permissionSelectorBlock(newline, profile)
+		edits.SelectorOriginal = append([]byte(nil), defaults[0].Raw...)
+		edits.SelectorReplacement = replacement
+		working = replaceRange(working, defaults[0].Start, defaults[0].End, replacement)
 	} else {
-		edits.SelectorBlock = selectorBlock
-		working = append(append([]byte(nil), selectorBlock...), working...)
+		if len(sandboxes) == 1 {
+			if !options.MigratePermissions {
+				return nil, edits, false, ErrMigrationRequired
+			}
+			mode, ok := parseTOMLString(sandboxes[0].Value)
+			if !ok {
+				return nil, edits, false, fmt.Errorf("%w: sandbox_mode is not a string", ErrConflict)
+			}
+			var err error
+			parent, networkEnabled, err = legacyPermissionParent(original, mode)
+			if err != nil {
+				return nil, edits, false, err
+			}
+			if block, exists, err := sandboxWorkspaceWriteBlock(original); err != nil {
+				return nil, edits, false, err
+			} else if exists {
+				edits.SandboxTableOriginal = append([]byte(nil), block...)
+				edits.SandboxTableReplacement = []byte(sandboxTableMarker + newline)
+				var replaced bool
+				working, replaced = replaceExactlyOnce(working, block, edits.SandboxTableReplacement)
+				if !replaced {
+					return nil, edits, false, fmt.Errorf("%w: sandbox_workspace_write table is ambiguous", ErrConflict)
+				}
+			}
+			// Re-scan after the optional table replacement so byte offsets remain
+			// exact even when the table appeared before sandbox_mode.
+			active := findAssignments(working, "sandbox_mode")
+			if len(active) != 1 || !active[0].TopLevel {
+				return nil, edits, false, fmt.Errorf("%w: sandbox_mode changed during migration", ErrConflict)
+			}
+			edits.SandboxOriginal = append([]byte(nil), active[0].Raw...)
+			edits.SandboxReplacement = []byte(sandboxMarker + active[0].Newline)
+			working = replaceRange(working, active[0].Start, active[0].End, edits.SandboxReplacement)
+		} else if _, exists, err := sandboxWorkspaceWriteBlock(original); err != nil {
+			return nil, edits, false, err
+		} else if exists {
+			return nil, edits, false, fmt.Errorf("%w: sandbox_workspace_write exists without sandbox_mode", ErrConflict)
+		}
+		edits.SelectorBlock = permissionSelectorBlock(newline, profile)
+		working = append(append([]byte(nil), edits.SelectorBlock...), working...)
 	}
 
+	edits.ParentProfile = parent
+	profileBlock := permissionProfileBlock(newline, profile, parent, options.Paths, networkEnabled)
 	prefix := []byte(nil)
 	if len(working) > 0 {
 		if bytes.HasSuffix(working, []byte(newline)) {
@@ -133,9 +159,161 @@ func installConfig(original []byte, options Options) ([]byte, configEdits, bool,
 	return working, edits, true, nil
 }
 
+func validPermissionParent(value, wardProfile string) bool {
+	if value == "" || value == wardProfile || value == ":danger-full-access" {
+		return false
+	}
+	if value == ":workspace" || value == ":read-only" {
+		return true
+	}
+	return validBareKey(value)
+}
+
+func namedPermissionParentSafe(data []byte, name string) bool {
+	var config map[string]any
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return false
+	}
+	permissions, ok := config["permissions"].(map[string]any)
+	if !ok {
+		return false
+	}
+	profile, ok := permissions[name].(map[string]any)
+	if !ok {
+		return false
+	}
+	extends, ok := profile["extends"].(string)
+	if !ok || extends != ":workspace" && extends != ":read-only" {
+		return false
+	}
+	for key, value := range profile {
+		switch key {
+		case "extends":
+		case "description":
+			if _, ok := value.(string); !ok {
+				return false
+			}
+		case "network":
+			network, ok := value.(map[string]any)
+			if !ok || !namedPermissionNetworkSafe(network) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func namedPermissionNetworkSafe(network map[string]any) bool {
+	for key, value := range network {
+		switch key {
+		case "enabled", "enable_socks5", "enable_socks5_udp", "allow_upstream_proxy", "allow_local_binding",
+			"dangerously_allow_non_loopback_proxy", "dangerously_allow_all_unix_sockets":
+			if _, ok := value.(bool); !ok {
+				return false
+			}
+		case "proxy_url", "socks_url":
+			if _, ok := value.(string); !ok {
+				return false
+			}
+		case "domains", "unix_sockets":
+			rules, ok := value.(map[string]any)
+			if !ok {
+				return false
+			}
+			for _, raw := range rules {
+				rule, ok := raw.(string)
+				if !ok || rule != "allow" && rule != "deny" {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func legacyPermissionParent(data []byte, mode string) (string, bool, error) {
+	block, exists, err := sandboxWorkspaceWriteBlock(data)
+	if err != nil {
+		return "", false, err
+	}
+	switch mode {
+	case "danger-full-access":
+		if exists {
+			return "", false, fmt.Errorf("%w: sandbox_workspace_write cannot accompany danger-full-access", ErrConflict)
+		}
+		return ":workspace", true, nil
+	case "read-only":
+		if exists {
+			return "", false, fmt.Errorf("%w: sandbox_workspace_write cannot accompany read-only", ErrConflict)
+		}
+		return ":read-only", false, nil
+	case "workspace-write":
+		if !exists {
+			return ":workspace", false, nil
+		}
+		var parsed map[string]any
+		if err := toml.Unmarshal(block, &parsed); err != nil {
+			return "", false, fmt.Errorf("%w: invalid sandbox_workspace_write table", ErrConflict)
+		}
+		table, ok := parsed["sandbox_workspace_write"].(map[string]any)
+		if !ok {
+			return "", false, fmt.Errorf("%w: invalid sandbox_workspace_write table", ErrConflict)
+		}
+		if len(table) == 0 {
+			return ":workspace", false, nil
+		}
+		if len(table) != 1 {
+			return "", false, fmt.Errorf("%w: sandbox_workspace_write contains authority Ward cannot preserve", ErrConflict)
+		}
+		value, exists := table["network_access"]
+		enabled, ok := value.(bool)
+		if !exists || !ok {
+			return "", false, fmt.Errorf("%w: sandbox network capability is not resolvable", ErrConflict)
+		}
+		return ":workspace", enabled, nil
+	default:
+		return "", false, fmt.Errorf("%w: unsupported sandbox_mode %q", ErrConflict, mode)
+	}
+}
+
+func sandboxWorkspaceWriteBlock(data []byte) ([]byte, bool, error) {
+	lines := scanLines(data)
+	start, end := -1, -1
+	for index, line := range lines {
+		body := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(string(line.Raw), "\n"), "\r"))
+		match := tableHeaderPattern.FindStringSubmatch(body)
+		if len(match) != 2 {
+			continue
+		}
+		if start >= 0 && end < 0 {
+			end = line.Start
+			break
+		}
+		if match[1] == "sandbox_workspace_write" {
+			if start >= 0 {
+				return nil, false, fmt.Errorf("%w: duplicate sandbox_workspace_write table", ErrConflict)
+			}
+			start = line.Start
+			if index == len(lines)-1 {
+				end = line.End
+			}
+		}
+	}
+	if start < 0 {
+		return nil, false, nil
+	}
+	if end < 0 {
+		end = len(data)
+	}
+	return append([]byte(nil), data[start:end]...), true, nil
+}
+
 // hooksExplicitlyDisabled recognizes both the current feature name and the
-// deprecated codex_hooks spelling. Ward deliberately does not turn either
-// setting on: an explicit user choice to disable hooks is an install conflict.
+// deprecated codex_hooks spelling. Ward never changes either setting.
 func hooksExplicitlyDisabled(data []byte) bool {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return false
@@ -147,11 +325,17 @@ func hooksExplicitlyDisabled(data []byte) bool {
 	if explicitlyFalse(config, "codex_hooks") || explicitlyFalse(config, "hooks") {
 		return true
 	}
-	features, ok := config["features"].(map[string]any)
-	if !ok {
-		return false
+	if explicitlyTrue(config, "allow_managed_hooks_only") {
+		return true
 	}
-	return explicitlyFalse(features, "hooks") || explicitlyFalse(features, "codex_hooks")
+	features, ok := config["features"].(map[string]any)
+	return ok && (explicitlyFalse(features, "hooks") || explicitlyFalse(features, "codex_hooks"))
+}
+
+func explicitlyTrue(table map[string]any, key string) bool {
+	value, exists := table[key]
+	flag, isBool := value.(bool)
+	return exists && isBool && flag
 }
 
 func explicitlyFalse(table map[string]any, key string) bool {
@@ -163,17 +347,24 @@ func explicitlyFalse(table map[string]any, key string) bool {
 func uninstallConfig(original []byte, edits configEdits) ([]byte, bool, error) {
 	working := append([]byte(nil), original...)
 	changed := false
-
+	var ok bool
 	if len(edits.ProfileAppend) > 0 {
-		var ok bool
 		working, ok = removeExactlyOnce(working, edits.ProfileAppend)
 		if !ok {
 			return nil, false, fmt.Errorf("%w: Ward permission profile is missing or modified", ErrConflict)
 		}
 		changed = true
 	}
-	if len(edits.SelectorBlock) > 0 {
-		var ok bool
+	if len(edits.SelectorReplacement) > 0 {
+		if len(edits.SelectorOriginal) == 0 {
+			return nil, false, fmt.Errorf("%w: permission selector journal is incomplete", ErrConflict)
+		}
+		working, ok = replaceExactlyOnce(working, edits.SelectorReplacement, edits.SelectorOriginal)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: Ward permission selector is missing or modified", ErrConflict)
+		}
+		changed = true
+	} else if len(edits.SelectorBlock) > 0 {
 		working, ok = removeExactlyOnce(working, edits.SelectorBlock)
 		if !ok {
 			return nil, false, fmt.Errorf("%w: Ward default selector is missing or modified", ErrConflict)
@@ -181,13 +372,16 @@ func uninstallConfig(original []byte, edits configEdits) ([]byte, bool, error) {
 		changed = true
 	}
 	if len(edits.SandboxOriginal) > 0 {
-		if len(edits.SandboxReplacement) == 0 {
-			return nil, false, fmt.Errorf("%w: sandbox migration journal is incomplete", ErrConflict)
-		}
-		var ok bool
 		working, ok = replaceExactlyOnce(working, edits.SandboxReplacement, edits.SandboxOriginal)
 		if !ok {
 			return nil, false, fmt.Errorf("%w: sandbox migration marker is missing or modified", ErrConflict)
+		}
+		changed = true
+	}
+	if len(edits.SandboxTableOriginal) > 0 {
+		working, ok = replaceExactlyOnce(working, edits.SandboxTableReplacement, edits.SandboxTableOriginal)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: sandbox table migration marker is missing or modified", ErrConflict)
 		}
 		changed = true
 	}
@@ -195,315 +389,79 @@ func uninstallConfig(original []byte, edits configEdits) ([]byte, bool, error) {
 }
 
 func permissionSelectorBlock(newline, profile string) []byte {
-	return []byte(strings.Join([]string{
-		selectorBegin,
-		"default_permissions = " + strconv.Quote(profile),
-		selectorEnd,
-		"",
-	}, newline))
+	return []byte(strings.Join([]string{selectorBegin, "default_permissions = " + strconv.Quote(profile), selectorEnd, ""}, newline))
 }
 
-func permissionProfileBlock(newline, profile string, paths Paths, networkEnabled bool) []byte {
+func permissionProfileBlock(newline, profile, parent string, paths Paths, networkEnabled bool) []byte {
 	lines := []string{
 		profileBegin,
 		"[permissions." + profile + "]",
-		`description = "Ward bounded baseline: workspace editing with credential and Ward-state denies."`,
-		`extends = ":workspace"`,
+		`description = "Ward ambient kernel: preserve host authority and deny only reviewed workspace secrets."`,
+		"extends = " + strconv.Quote(parent),
 		"",
 		"[permissions." + profile + ".filesystem]",
-		"glob_scan_max_depth = 4",
-		`"~/.env" = "deny"`,
-		`"~/**/.env" = "deny"`,
-		`"~/**/.env.local" = "deny"`,
-		`"~/**/.env.*.local" = "deny"`,
-		`"~/**/.env.development" = "deny"`,
-		`"~/**/.env.dev" = "deny"`,
-		`"~/**/.env.test" = "deny"`,
-		`"~/**/.env.testing" = "deny"`,
-		`"~/**/.env.production" = "deny"`,
-		`"~/**/.env.prod" = "deny"`,
-		`"~/**/.env.staging" = "deny"`,
-		`"~/**/.env.stage" = "deny"`,
-		`"~/**/.env.secret" = "deny"`,
-		`"~/**/.env.secrets" = "deny"`,
-		`"~/**/.env.private" = "deny"`,
-		`"~/*.key" = "deny"`,
-		`"~/**/*.key" = "deny"`,
-		`"~/*.key.json" = "deny"`,
-		`"~/**/*.key.json" = "deny"`,
-		`"~/*credentials*.json" = "deny"`,
-		`"~/**/*credentials*.json" = "deny"`,
-		`"~/*service-account*.json" = "deny"`,
-		`"~/**/*service-account*.json" = "deny"`,
-		`"~/*service_account*.json" = "deny"`,
-		`"~/**/*service_account*.json" = "deny"`,
-		`"~/private.pem" = "deny"`,
-		`"~/**/private.pem" = "deny"`,
-		`"~/private-key.pem" = "deny"`,
-		`"~/**/private-key.pem" = "deny"`,
-		`"~/private_key.pem" = "deny"`,
-		`"~/**/private_key.pem" = "deny"`,
-		`"~/privatekey.pem" = "deny"`,
-		`"~/**/privatekey.pem" = "deny"`,
-		`"~/privkey.pem" = "deny"`,
-		`"~/**/privkey.pem" = "deny"`,
-		`"~/privkey0.pem" = "deny"`,
-		`"~/**/privkey0.pem" = "deny"`,
-		`"~/privkey1.pem" = "deny"`,
-		`"~/**/privkey1.pem" = "deny"`,
-		`"~/privkey2.pem" = "deny"`,
-		`"~/**/privkey2.pem" = "deny"`,
-		`"~/privkey3.pem" = "deny"`,
-		`"~/**/privkey3.pem" = "deny"`,
-		`"~/privkey4.pem" = "deny"`,
-		`"~/**/privkey4.pem" = "deny"`,
-		`"~/privkey5.pem" = "deny"`,
-		`"~/**/privkey5.pem" = "deny"`,
-		`"~/privkey6.pem" = "deny"`,
-		`"~/**/privkey6.pem" = "deny"`,
-		`"~/privkey7.pem" = "deny"`,
-		`"~/**/privkey7.pem" = "deny"`,
-		`"~/privkey8.pem" = "deny"`,
-		`"~/**/privkey8.pem" = "deny"`,
-		`"~/privkey9.pem" = "deny"`,
-		`"~/**/privkey9.pem" = "deny"`,
-		`"~/id_rsa.pem" = "deny"`,
-		`"~/**/id_rsa.pem" = "deny"`,
-		`"~/id_dsa.pem" = "deny"`,
-		`"~/**/id_dsa.pem" = "deny"`,
-		`"~/id_ecdsa.pem" = "deny"`,
-		`"~/**/id_ecdsa.pem" = "deny"`,
-		`"~/id_ed25519.pem" = "deny"`,
-		`"~/**/id_ed25519.pem" = "deny"`,
-		`"~/*-key.pem" = "deny"`,
-		`"~/**/*-key.pem" = "deny"`,
-		`"~/*_key.pem" = "deny"`,
-		`"~/**/*_key.pem" = "deny"`,
-		`"~/*.key.pem" = "deny"`,
-		`"~/**/*.key.pem" = "deny"`,
-		`"~/key.pem" = "deny"`,
-		`"~/**/key.pem" = "deny"`,
-		`"~/*.p12" = "deny"`,
-		`"~/**/*.p12" = "deny"`,
-		`"~/*.pfx" = "deny"`,
-		`"~/**/*.pfx" = "deny"`,
-		`"~/secrets.yml" = "deny"`,
-		`"~/**/secrets.yml" = "deny"`,
-		`"~/secrets.yaml" = "deny"`,
-		`"~/**/secrets.yaml" = "deny"`,
-		`"~/*-secret.yaml" = "deny"`,
-		`"~/**/*-secret.yaml" = "deny"`,
-		`"~/*-secret.yml" = "deny"`,
-		`"~/**/*-secret.yml" = "deny"`,
-		`"~/*-secrets.yaml" = "deny"`,
-		`"~/**/*-secrets.yaml" = "deny"`,
-		`"~/*-secrets.yml" = "deny"`,
-		`"~/**/*-secrets.yml" = "deny"`,
-		`"~/credentials.yml" = "deny"`,
-		`"~/**/credentials.yml" = "deny"`,
-		`"~/credentials.yaml" = "deny"`,
-		`"~/**/credentials.yaml" = "deny"`,
-		`"~/*credentials*.yml" = "deny"`,
-		`"~/**/*credentials*.yml" = "deny"`,
-		`"~/*credentials*.yaml" = "deny"`,
-		`"~/**/*credentials*.yaml" = "deny"`,
-		`"~/.npmrc" = "deny"`,
-		`"~/.pypirc" = "deny"`,
-		`"~/.aws" = "read"`,
-		`"~/.aws/credentials" = "deny"`,
-		`"~/id_rsa" = "deny"`,
-		`"~/**/id_rsa" = "deny"`,
-		`"~/id_dsa" = "deny"`,
-		`"~/**/id_dsa" = "deny"`,
-		`"~/id_ecdsa" = "deny"`,
-		`"~/**/id_ecdsa" = "deny"`,
-		`"~/id_ed25519" = "deny"`,
-		`"~/**/id_ed25519" = "deny"`,
-		`"~/.netrc" = "deny"`,
-		`"~/_netrc" = "deny"`,
-		`"~/.git-credentials" = "deny"`,
-		`"~/.docker" = "read"`,
-		`"~/.docker/config.json" = "deny"`,
-		`"~/.config/gh" = "read"`,
-		`"~/.config/gh/hosts.yml" = "deny"`,
-		`"~/.kube" = "read"`,
-		`"~/.kube/config" = "deny"`,
-		`"~/.config/gcloud" = "read"`,
-		`"~/.config/gcloud/application_default_credentials.json" = "deny"`,
-		`"~/.config/gcloud/credentials.db" = "deny"`,
-		`"~/AppData/Roaming/GitHub CLI/hosts.yml" = "deny"`,
-		`"~/AppData/Roaming/gcloud/application_default_credentials.json" = "deny"`,
-		`"~/AppData/Roaming/gcloud/credentials.db" = "deny"`,
+		"glob_scan_max_depth = 16",
 	}
 	for _, directory := range readOnlyBoundaryDirectories(paths) {
 		lines = append(lines, strconv.Quote(directory)+` = "read"`)
 	}
-	protected := []string{paths.UserPolicyPath, paths.StateDir, paths.ConfigFile, paths.HooksFile}
-	protected = append(protected, paths.CredentialFiles...)
-	seen := map[string]bool{}
-	for _, path := range protected {
-		if path == "" || seen[path] {
-			continue
+	for _, protected := range []string{paths.UserPolicyPath, paths.StateDir, paths.ConfigFile, paths.HooksFile} {
+		if protected != "" {
+			lines = append(lines, strconv.Quote(protected)+` = "deny"`)
 		}
-		seen[path] = true
-		lines = append(lines, strconv.Quote(path)+` = "deny"`)
 	}
 	if paths.BinaryPath != "" {
 		lines = append(lines, strconv.Quote(paths.BinaryPath)+` = "read"`)
 	}
-	lines = append(lines,
-		"",
-		"[permissions."+profile+`.filesystem.":workspace_roots"]`,
-		`".env" = "deny"`,
-		`"**/.env" = "deny"`,
-		`"**/.env.local" = "deny"`,
-		`"**/.env.*.local" = "deny"`,
-		`"**/.env.development" = "deny"`,
-		`"**/.env.dev" = "deny"`,
-		`"**/.env.test" = "deny"`,
-		`"**/.env.testing" = "deny"`,
-		`"**/.env.production" = "deny"`,
-		`"**/.env.prod" = "deny"`,
-		`"**/.env.staging" = "deny"`,
-		`"**/.env.stage" = "deny"`,
-		`"**/.env.secret" = "deny"`,
-		`"**/.env.secrets" = "deny"`,
-		`"**/.env.private" = "deny"`,
-		`"*.key" = "deny"`,
-		`"**/*.key" = "deny"`,
-		`"*.key.json" = "deny"`,
-		`"**/*.key.json" = "deny"`,
-		`"*credentials*.json" = "deny"`,
-		`"**/*credentials*.json" = "deny"`,
-		`"*service-account*.json" = "deny"`,
-		`"**/*service-account*.json" = "deny"`,
-		`"*service_account*.json" = "deny"`,
-		`"**/*service_account*.json" = "deny"`,
-		`"private.pem" = "deny"`,
-		`"**/private.pem" = "deny"`,
-		`"private-key.pem" = "deny"`,
-		`"**/private-key.pem" = "deny"`,
-		`"private_key.pem" = "deny"`,
-		`"**/private_key.pem" = "deny"`,
-		`"privatekey.pem" = "deny"`,
-		`"**/privatekey.pem" = "deny"`,
-		`"privkey.pem" = "deny"`,
-		`"**/privkey.pem" = "deny"`,
-		`"privkey0.pem" = "deny"`,
-		`"**/privkey0.pem" = "deny"`,
-		`"privkey1.pem" = "deny"`,
-		`"**/privkey1.pem" = "deny"`,
-		`"privkey2.pem" = "deny"`,
-		`"**/privkey2.pem" = "deny"`,
-		`"privkey3.pem" = "deny"`,
-		`"**/privkey3.pem" = "deny"`,
-		`"privkey4.pem" = "deny"`,
-		`"**/privkey4.pem" = "deny"`,
-		`"privkey5.pem" = "deny"`,
-		`"**/privkey5.pem" = "deny"`,
-		`"privkey6.pem" = "deny"`,
-		`"**/privkey6.pem" = "deny"`,
-		`"privkey7.pem" = "deny"`,
-		`"**/privkey7.pem" = "deny"`,
-		`"privkey8.pem" = "deny"`,
-		`"**/privkey8.pem" = "deny"`,
-		`"privkey9.pem" = "deny"`,
-		`"**/privkey9.pem" = "deny"`,
-		`"id_rsa.pem" = "deny"`,
-		`"**/id_rsa.pem" = "deny"`,
-		`"id_dsa.pem" = "deny"`,
-		`"**/id_dsa.pem" = "deny"`,
-		`"id_ecdsa.pem" = "deny"`,
-		`"**/id_ecdsa.pem" = "deny"`,
-		`"id_ed25519.pem" = "deny"`,
-		`"**/id_ed25519.pem" = "deny"`,
-		`"*-key.pem" = "deny"`,
-		`"**/*-key.pem" = "deny"`,
-		`"*_key.pem" = "deny"`,
-		`"**/*_key.pem" = "deny"`,
-		`"*.key.pem" = "deny"`,
-		`"**/*.key.pem" = "deny"`,
-		`"key.pem" = "deny"`,
-		`"**/key.pem" = "deny"`,
-		`"*.p12" = "deny"`,
-		`"**/*.p12" = "deny"`,
-		`"*.pfx" = "deny"`,
-		`"**/*.pfx" = "deny"`,
-		`"secrets.yml" = "deny"`,
-		`"**/secrets.yml" = "deny"`,
-		`"secrets.yaml" = "deny"`,
-		`"**/secrets.yaml" = "deny"`,
-		`"*-secret.yaml" = "deny"`,
-		`"**/*-secret.yaml" = "deny"`,
-		`"*-secret.yml" = "deny"`,
-		`"**/*-secret.yml" = "deny"`,
-		`"*-secrets.yaml" = "deny"`,
-		`"**/*-secrets.yaml" = "deny"`,
-		`"*-secrets.yml" = "deny"`,
-		`"**/*-secrets.yml" = "deny"`,
-		`"credentials.yml" = "deny"`,
-		`"**/credentials.yml" = "deny"`,
-		`"credentials.yaml" = "deny"`,
-		`"**/credentials.yaml" = "deny"`,
-		`"*credentials*.yml" = "deny"`,
-		`"**/*credentials*.yml" = "deny"`,
-		`"*credentials*.yaml" = "deny"`,
-		`"**/*credentials*.yaml" = "deny"`,
-		`".aws/credentials" = "deny"`,
-		`"**/.aws/credentials" = "deny"`,
-		`"id_rsa" = "deny"`,
-		`"**/id_rsa" = "deny"`,
-		`"id_dsa" = "deny"`,
-		`"**/id_dsa" = "deny"`,
-		`"id_ecdsa" = "deny"`,
-		`"**/id_ecdsa" = "deny"`,
-		`"id_ed25519" = "deny"`,
-		`"**/id_ed25519" = "deny"`,
-		`".netrc" = "deny"`,
-		`"**/.netrc" = "deny"`,
-		`".git-credentials" = "deny"`,
-		`"**/.git-credentials" = "deny"`,
-		`".docker/config.json" = "deny"`,
-		`"**/.docker/config.json" = "deny"`,
-		`".config/gh/hosts.yml" = "deny"`,
-		`"**/.config/gh/hosts.yml" = "deny"`,
-		`".kube/config" = "deny"`,
-		`"**/.kube/config" = "deny"`,
-		`".config/gcloud/application_default_credentials.json" = "deny"`,
-		`"**/.config/gcloud/application_default_credentials.json" = "deny"`,
-		`".config/gcloud/credentials.db" = "deny"`,
-		`"**/.config/gcloud/credentials.db" = "deny"`,
-	)
+	lines = append(lines, "", "[permissions."+profile+`.filesystem.":workspace_roots"]`)
+	lines = append(lines, workspaceSecretRules()...)
 	if networkEnabled {
-		lines = append(lines,
-			"",
-			"[permissions."+profile+".network]",
-			"enabled = true",
-		)
+		lines = append(lines, "", "[permissions."+profile+".network]", "enabled = true")
 	}
 	lines = append(lines, profileEnd, "")
 	return []byte(strings.Join(lines, newline))
 }
 
-// readOnlyBoundaryDirectories protects the directory entry that anchors each
-// exact Ward path. Exact file denies alone do not stop a writable parent from
-// being renamed, which would relocate the file outside the generated rule.
-// These directories remain readable so Ward does not recreate the broad
-// read-deny behavior that made Harness Legacy unusable.
-func readOnlyBoundaryDirectories(paths Paths) []string {
-	candidates := []string{
-		filepath.Dir(paths.ConfigFile),
-		filepath.Dir(paths.HooksFile),
-		filepath.Dir(paths.BinaryPath),
-		filepath.Dir(paths.UserPolicyPath),
-		filepath.Dir(paths.StateDir),
+func workspaceSecretRules() []string {
+	patterns := []string{
+		".env", "**/.env",
+		".env.local", "**/.env.local",
+		".env.development", "**/.env.development", ".env.dev", "**/.env.dev",
+		".env.test", "**/.env.test", ".env.testing", "**/.env.testing",
+		".env.production", "**/.env.production", ".env.prod", "**/.env.prod",
+		".env.staging", "**/.env.staging", ".env.stage", "**/.env.stage",
+		".env.secret", "**/.env.secret", ".env.secrets", "**/.env.secrets",
+		".env.private", "**/.env.private",
+		"*.key.json", "**/*.key.json",
+		"key.json", "**/key.json", "credentials.json", "**/credentials.json",
+		"service-account.json", "**/service-account.json", "service_account.json", "**/service_account.json",
+		"secrets.yml", "**/secrets.yml", "secrets.yaml", "**/secrets.yaml",
+		"credentials.yml", "**/credentials.yml", "credentials.yaml", "**/credentials.yaml",
+		"id_rsa", "**/id_rsa", "id_dsa", "**/id_dsa", "id_ecdsa", "**/id_ecdsa", "id_ed25519", "**/id_ed25519",
+		"private-key.pem", "**/private-key.pem", "private_key.pem", "**/private_key.pem", "privatekey.pem", "**/privatekey.pem",
+		"privkey.pem", "**/privkey.pem",
+		"*.p12", "**/*.p12", "*.pfx", "**/*.pfx",
 	}
-	candidates = append(candidates, paths.CredentialDirectories...)
+	for index := 1; index <= 9; index++ {
+		name := fmt.Sprintf("privkey%d.pem", index)
+		patterns = append(patterns, name, "**/"+name)
+	}
+	rules := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		rules = append(rules, strconv.Quote(pattern)+` = "deny"`)
+	}
+	return rules
+}
+
+// readOnlyBoundaryDirectories protects only Ward-owned relocation anchors. It
+// intentionally excludes CODEX_HOME itself and all HOME credential stores.
+func readOnlyBoundaryDirectories(paths Paths) []string {
+	candidates := []string{filepath.Dir(paths.BinaryPath), filepath.Dir(paths.UserPolicyPath), filepath.Dir(paths.StateDir)}
 	seen := make(map[string]struct{}, len(candidates))
 	result := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		candidate = filepath.Clean(candidate)
-		if candidate == "." || candidate == "" {
+		if candidate == "." || candidate == "" || filepath.Dir(candidate) == candidate {
 			continue
 		}
 		if _, exists := seen[candidate]; exists {
@@ -516,26 +474,87 @@ func readOnlyBoundaryDirectories(paths Paths) []string {
 	return result
 }
 
-// migratedLegacyNetworkEnabled preserves command-network access only when the
-// user explicitly migrates the legacy danger-full-access sandbox. Fresh and
-// workspace/read-only installations stay network-disabled; Ward never broadens
-// network authority merely because a permission profile is being installed.
-func migratedLegacyNetworkEnabled(data []byte) bool {
-	assignments := findAssignments(data, "sandbox_mode")
-	if len(assignments) != 1 || !assignments[0].TopLevel {
-		return false
+func hasWardMarkers(data []byte) bool {
+	markers := []string{selectorBegin, selectorEnd, profileBegin, profileEnd, sandboxMarker, sandboxTableMarker,
+		legacySelectorBegin, legacySelectorEnd, legacyProfileBegin, legacyProfileEnd, "# ward:migrated-sandbox-mode:v1"}
+	for _, marker := range markers {
+		if bytes.Contains(data, []byte(marker)) {
+			return true
+		}
 	}
-	value, ok := parseTOMLString(assignments[0].Value)
-	return ok && value == "danger-full-access"
+	return false
+}
+
+// hasWardConfigReferences classifies live Ward authority without relying on
+// installer comments. A missing ownership journal is safe to treat as an
+// idempotent uninstall only when neither the selected profile, the reserved
+// profile table, a child profile, nor an inline Hook still references Ward.
+func hasWardConfigReferences(data []byte, profile, binaryPath string) (bool, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false, nil
+	}
+	var config map[string]any
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return false, err
+	}
+	if selected, ok := config["default_permissions"].(string); ok && selected == profile {
+		return true, nil
+	}
+	if permissions, ok := config["permissions"].(map[string]any); ok {
+		if _, exists := permissions[profile]; exists {
+			return true, nil
+		}
+		for _, raw := range permissions {
+			candidate, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if parent, ok := candidate["extends"].(string); ok && parent == profile {
+				return true, nil
+			}
+		}
+	}
+	return containsWardConfigHookValue(config["hooks"], binaryPath), nil
+}
+
+func containsWardConfigHookValue(value any, binaryPath string) bool {
+	switch typed := value.(type) {
+	case string:
+		if looksLikeWardHookCommand(typed) {
+			return true
+		}
+		for _, spec := range wardHookSpecs {
+			if typed == hookCommand(binaryPath, spec.Subcommand) {
+				return true
+			}
+		}
+		for _, spec := range legacyWardHookSpecs {
+			if typed == hookCommand(binaryPath, spec.Subcommand) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, nested := range typed {
+			if containsWardConfigHookValue(nested, binaryPath) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if containsWardConfigHookValue(nested, binaryPath) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type assignmentLine struct {
-	Start    int
-	End      int
-	Raw      []byte
-	Newline  string
-	Value    string
-	TopLevel bool
+	Start, End int
+	Raw        []byte
+	Newline    string
+	Value      string
+	TopLevel   bool
 }
 
 func findAssignments(data []byte, key string) []assignmentLine {
@@ -552,10 +571,7 @@ func findAssignments(data []byte, key string) []assignmentLine {
 		match := assignmentPattern.FindStringSubmatch(body)
 		parsedKey, keyOK := parseAssignmentKey(match)
 		if keyOK && parsedKey == key {
-			found = append(found, assignmentLine{
-				Start: line.Start, End: line.End, Raw: append([]byte(nil), line.Raw...),
-				Newline: line.Newline, Value: match[2], TopLevel: topLevel,
-			})
+			found = append(found, assignmentLine{Start: line.Start, End: line.End, Raw: append([]byte(nil), line.Raw...), Newline: line.Newline, Value: match[2], TopLevel: topLevel})
 		}
 	}
 	return found
@@ -577,10 +593,9 @@ func parseAssignmentKey(match []string) (string, bool) {
 }
 
 type rawLine struct {
-	Start   int
-	End     int
-	Raw     []byte
-	Newline string
+	Start, End int
+	Raw        []byte
+	Newline    string
 }
 
 func scanLines(data []byte) []rawLine {
@@ -588,14 +603,11 @@ func scanLines(data []byte) []rawLine {
 		return nil
 	}
 	var lines []rawLine
-	start := 0
-	for start < len(data) {
+	for start := 0; start < len(data); {
 		rel := bytes.IndexByte(data[start:], '\n')
-		end := len(data)
-		newline := ""
+		end, newline := len(data), ""
 		if rel >= 0 {
-			end = start + rel + 1
-			newline = "\n"
+			end, newline = start+rel+1, "\n"
 			if end-start >= 2 && data[end-2] == '\r' {
 				newline = "\r\n"
 			}
@@ -642,39 +654,12 @@ func containsProfileHeader(data []byte, profile string) bool {
 	return exists
 }
 
-func containsSandboxWorkspaceWrite(data []byte) bool {
-	var value map[string]any
-	if toml.Unmarshal(data, &value) != nil {
-		return false
-	}
-	_, exists := value["sandbox_workspace_write"]
-	return exists
-}
-
 func hasActiveLegacySandbox(data []byte) bool {
-	if len(findAssignments(data, "sandbox_mode")) > 0 || containsSandboxWorkspaceWrite(data) {
+	if len(findAssignments(data, "sandbox_mode")) > 0 {
 		return true
 	}
-	var value map[string]any
-	return toml.Unmarshal(data, &value) == nil && containsSemanticKey(value, "sandbox_mode")
-}
-
-func containsSemanticKey(value any, key string) bool {
-	switch typed := value.(type) {
-	case map[string]any:
-		for childKey, child := range typed {
-			if childKey == key || containsSemanticKey(child, key) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if containsSemanticKey(child, key) {
-				return true
-			}
-		}
-	}
-	return false
+	_, exists, _ := sandboxWorkspaceWriteBlock(data)
+	return exists
 }
 
 func detectNewline(data []byte) string {

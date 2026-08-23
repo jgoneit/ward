@@ -30,7 +30,7 @@ func acquireFileLock(ctx context.Context, path string, mode lockMode, timeout ti
 			if closeErr := created.Close(); closeErr != nil {
 				return nil, fmt.Errorf("close audit lock file: %w", closeErr)
 			}
-			if secureErr := securePrivateFile(path); secureErr != nil {
+			if secureErr := securePrivateFileContext(ctx, path); secureErr != nil {
 				return nil, fmt.Errorf("secure audit lock file: %w", secureErr)
 			}
 			info, err = os.Lstat(path)
@@ -49,7 +49,7 @@ func acquireFileLock(ctx context.Context, path string, mode lockMode, timeout ti
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, errors.New("audit lock path must be a regular file")
 	}
-	if err := inspectPrivateFilePermissions(path); err != nil {
+	if err := inspectPrivateFilePermissionsContext(ctx, path); err != nil {
 		return nil, fmt.Errorf("unsafe audit lock permissions: %w", err)
 	}
 

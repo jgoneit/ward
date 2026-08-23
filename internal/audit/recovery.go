@@ -19,23 +19,25 @@ func (s *Store) RecoverHead(ctx context.Context, cwd string, dryRun bool) (Recov
 		return result, nil
 	}
 
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return RecoveryResult{}, err
+	}
 	defer s.mu.Unlock()
 	lock, err := acquireFileLock(ctx, project.lockPath, lockExclusive, s.lockTimeout, false)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
 	defer lock.release()
-	state, err := s.readVerifiedChain(project)
+	state, err := s.readVerifiedChainContext(ctx, project)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
-	segments, err := listSegments(project.dir)
+	segments, err := listSegmentsContext(ctx, project.dir)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
 	if len(segments) == 0 {
-		if err := verifyHead(project, state, false); err != nil {
+		if err := verifyHeadContext(ctx, project, state, false); err != nil {
 			return RecoveryResult{}, err
 		}
 		return result, nil
@@ -43,7 +45,7 @@ func (s *Store) RecoverHead(ctx context.Context, cwd string, dryRun bool) (Recov
 
 	targetSequence := state.nextSequence() - 1
 	targetMAC := state.lastMAC()
-	head, headExists, err := readHead(project)
+	head, headExists, err := readHeadContext(ctx, project)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
@@ -68,10 +70,10 @@ func (s *Store) RecoverHead(ctx context.Context, cwd string, dryRun bool) (Recov
 	if dryRun {
 		return result, nil
 	}
-	if err := writeHead(project, targetSequence, targetMAC, s.now().UTC()); err != nil {
+	if err := writeHeadContext(ctx, project, targetSequence, targetMAC, s.now().UTC()); err != nil {
 		return RecoveryResult{}, fmt.Errorf("repair audit head: %w", err)
 	}
-	if _, err := s.readVerifiedLog(project); err != nil {
+	if _, err := s.readVerifiedLogContext(ctx, project); err != nil {
 		return RecoveryResult{}, fmt.Errorf("verify repaired audit head: %w", err)
 	}
 	result.Repaired = true

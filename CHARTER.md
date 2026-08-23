@@ -5,44 +5,43 @@ bottleneck.
 
 ## Product promise
 
-> Ward installs and verifies a bounded native secret boundary, vetoes a small
-> set of high-confidence catastrophic actions, and otherwise defers to the
-> user's existing Host permissions.
+> Ward installs a bounded native secret boundary, vetoes a small set of
+> high-confidence destructive actions, and otherwise disappears into the
+> user's existing Host permission flow.
 
-Ward must satisfy both of these conditions:
+Ward succeeds only when both statements are true:
 
-1. An Agent can complete normal development work without disabling Ward.
-2. Ward adds no approval prompt to work the user has already authorized.
+1. An Agent can finish ordinary development without disabling Ward.
+2. Ward adds no prompt or model context to work the user already authorized.
 
-## Authority boundary
+## Fixed layers
 
-- The Host's native permission profile is the secret filesystem boundary for
-  paths its policy language can represent without breaking ordinary public
-  template workflows.
-- Ward hooks are synchronous, veto-only guardrails for supported tool paths.
-- The Plugin and Skill provide installation, diagnostics, audit, and
-  explanation UX; they are not security boundaries.
-- Ward never grants access, never auto-approves a request, and never changes a
-  user's approval policy.
-- Ward never broadens command network authority during installation. Explicit
-  danger-full migration may preserve already-authorized networking; otherwise
-  the Host profile remains least privilege.
+Ward has no user-selected runtime modes. A Core installation owns:
+
+- a synchronous destructive-action veto for supported tool paths;
+- a native profile for reviewed high-confidence workspace secret names;
+- privacy-preserving audit events only for attributable `deny` and `error`.
+
+The Plugin and Skill explain health and help the current Agent recover after a
+deny. They are not security boundaries and do not approve access.
 
 ## Decision vocabulary
 
-- `deny`: a narrow, high-confidence built-in or additive-deny rule matched.
-- `defer`: Ward makes no access decision; the Host keeps its normal flow.
-- `error`: Ward could not uphold its evaluation contract. The Codex adapter
-  maps this to a static deny response.
+- `deny`: a narrow, high-confidence destructive rule matched.
+- `defer`: Ward made no decision and produced no prompt, context, or audit
+  mutation.
+- `error`: Ward could not evaluate reliably; the Codex adapter emits no
+  permission decision and the Host remains authoritative.
 
-`allow`, `ask`, and legacy `approve` are not Ward decisions.
-`defer` also does not promise that the Host grants filesystem or network
-capability; it promises only that Ward adds no decision or prompt.
+Ward never returns `allow`, `ask`, or legacy `approve`, and never edits
+`approval_policy`.
 
 ## Autonomy constraint
 
-Ambiguity is not a deny rule. Unknown tools, unsupported syntax, ordinary file
-deletion, normal Git work, builds, tests, package installation, migrations,
-and infrastructure planning defer to Host permissions. A new built-in deny
-rule is admitted only after audit-only burn-in proves defensive value with no
-unresolved false deny.
+Ambiguous syntax, unknown tools, interactive sessions, secret-reading commands,
+ordinary deletion, builds, normal Git, migrations, and infrastructure planning
+defer. A new built-in deny is admitted only for a recoverability-critical
+target that can be identified with high confidence and has attack plus normal
+workflow counterexamples.
+
+Harness Legacy fixtures are test input, not inherited policy.

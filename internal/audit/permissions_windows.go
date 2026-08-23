@@ -3,6 +3,7 @@
 package audit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -15,13 +16,59 @@ import (
 // whether a filesystem persists or expands GENERIC_ALL in inheritable ACEs.
 const windowsFileAllAccess = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff)
 
-func securePrivateDirectory(path string) error { return setPrivateWindowsACL(path, true) }
-func securePrivateFile(path string) error      { return setPrivateWindowsACL(path, false) }
+func securePrivateDirectory(path string) error {
+	return securePrivateDirectoryContext(context.Background(), path)
+}
+func securePrivateDirectoryContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	err := setPrivateWindowsACL(path, true)
+	if err != nil {
+		return err
+	}
+	return contextError(ctx)
+}
+func securePrivateFile(path string) error {
+	return securePrivateFileContext(context.Background(), path)
+}
+func securePrivateFileContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	err := setPrivateWindowsACL(path, false)
+	if err != nil {
+		return err
+	}
+	return contextError(ctx)
+}
 
 func inspectPrivateDirectoryPermissions(path string) error {
-	return inspectPrivateWindowsACL(path, true)
+	return inspectPrivateDirectoryPermissionsContext(context.Background(), path)
 }
-func inspectPrivateFilePermissions(path string) error { return inspectPrivateWindowsACL(path, false) }
+func inspectPrivateDirectoryPermissionsContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	err := inspectPrivateWindowsACL(path, true)
+	if err != nil {
+		return err
+	}
+	return contextError(ctx)
+}
+func inspectPrivateFilePermissions(path string) error {
+	return inspectPrivateFilePermissionsContext(context.Background(), path)
+}
+func inspectPrivateFilePermissionsContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	err := inspectPrivateWindowsACL(path, false)
+	if err != nil {
+		return err
+	}
+	return contextError(ctx)
+}
 
 func setPrivateWindowsACL(path string, directory bool) error {
 	userSID, closeToken, err := currentUserSID()

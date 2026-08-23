@@ -1,18 +1,18 @@
 {
   "name": "ward",
   "version": "0.1.0-dev.0+codex.20260819154508",
-  "description": "Diagnose and explain Ward's Codex security guardrail.",
+  "description": "Recover from Ward denials and inspect its ambient Codex safety kernel.",
   "author": {
     "name": "jgoneit"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Ward",
-    "shortDescription": "Inspect Ward security decisions and health.",
-    "longDescription": "Ward provides diagnostics, privacy-preserving audit inspection, and explanations for a veto-only Codex security guardrail. It never grants permissions or adds approval prompts.",
+    "shortDescription": "Recover from Ward denials and inspect health.",
+    "longDescription": "Ward guides the current Agent after a high-confidence destructive veto and provides explicit diagnostics for its ambient Codex safety kernel. Ordinary deferred work receives no Ward intervention, permission grant, or added prompt.",
     "developerName": "jgoneit",
     "category": "Developer Tools",
     "capabilities": [],
-    "defaultPrompt": "Explain Ward status and any deny or coverage gap. Run privileged Doctor or audit checks only through an already-authorized Host path; otherwise report them as Not run."
+    "defaultPrompt": "Recover safely from a Ward denial or explain a Ward session-health warning. Stay silent for ordinary deferred requests, and run Doctor or audit checks only through an already-authorized Host path."
   }
 }

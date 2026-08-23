@@ -15,18 +15,11 @@ import (
 
 const doctorSchemaV1 = "ward-doctor/v1"
 
-// Doctor performs read-only checks against the explicit integration paths.
-// Warnings identify limitations that do not make the installed boundary
-// internally inconsistent; any failed check sets Healthy to false.
+// Doctor performs read-only checks. Messages remain useful to a human CLI;
+// SessionStart exposes only failed check IDs through the Codex adapter.
 func Doctor(options Options) DoctorReport {
 	report := DoctorReport{Schema: doctorSchemaV1, Healthy: true}
-	add := func(id string, status CheckStatus, message string) {
-		report.Checks = append(report.Checks, Check{ID: id, Status: status, Message: message})
-		if status == CheckFail {
-			report.Healthy = false
-		}
-	}
-
+	add := reportAdder(&report)
 	if err := validateOptions(options); err != nil {
 		add("paths", CheckFail, err.Error())
 		return report
@@ -36,13 +29,13 @@ func Doctor(options Options) DoctorReport {
 		return report
 	}
 
-	journalRaw, journalExists, err := readOptional(options.Paths.journalFile())
-	if err != nil {
-		add("journal", CheckFail, err.Error())
-		return report
-	}
-	if !journalExists {
-		add("journal", CheckFail, "Ward integration journal is missing.")
+	journalRaw, exists, err := readOptional(options.Paths.journalFile())
+	if err != nil || !exists {
+		if err != nil {
+			add("journal", CheckFail, err.Error())
+		} else {
+			add("journal", CheckFail, "Ward integration journal is missing.")
+		}
 		return report
 	}
 	journal, err := decodeJournal(journalRaw)
@@ -50,12 +43,15 @@ func Doctor(options Options) DoctorReport {
 		add("journal", CheckFail, err.Error())
 		return report
 	}
-	if journal.ProfileName != options.profileName() {
-		add("journal", CheckFail, "Journal profile does not match the requested profile.")
-	} else if filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
-		add("journal", CheckFail, "Journal binary path does not match the running Ward binary.")
+	if journal.Schema != journalSchemaV2 {
+		add("journal.version", CheckFail, "Ward integration journal requires the atomic v2 migration.")
 	} else {
-		add("journal", CheckPass, "Ward integration journal is valid.")
+		add("journal.version", CheckPass, "Ward integration journal uses v2.")
+	}
+	if journal.ProfileName != options.profileName() || filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
+		add("journal.identity", CheckFail, "Journal identity does not match this Ward installation.")
+	} else {
+		add("journal.identity", CheckPass, "Ward integration journal identity is valid.")
 	}
 	checkPrivateFile(&report, "journal.permissions", options.Paths.journalFile())
 
@@ -67,8 +63,7 @@ func Doctor(options Options) DoctorReport {
 		add("binary", CheckPass, "Configured Ward binary is present.")
 	}
 
-	hooksRaw, hooksExists, err := readOptional(options.Paths.HooksFile)
-	if err != nil || !hooksExists {
+	if hooksRaw, hooksExists, err := readOptional(options.Paths.HooksFile); err != nil || !hooksExists {
 		if err != nil {
 			add("hooks", CheckFail, err.Error())
 		} else {
@@ -76,13 +71,12 @@ func Doctor(options Options) DoctorReport {
 		}
 	} else {
 		checkHooks(&report, hooksRaw, journal.BinaryPath)
-		if journal.HooksDigest != "" && journal.HooksDigest != digest(hooksRaw) {
-			add("hooks.changed", CheckWarn, "hooks.json changed after Ward installation; exact Ward handlers were checked separately.")
+		if journal.HooksDigest != digest(hooksRaw) {
+			add("hooks.changed", CheckWarn, "hooks.json changed after installation; exact Ward handlers were checked separately.")
 		}
 	}
 
-	configRaw, configExists, err := readOptional(options.Paths.ConfigFile)
-	if err != nil || !configExists {
+	if configRaw, configExists, err := readOptional(options.Paths.ConfigFile); err != nil || !configExists {
 		if err != nil {
 			add("permissions", CheckFail, err.Error())
 		} else {
@@ -90,38 +84,51 @@ func Doctor(options Options) DoctorReport {
 		}
 	} else {
 		checkConfig(&report, configRaw, journal, options)
-		if journal.ConfigDigest != "" && journal.ConfigDigest != digest(configRaw) {
-			add("permissions.changed", CheckWarn, "config.toml changed after Ward installation; managed blocks were checked separately.")
+		if journal.ConfigDigest != digest(configRaw) {
+			add("permissions.changed", CheckWarn, "config.toml changed after installation; managed bytes were checked separately.")
 		}
 	}
 
+	if _, policyExists, err := readOptional(options.Paths.UserPolicyPath); err != nil {
+		add("policy.additive", CheckFail, "Ward additive policy path could not be inspected.")
+	} else if policyExists {
+		add("policy.additive", CheckFail, "Additive user policy conflicts with the ambient kernel.")
+	} else {
+		add("policy.additive", CheckPass, "No additive user policy is active.")
+	}
 	if info, err := os.Lstat(options.Paths.StateDir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		add("state", CheckFail, "Ward state directory is missing or not a directory.")
+		add("state", CheckFail, "Ward state directory is missing or not a real directory.")
 	} else if err := audit.InspectPrivateDirectory(options.Paths.StateDir); err != nil {
 		add("state.permissions", CheckFail, "Ward state directory permissions are not private.")
 	} else {
 		add("state.permissions", CheckPass, "Ward state directory permissions are private.")
 	}
-
-	add("permissions.glob_depth", CheckWarn, "glob_scan_max_depth=4 bounds Linux, WSL, and Windows pre-expansion; secrets nested more deeply require explicit depth rules or a larger reviewed limit.")
-	add("permissions.env_custom", CheckWarn, "Codex deny globs cannot be reopened by exact public-template rules; native policy denies .env and reviewed common suffixes, while other .env.<custom> names depend on observed Ward hooks.")
-	add("permissions.credential_broker", CheckWarn, "Native credential-store and SSH-key denies can block subprocesses that read credentials directly; workflows without an OS keychain, ssh-agent, or equivalent broker require burn-in and are not yet claimed as normal-workflow compatible.")
-	add("permissions.layers", CheckWarn, "This doctor checks the selected user config only; sandbox_mode in another loaded Codex layer can still override permission profiles.")
-	add("hooks.managed", CheckWarn, "User config cannot prove that managed allow_managed_hooks_only policy permits this user-global hook.")
-	add("hooks.trust", CheckWarn, "File inspection cannot prove Codex hook trust; review and trust the exact user hook definition in Codex.")
+	if options.Paths.StateTopologyIncomplete {
+		add("permissions.state_topology", CheckWarn, "Ward state has a higher project-writable ancestor; the bounded immediate anchor remains protected.")
+	} else {
+		add("permissions.state_topology", CheckPass, "Ward state uses a bounded protected anchor.")
+	}
+	if options.Paths.ControlTopologyIncomplete {
+		add("permissions.control_topology", CheckWarn, "A project-writable ancestor can relocate a Ward control anchor; the dedicated immediate anchors remain protected.")
+	} else {
+		add("permissions.control_topology", CheckPass, "Ward control files use bounded dedicated anchors outside project relocation authority.")
+	}
+	if options.Paths.HomeWorkspaceTopology {
+		add("permissions.home_workspace_topology", CheckWarn, "HOME is the active workspace; recursive workspace Secret rules may also cover Host credential stores. Use a project subdirectory or another Host profile.")
+	} else {
+		add("permissions.home_workspace_topology", CheckPass, "The active workspace is narrower than HOME credential storage.")
+	}
+	add("permissions.layers", CheckPass, "Other Codex permission layers remain Host authority.")
+	add("hooks.trust", CheckWarn, "Hook definition trust is controlled by Codex and cannot be verified by Ward; confirm it once in the Host.")
 	return report
 }
 
 func checkHooks(report *DoctorReport, raw []byte, binaryPath string) {
 	add := reportAdder(report)
-	root, err := decodeJSONObject(raw)
+	root, hooks, err := decodeHookRoot(raw)
+	_ = root
 	if err != nil {
 		add("hooks", CheckFail, "hooks.json is not valid JSON: "+err.Error())
-		return
-	}
-	var hooks map[string]json.RawMessage
-	if err := json.Unmarshal(root["hooks"], &hooks); err != nil || hooks == nil {
-		add("hooks", CheckFail, "hooks.json does not contain a hooks object.")
 		return
 	}
 	allPass := true
@@ -132,17 +139,54 @@ func checkHooks(report *DoctorReport, raw []byte, binaryPath string) {
 			allPass = false
 			continue
 		}
-		count, conflict := countWardHandlers(groups, spec.StatusMessage, hookCommand(binaryPath, spec.Subcommand))
+		count, conflict := countDesiredHandlers(groups, spec, binaryPath)
 		if conflict || count != 1 {
-			add("hooks."+spec.Event, CheckFail, fmt.Sprintf("Expected exactly one unmodified Ward handler; found %d.", count))
+			add("hooks."+spec.Event, CheckFail, fmt.Sprintf("Expected one exact Ward handler; found %d.", count))
 			allPass = false
 			continue
 		}
-		add("hooks."+spec.Event, CheckPass, "Ward handler is installed once with matcher * and a bounded synchronous timeout.")
+		add("hooks."+spec.Event, CheckPass, "Ward handler has its canonical matcher and a 2 second command timeout.")
+	}
+	legacyCount, legacyConflict := countLegacyHandlers(hooks, binaryPath)
+	if legacyConflict || legacyCount > 0 {
+		add("hooks.legacy_stale", CheckFail, fmt.Sprintf("Legacy or modified Ward handlers remain: %d.", legacyCount))
+		allPass = false
+	} else {
+		add("hooks.legacy_stale", CheckPass, "No v1 PermissionRequest/PostToolUse handlers remain.")
 	}
 	if allPass {
-		add("hooks", CheckPass, "All Ward Codex hook handlers are installed.")
+		add("hooks", CheckPass, "Exactly the two ambient Ward hook handlers are installed.")
 	}
+}
+
+func countLegacyHandlers(hooks map[string]json.RawMessage, binaryPath string) (int, bool) {
+	count := 0
+	for _, event := range managedHookEvents() {
+		groups, err := decodeGroups(hooks[event])
+		if err != nil {
+			return count, true
+		}
+		for _, rawGroup := range groups {
+			group, err := decodeGroup(rawGroup)
+			if err != nil {
+				return count, true
+			}
+			handlers, err := decodeHandlers(group["hooks"])
+			if err != nil {
+				return count, true
+			}
+			for _, handler := range handlers {
+				legacy, _, conflict, err := classifyWardHandler(handler, groupMatcher(group), event, binaryPath)
+				if err != nil || conflict {
+					return count, true
+				}
+				if legacy {
+					count++
+				}
+			}
+		}
+	}
+	return count, false
 }
 
 func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, options Options) {
@@ -153,16 +197,15 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 		add("permissions.syntax", CheckPass, "config.toml is valid TOML.")
 	}
 	if hooksExplicitlyDisabled(raw) {
-		add("hooks.feature", CheckFail, "Codex hooks are explicitly disabled in config.toml.")
+		add("hooks.feature", CheckFail, "Codex hooks are explicitly disabled.")
 	} else {
-		add("hooks.feature", CheckPass, "Codex hooks are not explicitly disabled in config.toml.")
+		add("hooks.feature", CheckPass, "Codex hooks are not explicitly disabled.")
 	}
 	if hasActiveLegacySandbox(raw) {
-		add("permissions.legacy_sandbox", CheckFail, "sandbox_mode or sandbox_workspace_write overrides permission profiles.")
+		add("permissions.legacy_sandbox", CheckFail, "A legacy sandbox setting overrides permission profiles.")
 	} else {
-		add("permissions.legacy_sandbox", CheckPass, "No active legacy sandbox setting overrides permission profiles.")
+		add("permissions.legacy_sandbox", CheckPass, "No legacy sandbox setting overrides permission profiles.")
 	}
-
 	defaults := findAssignments(raw, "default_permissions")
 	selected := ""
 	if len(defaults) == 1 && defaults[0].TopLevel {
@@ -171,93 +214,88 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 	if selected != journal.ProfileName {
 		add("permissions.default", CheckFail, fmt.Sprintf("default_permissions selects %q instead of %q.", selected, journal.ProfileName))
 	} else {
-		add("permissions.default", CheckPass, "Ward baseline is the default permission profile.")
+		add("permissions.default", CheckPass, "Ward's wrapper profile is selected.")
 	}
-
-	if len(journal.ConfigEdits.ProfileAppend) == 0 || !bytes.Contains(raw, journal.ConfigEdits.ProfileAppend) {
+	profile := journal.ConfigEdits.ProfileAppend
+	if len(profile) == 0 || bytes.Count(raw, profile) != 1 {
 		add("permissions.profile", CheckFail, "Ward permission profile block is missing or modified.")
-	} else {
-		add("permissions.profile", CheckPass, "Ward permission profile block is intact.")
+		return
 	}
-	if bytes.Contains(journal.ConfigEdits.ProfileAppend, []byte("[permissions."+journal.ProfileName+".network]")) {
-		add("permissions.network", CheckPass, "Command network access was preserved from an explicitly migrated danger-full-access sandbox.")
+	add("permissions.profile", CheckPass, "Ward permission profile block is intact.")
+	parentNeedle := []byte("extends = " + strconv.Quote(journal.ConfigEdits.ParentProfile))
+	if journal.ConfigEdits.ParentProfile == "" || !bytes.Contains(profile, parentNeedle) {
+		add("permissions.parent", CheckFail, "Ward profile parent is missing or changed.")
+	} else if !strings.HasPrefix(journal.ConfigEdits.ParentProfile, ":") && !namedPermissionParentSafe(raw, journal.ConfigEdits.ParentProfile) {
+		add("permissions.parent", CheckFail, "Ward profile parent now contains authority Ward cannot safely inherit.")
 	} else {
-		add("permissions.network", CheckPass, "Ward did not grant command network access beyond the source permission state.")
+		add("permissions.parent", CheckPass, "Ward preserves the prior modern permission parent.")
 	}
-	for _, path := range []struct {
-		id   string
-		path string
-	}{
-		{"permissions.state", options.Paths.StateDir},
-		{"permissions.user_policy", options.Paths.UserPolicyPath},
-		{"permissions.control_config", options.Paths.ConfigFile},
-		{"permissions.control_hooks", options.Paths.HooksFile},
+	checkNativeSecretVocabulary(report, profile)
+	for _, protected := range []struct{ id, path, mode string }{
+		{"permissions.state", options.Paths.StateDir, "deny"},
+		{"permissions.user_policy", options.Paths.UserPolicyPath, "deny"},
+		{"permissions.control_config", options.Paths.ConfigFile, "deny"},
+		{"permissions.control_hooks", options.Paths.HooksFile, "deny"},
+		{"permissions.control_binary", options.Paths.BinaryPath, "read"},
 	} {
-		needle := []byte(strconv.Quote(path.path) + ` = "deny"`)
-		if path.path == "" || !bytes.Contains(journal.ConfigEdits.ProfileAppend, needle) {
-			add(path.id, CheckFail, "Protected Ward path is missing from the permission profile.")
+		needle := []byte(strconv.Quote(protected.path) + ` = "` + protected.mode + `"`)
+		if protected.path == "" || !bytes.Contains(profile, needle) {
+			add(protected.id, CheckFail, "A Ward control or state path is not protected.")
 		} else {
-			add(path.id, CheckPass, "Ward-owned path is denied to sandboxed commands.")
+			add(protected.id, CheckPass, "Ward control or state path is protected.")
 		}
 	}
-	binaryNeedle := []byte(strconv.Quote(options.Paths.BinaryPath) + ` = "read"`)
-	if options.Paths.BinaryPath == "" || !bytes.Contains(journal.ConfigEdits.ProfileAppend, binaryNeedle) {
-		add("permissions.control_binary", CheckFail, "Ward executable is not sandbox read-only in the permission profile.")
-	} else {
-		add("permissions.control_binary", CheckPass, "Ward executable is readable and executable but not writable by sandboxed commands.")
-	}
-	boundariesComplete := true
+	bounded := true
 	for _, directory := range readOnlyBoundaryDirectories(options.Paths) {
-		needle := []byte(strconv.Quote(directory) + ` = "read"`)
-		if !bytes.Contains(journal.ConfigEdits.ProfileAppend, needle) {
-			boundariesComplete = false
+		if !bytes.Contains(profile, []byte(strconv.Quote(directory)+` = "read"`)) {
+			bounded = false
+		}
+	}
+	codexRootRead := []byte(strconv.Quote(filepath.Dir(options.Paths.ConfigFile)) + ` = "read"`)
+	if !bounded || bytes.Contains(profile, codexRootRead) {
+		add("permissions.control_boundaries", CheckFail, "Ward control topology is missing or broader than the bounded Ward anchors.")
+	} else {
+		add("permissions.control_boundaries", CheckPass, "Only bounded Ward-owned relocation anchors are read-only.")
+	}
+	if containsInlineHooksTable(raw) {
+		if bytes.Contains(raw, []byte(options.Paths.BinaryPath)) || bytes.Contains(raw, []byte("ward hook codex-")) {
+			add("hooks.inline_ward", CheckFail, "Inline configuration also references Ward; duplicate Hook execution cannot be excluded.")
+		} else {
+			add("hooks.inline", CheckWarn, "config.toml also defines unrelated inline hooks; Codex merges them with hooks.json.")
+		}
+	}
+	if len(journal.ConfigEdits.SandboxOriginal) > 0 && bytes.Count(raw, journal.ConfigEdits.SandboxReplacement) != 1 {
+		add("permissions.migration", CheckFail, "Sandbox migration marker is missing or duplicated.")
+	}
+}
+
+func checkNativeSecretVocabulary(report *DoctorReport, profile []byte) {
+	add := reportAdder(report)
+	missing := false
+	for _, rule := range workspaceSecretRules() {
+		if !bytes.Contains(profile, []byte(rule)) {
+			missing = true
 			break
 		}
 	}
-	if boundariesComplete {
-		add("permissions.control_boundaries", CheckPass, "Ward and directory-valued credential anchors are sandbox read-only.")
+	if missing {
+		add("permissions.native_secret_probe", CheckFail, "A reviewed workspace secret rule is missing.")
 	} else {
-		add("permissions.control_boundaries", CheckFail, "A Ward or credential boundary directory is missing from the permission profile.")
+		add("permissions.native_secret_probe", CheckPass, "All reviewed workspace secret probes are represented.")
 	}
-	if options.Paths.StateTopologyIncomplete {
-		add("permissions.state_topology", CheckWarn, "Ward audit state has a higher writable ancestor inside the diagnosed project that cannot be frozen without broadly restricting normal work; relocating that ancestor can degrade audit continuity and remains a project release blocker.")
-	} else {
-		add("permissions.state_topology", CheckPass, "Ward audit state anchor has no unprotected relocatable ancestor inside the diagnosed project.")
+	forbidden := []string{
+		`"~/.aws/credentials" = "deny"`, `"~/.config/gh/hosts.yml" = "deny"`, `"~/.docker/config.json" = "deny"`,
+		`"*.key" = "deny"`, `"**/*.key" = "deny"`, `"*.pem" = "deny"`, `"**/*.pem" = "deny"`,
+		`"*-secret.yml" = "deny"`, `"**/*-secret.yml" = "deny"`, `"*credentials*.json" = "deny"`, `".env.*" = "deny"`,
+		`"privkey0.pem" = "deny"`,
 	}
-	if options.Paths.CredentialPathsIncomplete {
-		add("permissions.credential_paths", CheckFail, "One or more configured credential paths are relative or otherwise cannot be represented as exact native denies.")
-	} else if journal.CredentialPathsDigest == "" || journal.CredentialPathsDigest != credentialPathsDigest(options.Paths.CredentialFiles, options.Paths.CredentialDirectories) {
-		add("permissions.credential_paths", CheckFail, "The environment-resolved credential path set changed after installation; reinstall Ward to replace the exact native denies.")
-	} else {
-		missing := false
-		for _, credentialPath := range options.Paths.CredentialFiles {
-			needle := []byte(strconv.Quote(credentialPath) + ` = "deny"`)
-			if credentialPath == "" || !bytes.Contains(journal.ConfigEdits.ProfileAppend, needle) {
-				missing = true
-				break
-			}
-		}
-		if missing {
-			add("permissions.credential_paths", CheckFail, "An environment-resolved credential path is missing from the installed permission profile.")
-		} else {
-			add("permissions.credential_paths", CheckPass, "Environment-resolved credential paths are represented as exact native denies.")
+	for _, needle := range forbidden {
+		if bytes.Contains(profile, []byte(needle)) {
+			add("permissions.native_minimal_probe", CheckFail, "The native profile contains a broad or HOME credential rule.")
+			return
 		}
 	}
-	if options.Paths.CredentialTopologyIncomplete {
-		add("permissions.credential_topology", CheckWarn, "At least one credential file or directory anchor has a higher writable ancestor inside the diagnosed project; the immediate path is protected, but ancestor relocation remains hook-dependent.")
-	} else {
-		add("permissions.credential_topology", CheckPass, "Credential anchors have no unprotected relocatable ancestor inside the diagnosed project.")
-	}
-	if containsInlineHooksTable(raw) {
-		add("hooks.inline", CheckWarn, "config.toml also defines inline hooks; Codex merges them with hooks.json.")
-	}
-	if len(journal.ConfigEdits.SandboxOriginal) > 0 {
-		if bytes.Count(raw, journal.ConfigEdits.SandboxReplacement) != 1 {
-			add("permissions.migration", CheckFail, "Sandbox migration marker is missing or duplicated.")
-		} else {
-			add("permissions.migration", CheckPass, "Legacy sandbox_mode is journaled for exact restoration.")
-		}
-	}
+	add("permissions.native_minimal_probe", CheckPass, "Public PEM, generic YAML, templates, and HOME auth stores remain outside Ward's native carve-out.")
 }
 
 func checkPrivateFile(report *DoctorReport, id, path string) {
@@ -289,8 +327,6 @@ func reportAdder(report *DoctorReport) func(string, CheckStatus, string) {
 	}
 }
 
-// CleanPaths is useful to callers that need a stable display of the paths
-// Doctor evaluated; it does not touch the filesystem.
 func CleanPaths(paths Paths) Paths {
 	paths.HomeDir = filepath.Clean(paths.HomeDir)
 	paths.HooksFile = filepath.Clean(paths.HooksFile)

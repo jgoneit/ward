@@ -96,7 +96,7 @@ func TestRecordUsesHMACFingerprintsAndPersistsNoRawInput(t *testing.T) {
 		ToolName:        "mcp__private_server__read_secret",
 		ToolKind:        ToolMCP,
 		ToolInput:       []byte(`{"path":"/private/credentials","token":"` + secret + `"}`),
-		Decision:        DecisionDefer,
+		Decision:        DecisionDeny,
 		RuleID:          "WARD.SECRET.READ",
 		RiskClass:       "secret-read",
 		PermissionMode:  "default",
@@ -106,24 +106,15 @@ func TestRecordUsesHMACFingerprintsAndPersistsNoRawInput(t *testing.T) {
 	if err := store.Record(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
-	post := input
-	post.Phase = PhasePost
-	post.HostDisposition = HostPostObserved
-	post.Decision = ""
-	post.RuleID = ""
-	post.RiskClass = ""
-	if err := store.Record(context.Background(), post); err != nil {
-		t.Fatal(err)
-	}
 
 	events, err := store.Show(context.Background(), project, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %d, want 2", len(events))
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
 	}
-	first, second := events[0], events[1]
+	first := events[0]
 	for name, value := range map[string]string{
 		"project": first.ProjectID, "session": first.SessionFingerprint, "turn": first.TurnFingerprint,
 		"tool use": first.ToolUseFingerprint, "input": first.InputFingerprint, "tool": first.ToolFingerprint,
@@ -136,17 +127,136 @@ func TestRecordUsesHMACFingerprintsAndPersistsNoRawInput(t *testing.T) {
 	if first.Timestamp.Location() != time.UTC {
 		t.Fatalf("timestamp location = %v, want UTC", first.Timestamp.Location())
 	}
-	if first.InputFingerprint != second.InputFingerprint || first.RequestFingerprint != second.RequestFingerprint {
-		t.Fatal("matching Pre/Post inputs did not retain correlation fingerprints")
-	}
-	if second.HostDisposition != HostPostObserved || second.Decision != "" {
-		t.Fatalf("unexpected post event: %+v", second)
+	if first.Phase != PhasePre || first.HostDisposition != HostUnknown || first.Decision != DecisionDeny || first.CoverageGapCode != "" {
+		t.Fatalf("unexpected sparse audit event: %+v", first)
 	}
 
 	assertStateExcludes(t, state, []string{
 		secret, project, input.SessionID, input.TurnID, input.ToolUseID, input.ToolName,
 		"/private/credentials", "private-policy-material",
 	})
+}
+
+func TestRecordAcceptsOnlySparseWriterSubset(t *testing.T) {
+	t.Parallel()
+	state := filepath.Join(t.TempDir(), "state")
+	store := mustStore(t, Options{StateDir: state})
+	project := makeProject(t)
+
+	cases := map[string]RecordInput{}
+	deferInput := sampleInput(project, time.Now().UTC())
+	deferInput.Decision = DecisionDefer
+	cases["defer"] = deferInput
+
+	permission := sampleInput(project, time.Now().UTC())
+	permission.Phase = PhasePermissionRequest
+	permission.HostDisposition = HostApprovalRequested
+	cases["permission request"] = permission
+
+	post := sampleInput(project, time.Now().UTC())
+	post.Phase = PhasePost
+	post.HostDisposition = HostPostObserved
+	post.Decision = ""
+	cases["post"] = post
+
+	wrongDisposition := sampleInput(project, time.Now().UTC())
+	wrongDisposition.HostDisposition = HostPostObserved
+	cases["pre disposition"] = wrongDisposition
+
+	coverageGap := sampleInput(project, time.Now().UTC())
+	coverageGap.CoverageGapCode = string(CoverageGapDynamicPath)
+	cases["coverage gap"] = coverageGap
+
+	for name, input := range cases {
+		input := input
+		t.Run(name, func(t *testing.T) {
+			if err := store.Record(context.Background(), input); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("Record() error = %v, want ErrInvalidEvent", err)
+			}
+		})
+	}
+	projectEntries, err := os.ReadDir(filepath.Join(state, "projects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projectEntries) != 0 {
+		t.Fatalf("invalid sparse writes registered project state: %v", projectEntries)
+	}
+
+	deny := sampleInput(project, time.Now().UTC())
+	deny.ToolUseID = "deny"
+	if err := store.Record(context.Background(), deny); err != nil {
+		t.Fatal(err)
+	}
+	errorInput := sampleInput(project, time.Now().UTC())
+	errorInput.ToolUseID = "error"
+	errorInput.Decision = DecisionError
+	errorInput.RuleID = ""
+	errorInput.RiskClass = ""
+	if err := store.Record(context.Background(), errorInput); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := store.Show(context.Background(), project, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Decision != DecisionDeny || events[1].Decision != DecisionError {
+		t.Fatalf("sparse events = %+v", events)
+	}
+}
+
+func TestHistoricalV1ChainRemainsReadableAndAppendable(t *testing.T) {
+	t.Parallel()
+	store := mustStore(t, Options{StateDir: filepath.Join(t.TempDir(), "state")})
+	project := makeProject(t)
+	base := time.Now().UTC().Add(-time.Hour)
+
+	deferInput := sampleInput(project, base)
+	deferInput.Decision = DecisionDefer
+	deferInput.CoverageGapCode = string(CoverageGapUnsupportedTool)
+	recordHistoricalForTest(t, store, deferInput)
+
+	permission := sampleInput(project, base.Add(time.Minute))
+	permission.Phase = PhasePermissionRequest
+	permission.HostDisposition = HostApprovalRequested
+	permission.ToolUseID = "permission"
+	recordHistoricalForTest(t, store, permission)
+
+	post := sampleInput(project, base.Add(2*time.Minute))
+	post.Phase = PhasePost
+	post.HostDisposition = HostPostObserved
+	post.ToolUseID = "post"
+	post.Decision = ""
+	post.RuleID = ""
+	post.RiskClass = ""
+	recordHistoricalForTest(t, store, post)
+
+	current := sampleInput(project, base.Add(3*time.Minute))
+	current.ToolUseID = "current-error"
+	current.Decision = DecisionError
+	if err := store.Record(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+
+	verification, err := store.Verify(context.Background(), project)
+	if err != nil || !verification.Valid || verification.Records != 4 || verification.LastSequence != 4 {
+		t.Fatalf("verification = %+v, err = %v", verification, err)
+	}
+	events, err := store.Show(context.Background(), project, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 || events[0].Decision != DecisionDefer || events[1].Phase != PhasePermissionRequest || events[2].Phase != PhasePost || events[3].Decision != DecisionError {
+		t.Fatalf("historical chain = %+v", events)
+	}
+	stats, err := store.Stats(context.Background(), project, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 4 || stats.ByDecision[DecisionDefer] != 1 || stats.ByDecision[DecisionDeny] != 1 || stats.ByDecision[DecisionError] != 1 || stats.ByPhase[PhasePost] != 1 || stats.ByHostDisposition[HostApprovalRequested] != 1 {
+		t.Fatalf("historical stats = %+v", stats)
+	}
 }
 
 func TestPermissionModePersistsOnlyCatalogValues(t *testing.T) {
@@ -195,23 +305,21 @@ func TestPermissionModePersistsOnlyCatalogValues(t *testing.T) {
 	}
 }
 
-func TestCoverageGapCodePersistsOnlyStaticCatalogValues(t *testing.T) {
+func TestHistoricalCoverageGapCodePersistsOnlyStaticCatalogValues(t *testing.T) {
 	t.Parallel()
 	state := filepath.Join(t.TempDir(), "state")
 	project := makeProject(t)
 	store := mustStore(t, Options{StateDir: state})
 	known := sampleInput(project, time.Now().UTC())
+	known.Decision = DecisionDefer
 	known.CoverageGapCode = string(CoverageGapUnsupportedTool)
-	if err := store.Record(context.Background(), known); err != nil {
-		t.Fatal(err)
-	}
+	recordHistoricalForTest(t, store, known)
 	canary := "attacker-controlled-gap-WARD-CANARY"
 	unknown := sampleInput(project, time.Now().UTC())
+	unknown.Decision = DecisionDefer
 	unknown.ToolUseID = "unknown-gap"
 	unknown.CoverageGapCode = canary
-	if err := store.Record(context.Background(), unknown); err != nil {
-		t.Fatal(err)
-	}
+	recordHistoricalForTest(t, store, unknown)
 	events, err := store.Show(context.Background(), project, Filter{})
 	if err != nil {
 		t.Fatal(err)
@@ -234,18 +342,17 @@ func TestCoverageGapCodePersistsOnlyStaticCatalogValues(t *testing.T) {
 	}
 }
 
-func TestRecentlyAddedCoverageGapCodesAreCataloged(t *testing.T) {
+func TestHistoricalCoverageGapCodesRemainCataloged(t *testing.T) {
 	t.Parallel()
 	store := mustStore(t, Options{StateDir: filepath.Join(t.TempDir(), "state")})
 	project := makeProject(t)
 	codes := []CoverageGapCode{CoverageGapBuiltinDispatch, CoverageGapNohupStdinSemantics, CoverageGapMissingStructuredMoveRoles}
 	for index, code := range codes {
 		input := sampleInput(project, time.Now().UTC())
+		input.Decision = DecisionDefer
 		input.ToolUseID = fmt.Sprintf("new-gap-%d", index)
 		input.CoverageGapCode = string(code)
-		if err := store.Record(context.Background(), input); err != nil {
-			t.Fatal(err)
-		}
+		recordHistoricalForTest(t, store, input)
 	}
 	events, err := store.Show(context.Background(), project, Filter{})
 	if err != nil {
@@ -261,7 +368,7 @@ func TestRecentlyAddedCoverageGapCodesAreCataloged(t *testing.T) {
 	}
 }
 
-func TestRequestFingerprintCorrelatesPreAndPermissionRequest(t *testing.T) {
+func TestHistoricalRequestFingerprintCorrelatesPreAndPermissionRequest(t *testing.T) {
 	t.Parallel()
 	store := mustStore(t, Options{StateDir: filepath.Join(t.TempDir(), "state")})
 	project := makeProject(t)
@@ -274,9 +381,7 @@ func TestRequestFingerprintCorrelatesPreAndPermissionRequest(t *testing.T) {
 	permission.Phase = PhasePermissionRequest
 	permission.HostDisposition = HostApprovalRequested
 	permission.ToolUseID = "permission-request-id"
-	if err := store.Record(context.Background(), permission); err != nil {
-		t.Fatal(err)
-	}
+	recordHistoricalForTest(t, store, permission)
 	changed := pre
 	changed.ToolUseID = "changed-input-id"
 	changed.ToolInput = []byte(`{"command":"go test ./internal/audit"}`)
@@ -301,7 +406,7 @@ func TestRequestFingerprintCorrelatesPreAndPermissionRequest(t *testing.T) {
 	}
 }
 
-func TestRequestFingerprintUsesNormalizedCorrelationInput(t *testing.T) {
+func TestHistoricalRequestFingerprintUsesNormalizedCorrelationInput(t *testing.T) {
 	t.Parallel()
 	state := filepath.Join(t.TempDir(), "state")
 	store := mustStore(t, Options{StateDir: state})
@@ -320,9 +425,7 @@ func TestRequestFingerprintUsesNormalizedCorrelationInput(t *testing.T) {
 	permission.ToolUseID = "permission-id"
 	permission.ToolInput = []byte(`{"command":"printf x","description":"` + descriptionCanary + `"}`)
 	permission.CorrelationInput = []byte(` { "command" : "printf x" } `)
-	if err := store.Record(context.Background(), permission); err != nil {
-		t.Fatal(err)
-	}
+	recordHistoricalForTest(t, store, permission)
 	events, err := store.Show(context.Background(), project, Filter{})
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +478,7 @@ func TestVerifyDetectsTampering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data = bytes.Replace(data, []byte(`"ward_decision":"defer"`), []byte(`"ward_decision":"error"`), 1)
+	data = bytes.Replace(data, []byte(`"ward_decision":"deny"`), []byte(`"ward_decision":"error"`), 1)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -687,10 +790,9 @@ func TestShowFiltersAndStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	deferEvent := sampleInput(project, base.Add(time.Minute))
+	deferEvent.Decision = DecisionDefer
 	deferEvent.CoverageGapCode = string(CoverageGapDynamicPath)
-	if err := store.Record(context.Background(), deferEvent); err != nil {
-		t.Fatal(err)
-	}
+	recordHistoricalForTest(t, store, deferEvent)
 	filtered, err := store.Show(context.Background(), project, Filter{Decision: DecisionDeny, Limit: 1})
 	if err != nil || len(filtered) != 1 || filtered[0].Decision != DecisionDeny {
 		t.Fatalf("filtered events = %+v, %v", filtered, err)
@@ -1042,7 +1144,7 @@ func TestRecoverHeadRejectsInvalidTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data = bytes.Replace(data, []byte(`"ward_decision":"defer"`), []byte(`"ward_decision":"error"`), 1)
+	data = bytes.Replace(data, []byte(`"ward_decision":"deny"`), []byte(`"ward_decision":"error"`), 1)
 	if err := os.WriteFile(logPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1073,6 +1175,94 @@ func TestRecordErrorDoesNotMutateDecision(t *testing.T) {
 	}
 	if input.Decision != DecisionDeny {
 		t.Fatalf("decision changed to %q", input.Decision)
+	}
+}
+
+func TestRecordContextCancelsInjectedSegmentScanPromptly(t *testing.T) {
+	store := mustStore(t, Options{StateDir: filepath.Join(t.TempDir(), "state")})
+	project := makeProject(t)
+	first := sampleInput(project, time.Now().UTC())
+	first.ToolUseID = "first"
+	if err := store.Record(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	logPath, err := store.ProjectLogPath(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectState, err := store.project(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logBefore, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headBefore, err := os.ReadFile(projectState.headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	var once sync.Once
+	store.scanCheckpoint = func(ctx context.Context) error {
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	second := sampleInput(project, time.Now().UTC())
+	second.ToolUseID = "cancelled-scan"
+	result := make(chan error, 1)
+	go func() { result <- store.Record(ctx, second) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("Record() did not reach the injected segment scan")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err = <-result:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Record() did not return within the Hook audit budget after cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Record() error=%v, want context cancellation", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("Record() returned after %s, want below Hook audit budget", elapsed)
+	}
+	logAfter, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headAfter, err := os.ReadFile(projectState.headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(logAfter, logBefore) || !bytes.Equal(headAfter, headBefore) {
+		t.Fatal("cancelled segment scan mutated audit chain")
+	}
+}
+
+func TestRecordContextCancelsInternalMutexWaitPromptly(t *testing.T) {
+	store := mustStore(t, Options{StateDir: filepath.Join(t.TempDir(), "state")})
+	project := makeProject(t)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := store.Record(ctx, sampleInput(project, time.Now().UTC()))
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Record() error=%v, want context deadline", err)
+	}
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("Record() mutex wait returned after %s, want below Hook audit budget", elapsed)
 	}
 }
 
@@ -1109,6 +1299,13 @@ func mustStore(t *testing.T, options Options) *Store {
 	return store
 }
 
+func recordHistoricalForTest(t *testing.T, store *Store, input RecordInput) {
+	t.Helper()
+	if err := store.record(context.Background(), input, validateHistoricalRecordInput); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func sampleInput(project string, timestamp time.Time) RecordInput {
 	return RecordInput{
 		CWD:             project,
@@ -1121,7 +1318,7 @@ func sampleInput(project string, timestamp time.Time) RecordInput {
 		ToolName:        "Bash",
 		ToolKind:        ToolShell,
 		ToolInput:       []byte(`{"command":"go test ./..."}`),
-		Decision:        DecisionDefer,
+		Decision:        DecisionDeny,
 		PermissionMode:  "default",
 		EngineVersion:   "0.1.0",
 	}

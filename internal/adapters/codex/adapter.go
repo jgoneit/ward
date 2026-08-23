@@ -15,9 +15,19 @@ import (
 )
 
 const (
+	EventSessionStart      = "SessionStart"
 	EventPreToolUse        = "PreToolUse"
 	EventPermissionRequest = "PermissionRequest"
 	EventPostToolUse       = "PostToolUse"
+
+	// DestructiveToolNames is the single canonical tool-name alternation used
+	// by Ward's ambient PreToolUse hook. Codex presents shell execution as Bash;
+	// the remaining names are direct destructive file operations.
+	DestructiveToolNames = `Bash|PowerShell|pwsh|cmd|cmd\.exe|apply_patch|delete_file|move_file|mcp__filesystem__delete_file|mcp__filesystem__move_file`
+	// DestructiveToolMatcher is derived only from DestructiveToolNames. It is
+	// exported so integration tests and installers cannot drift from the
+	// adapter's canonical vocabulary.
+	DestructiveToolMatcher = `^(?:` + DestructiveToolNames + `)$`
 
 	MaxPayloadBytes  = 1 << 20
 	maxMetadataBytes = 4 << 10
@@ -56,6 +66,72 @@ type Invocation struct {
 	ToolName       string
 	RawToolInput   []byte
 	Request        contract.Request
+}
+
+// SessionStartInvocation is the privacy-minimal projection needed to run a
+// read-only installation health check. Ward never reads transcript contents.
+type SessionStartInvocation struct {
+	SessionID string
+	CWD       string
+	Source    string
+}
+
+// DecodeSessionStart validates Codex's SessionStart payload independently of
+// tool-call payloads. Unknown top-level fields are accepted so future Codex
+// metadata does not turn a healthy session into a startup failure.
+func DecodeSessionStart(data []byte) (SessionStartInvocation, error) {
+	if len(data) > MaxPayloadBytes {
+		return SessionStartInvocation{}, fmt.Errorf("%w: payload exceeds %d bytes", ErrInvalidPayload, MaxPayloadBytes)
+	}
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return SessionStartInvocation{}, fmt.Errorf("%w: %v", ErrInvalidPayload, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return SessionStartInvocation{}, fmt.Errorf("%w: top-level value must be an object", ErrInvalidPayload)
+	}
+	for _, key := range []string{"session_id", "transcript_path", "cwd", "hook_event_name", "source", "model", "permission_mode"} {
+		if _, exists := fields[key]; !exists {
+			return SessionStartInvocation{}, fmt.Errorf("%w: %s is required", ErrInvalidPayload, key)
+		}
+	}
+	var payload struct {
+		SessionID      string          `json:"session_id"`
+		TranscriptPath json.RawMessage `json:"transcript_path"`
+		CWD            string          `json:"cwd"`
+		HookEventName  string          `json:"hook_event_name"`
+		Source         string          `json:"source"`
+		Model          string          `json:"model"`
+		PermissionMode string          `json:"permission_mode"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&payload); err != nil {
+		return SessionStartInvocation{}, fmt.Errorf("%w: %v", ErrInvalidPayload, err)
+	}
+	if payload.HookEventName != EventSessionStart {
+		return SessionStartInvocation{}, fmt.Errorf("%w: got %q, want %q", ErrEventMismatch, payload.HookEventName, EventSessionStart)
+	}
+	for name, value := range map[string]string{
+		"session_id":      payload.SessionID,
+		"cwd":             payload.CWD,
+		"source":          payload.Source,
+		"model":           payload.Model,
+		"permission_mode": payload.PermissionMode,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return SessionStartInvocation{}, fmt.Errorf("%w: %s is empty", ErrInvalidPayload, name)
+		}
+		if len(value) > maxMetadataBytes {
+			return SessionStartInvocation{}, fmt.Errorf("%w: %s exceeds metadata size limit", ErrInvalidPayload, name)
+		}
+	}
+	if !nullableString(payload.TranscriptPath) {
+		return SessionStartInvocation{}, fmt.Errorf("%w: transcript_path must be a string or null", ErrInvalidPayload)
+	}
+	if !absoluteHostPath(payload.CWD) {
+		return SessionStartInvocation{}, fmt.Errorf("%w: cwd must be an absolute literal path", ErrInvalidPayload)
+	}
+	return SessionStartInvocation{SessionID: payload.SessionID, CWD: payload.CWD, Source: payload.Source}, nil
 }
 
 // Decode validates a Codex hook payload for expectedEvent and normalizes its
@@ -140,6 +216,9 @@ func validateOfficialFields(fields map[string]json.RawMessage, payload Payload, 
 	if !nullableString(payload.TranscriptPath) {
 		return fmt.Errorf("%w: transcript_path must be a string or null", ErrInvalidPayload)
 	}
+	if !absoluteHostPath(payload.CWD) {
+		return fmt.Errorf("%w: cwd must be an absolute literal path", ErrInvalidPayload)
+	}
 	if len(bytes.TrimSpace(payload.ToolInput)) == 0 || bytes.Equal(bytes.TrimSpace(payload.ToolInput), []byte("null")) {
 		return fmt.Errorf("%w: tool_input is required", ErrInvalidPayload)
 	}
@@ -157,6 +236,17 @@ func validateOfficialFields(fields map[string]json.RawMessage, payload Payload, 
 		}
 	}
 	return nil
+}
+
+func absoluteHostPath(value string) bool {
+	value = strings.TrimSpace(strings.ReplaceAll(value, `\`, "/"))
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return false
+	}
+	if strings.HasPrefix(value, "/") {
+		return true
+	}
+	return len(value) >= 3 && value[1] == ':' && value[2] == '/' && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'))
 }
 
 func nullableString(raw json.RawMessage) bool {
@@ -293,6 +383,16 @@ func normalizeInput(toolName string, raw json.RawMessage) (contract.Input, error
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
+	if isRoleAwareDeleteTool(tool) {
+		// Codex may add path-shaped context such as cwd or destination to a
+		// structured payload. Only the reviewed top-level delete target aliases
+		// are deletion operands; ambiguous or conflicting shapes defer.
+		if target := uniqueRolePath(obj, "path", "file_path"); target != "" {
+			ordered = []string{target}
+		} else {
+			ordered = nil
+		}
+	}
 
 	input := contract.Input{Command: command, Paths: ordered}
 	if isRoleAwareMoveTool(tool) {
@@ -304,6 +404,10 @@ func normalizeInput(toolName string, raw json.RawMessage) (contract.Input, error
 
 func isRoleAwareMoveTool(tool string) bool {
 	return tool == "move_file" || tool == "mcp__filesystem__move_file"
+}
+
+func isRoleAwareDeleteTool(tool string) bool {
+	return tool == "delete_file" || tool == "mcp__filesystem__delete_file"
 }
 
 // uniqueRolePath retains a move operand only when all aliases that are present

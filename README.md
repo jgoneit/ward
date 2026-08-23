@@ -1,131 +1,249 @@
 # Ward
 
-Ward is a Codex-first, veto-only security guardrail designed to protect secrets
-and stop a small set of catastrophic actions without adding a new human
-approval bottleneck.
+Ward is an ambient, veto-only Codex safety kernel. It blocks a small set of
+high-confidence destructive actions, installs a bounded native boundary for
+high-confidence workspace secret names, and otherwise leaves the user's Host
+permissions alone.
 
-> Ward installs and verifies a bounded native secret boundary, vetoes a small
-> set of high-confidence catastrophic actions, and otherwise defers to the
-> user's existing Host permissions.
+Ward is under v0.1 development. It is not an unbypassable sandbox and has not
+passed its release burn-in.
 
-Ward is currently under v0.1 development. It is not released and should not be
-treated as an unbypassable sandbox.
+## Product contract
 
-## Decision flow
+Ward has no user-selected runtime modes. One user-global Core installation
+provides three fixed layers:
+
+1. a minimal destructive-action evaluator;
+2. a native permission profile for a reviewed secret-name set;
+3. bounded HMAC audit attempts for `deny` and attributable `error` events only.
 
 ```text
-Tool request
+tool request
     |
     v
   Ward
-    |-- high-confidence risk --> deny
-    `-- everything else ------> defer
-                                  |
-                                  v
-                         current Host permissions
-                         |-- already allowed -> run
-                         |-- approval needed -> Host asks once
-                         `-- not allowed ----> Host rejects
+    |-- high-confidence destruction --> deny + bounded redacted audit attempt
+    |-- evaluator error -------------> no Ward decision; Host decides
+    \`-- everything else ------------> no output, no audit write; Host decides
 ```
 
-`defer` does not mean allow. Ward emits no permission decision for it, so
-Codex retains the user's current permission profile, sandbox, and approval
-policy. Ward never returns `allow`, `ask`, or legacy `approve`.
+`defer` is not an allow. Ward never emits `allow`, `ask`, input replacement, or
+an additional approval step.
 
-## v0.1 scope
+A healthy initialized audit store appends exactly one event for each
+attributable deny/error. Audit unavailability never changes the decision, so a
+failed or timed-out exceptional append may be absent as documented below.
 
-Ward denies only high-confidence cases:
+The ordinary path makes no model call. A matched shell request starts the local
+Go hook process, but a defer produces zero model-visible bytes and performs no
+audit I/O.
 
-- access to protected secret paths, while exact `.env.example`,
-  `.env.sample`, `.env.template`, and `.env.dist` templates remain ordinary;
-- recursive deletion of filesystem, home, workspace, or repository roots;
-- deletion of `.git`, protected secrets, or Ward state/key;
-- `git reset --hard`, destructive `git clean`, and force push;
-- explicit `DROP DATABASE`, `DROP SCHEMA ... CASCADE`, `terraform destroy`,
-  `kubectl delete namespace`, and `docker compose down -v`;
-- a true interactive shell, REPL, or database client started without a command.
+## What v0.1 denies
 
-Ordinary single-file deletion, refactors, builds, package installation, normal
-Git work, migrations, test-data changes, infrastructure planning/apply, unknown
-MCP tools, and ambiguous shell expressions defer to Codex.
+- recursive deletion of `/`, the actual user home, the request CWD, the nearest
+  Git root, or an ancestor containing one of those boundaries;
+- deletion or relocation of `.git` or Ward control, state, and key paths;
+- `git reset --hard`, forced directory clean, force/mirror/forced-refspec push;
+- literal `DROP DATABASE` and `DROP SCHEMA ... CASCADE`;
+- non-dry-run `terraform destroy`, `terraform apply -destroy`,
+  `kubectl delete namespace`, and `docker compose down -v/--volumes`.
 
-## Architecture
+Ordinary file and directory deletion, build/cache cleanup, normal patch
+deletion, `--force-with-lease`, migrations, table or row changes,
+infrastructure planning, interactive shells, secret-reading commands, dynamic
+expressions, and unknown tools defer to the Host.
 
-1. A Codex native permission profile is the filesystem boundary for secret
-   paths that the Host permission language can represent without blocking
-   public templates.
-2. User-global synchronous hooks veto supported high-confidence requests.
-3. The Ward Plugin and Skill expose Doctor, audit inspection, and explanations.
-4. Per-project HMAC-chained JSONL records decisions without raw commands,
-   patches, paths, environment variables, output, transcripts, or secrets.
+Ambiguity is never promoted to a deny.
 
-Hooks are guardrails, not complete security boundaries. Some hosted or
-specialized tool paths can bypass them; see [Codex Hooks](https://learn.chatgpt.com/docs/hooks)
+## Codex integration
+
+Ward installs exactly two user-global command hooks:
+
+| Event | Behavior |
+| --- | --- |
+| `SessionStart` | Run a Host-side health check on startup/resume/clear (never automatic compaction). Healthy is silent; unhealthy emits only bounded check IDs. |
+| `PreToolUse` | Evaluate only reviewed shell, patch, delete, and move tool names before the Host permission flow. |
+
+The Pre matcher is generated from one canonical tool-name list and never uses
+`*`. Its timeout is two seconds. Ward does not install PermissionRequest or
+PostToolUse hooks and does not emit normal-path status or model context.
+SessionStart uses the bounded structural Doctor subset; the Codex version and
+native sandbox probes remain explicit trusted-terminal checks rather than
+per-session work.
+
+Current Codex command hooks cannot start a separate Agent. A Ward denial is
+therefore handled by the current Agent, which should choose a scoped,
+recoverable alternative without asking the user when no new authority is
+needed. The Plugin and Skill provide that recovery and explicit management UX;
+they are not enforcement boundaries.
+
+Hooks remain guardrails. A newly written user Hook is not active until Codex
+trusts that exact definition; Ward cannot read or approve that Host decision.
+Doctor therefore reports Hook trust as unverified, and installation reports
+"configured" rather than claiming activation. Hosted, specialized, disabled,
+untrusted, managed-hooks-only, or timed-out paths may bypass them. See [Codex Hooks](https://learn.chatgpt.com/docs/hooks)
 and [Codex Permissions](https://learn.chatgpt.com/docs/permissions).
 
-The Plugin is management UX, not a privileged process. After `ward-baseline`
-is active, an ordinary project-sandbox command cannot read the Ward control and
-audit paths that the profile deliberately denies. `ward doctor`, `ward audit`,
-active-policy validation, install, and uninstall must therefore run through an
-already-authorized Host-side execution path or a trusted local terminal. When
-that path is unavailable, the Plugin reports those checks as `Not run`; it does
-not weaken the boundary or create a Ward-specific approval prompt. `ward
---version` and static decision explanations remain usable inside the sandbox.
+## Native secret boundary
 
-Codex 0.147 cannot express a broad `.env.*` native deny followed by exact
-`.env.example`-style exceptions: a matching deny glob wins. Ward therefore
-denies `.env`, reviewed common sensitive suffixes, keys, credential stores, and
-other representable paths natively. Arbitrary `.env.<custom>` names are denied
-when a supported request reaches Ward's hooks, but remain an explicit native
-coverage gap reported by `ward doctor`. This tradeoff preserves normal public
-template reads and writes instead of recreating the broad false-deny behavior
-of Harness Legacy.
+The `ward-baseline` profile protects a deliberately small workspace-relative
+set:
 
-Installation also resolves supported credential path overrides into exact
-native denies. It also makes the narrow directories anchoring `config.toml`,
-`hooks.json`, the Ward executable, Ward policy/state, and directory-valued
-credential overrides sandbox read-only. This prevents a writable parent rename
-from relocating a protected file outside its exact rule without denying reads
-of unrelated control metadata. The release installers therefore place the
-binary in the dedicated `${CODEX_HOME:-$HOME/.codex}/ward/bin` directory; a
-custom binary location must remain below that `CODEX_HOME` control root.
-Symlinked or locally writable control paths are an install conflict, not
-something Ward silently repairs. If a credential path override changes later,
-`ward doctor` fails until the integration is reinstalled with the new exact
-path set.
+- `.env` and reviewed local/development/test/production/staging/secret suffixes;
+- `*.key.json` and exact key, credentials, and service-account JSON basenames;
+- exact `secrets` and `credentials` YAML basenames;
+- canonical SSH/private-key basenames and reviewed private-key PEM basenames;
+- `*.p12` and `*.pfx`;
+- Ward control and audit state.
 
-For v0.1, `CODEX_HOME` itself must be a direct child of the user home. Ward
-rejects a control root nested inside a project because protecting only its
-immediate directory would not stop a writable higher ancestor from being
-renamed, while freezing the whole project would violate Ward's autonomy goal.
+Public templates (`.env.example`, `.env.sample`, `.env.template`,
+`.env.dist`), arbitrary custom `.env.*` suffixes, generic PEM/YAML/key names,
+and HOME credential stores for SSH, GitHub, Docker, Kubernetes, clouds, and
+package managers remain usable when the active workspace is a normal project
+subdirectory. Opening HOME itself as the workspace is unsupported in v0.1:
+workspace-relative recursive rules can then overlap those Host stores, so
+Doctor and SessionStart report `permissions.home_workspace_topology`. Ward does
+not claim the excluded paths or this topology are protected without workflow
+impact.
 
-File-valued overrides such as a custom `KUBECONFIG` may point into an arbitrary
-project directory. Ward denies the exact file but does not silently make that
-whole project directory read-only. Doctor reports this as
-`permissions.credential_topology`. The same warning applies to a directory
-override nested below a writable ancestor of the project passed to Doctor (or
-the current project by default). Until the credential is moved to a dedicated,
-stable directory, ancestor relocation is a hook-dependent native coverage gap
-and a release blocker for that project, not a hidden claim of complete
-isolation. Normal user configuration outside the current workspace does not
-produce this warning merely because it is nested below `$HOME`.
+On Linux/WSL/native Windows, Codex pre-expands recursive deny globs. Ward sets
+`glob_scan_max_depth = 16`; reviewed names at greater depth are outside the v0.1
+native claim. The platform E2E corpus exercises a depth-10 secret and a custom
+dotenv counterexample.
 
-The mandated XDG/LocalAppData audit location can likewise have a writable
-higher ancestor inside the active project even though Ward protects its
-immediate `ward` directory. Doctor reports `permissions.state_topology` for
-that project; ancestor relocation can degrade audit continuity and remains a
-release blocker there. Ward does not make all of `~/.local` or a custom state
-tree read-only merely to hide that limitation.
+The installer preserves `approval_policy`. A named existing permission profile
+is inherited only when it directly extends `:workspace` or `:read-only` and
+contains no filesystem authority. Its string `description` metadata and the
+currently documented Codex network subtree are inherited unchanged; unknown
+authority fields stop installation instead of being guessed. With no active
+profile Ward uses `:workspace`. Legacy
+`sandbox_mode` requires explicit `--migrate-permissions`, because it cannot be
+composed with permission profiles. Danger-full migration preserves previously
+available command networking while intentionally narrowing filesystem access.
+Unrepresentable permission or network semantics are a conflict, not a guess.
 
-## Build from source
+Ward protects dedicated control/state anchors and reports a SessionStart health
+warning when the active project topology can relocate them. Opening the user
+home itself as a writable workspace remains an unsupported, explicitly warned
+boundary rather than a reason to freeze the entire home directory.
+
+## Build and install from source
 
 Requirements: Go 1.25 or newer.
 
+The v0.1 installer supports an absolute `CODEX_HOME` that is a direct child of
+the actual user HOME (the default `~/.codex` topology). Other enterprise or
+nested layouts stop as an unsafe/unsupported topology rather than being
+rewritten or silently accepted.
+
+This source flow is fresh-install-only. It stops before creating a directory or
+building when the stable Ward binary already exists, because replacing that
+path would immediately change any trusted Hook that references it. Update an
+existing installation with the tagged transactional installer instead:
+
 ```sh
-go build -o bin/ward ./cmd/ward
+./install.sh --version vX.Y.Z
+```
+
+```powershell
+.\install.ps1 -Version vX.Y.Z
+```
+
+```sh
+set -eu
+
+ward_bin="${CODEX_HOME:-$HOME/.codex}/ward/bin/ward"
+if [ -e "$ward_bin" ] || [ -L "$ward_bin" ]; then
+  printf '%s\n' 'Ward is already installed; use ./install.sh --version vX.Y.Z for a transactional update.' >&2
+  exit 1
+fi
+
 go test ./...
 go vet ./...
+
+ward_dir=$(dirname "$ward_bin")
+mkdir -p "$ward_dir"
+ward_candidate=$(mktemp "$ward_dir/.ward-source-build.XXXXXX")
+cleanup_source_build() {
+  if [ -n "${ward_candidate:-}" ] && { [ -e "$ward_candidate" ] || [ -L "$ward_candidate" ]; }; then
+    unlink "$ward_candidate" 2>/dev/null || :
+  fi
+}
+trap cleanup_source_build 0
+trap 'exit 1' 1 2 15
+
+go build -o "$ward_candidate" ./cmd/ward
+if ! ln "$ward_candidate" "$ward_bin"; then
+  printf '%s\n' 'Ward appeared during the source build; the existing binary was preserved.' >&2
+  exit 1
+fi
+unlink "$ward_candidate"
+ward_candidate=
+
+"$ward_bin" codex install --scope user --dry-run
+"$ward_bin" codex install --scope user
 ```
+
+PowerShell:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$wardBin = Join-Path $codexDir 'ward\bin\ward.exe'
+$existingWard = Get-Item -Force -LiteralPath $wardBin -ErrorAction SilentlyContinue
+if ($null -ne $existingWard) {
+    throw 'Ward is already installed; use .\install.ps1 -Version vX.Y.Z for a transactional update.'
+}
+
+$wardDir = Split-Path $wardBin
+New-Item -ItemType Directory -Force -Path $wardDir | Out-Null
+$wardCandidate = Join-Path $wardDir ('.ward-source-build-' + [guid]::NewGuid().ToString('N') + '.exe')
+try {
+    go build -o $wardCandidate ./cmd/ward
+    if ($LASTEXITCODE -ne 0) { throw 'Ward source build failed.' }
+    try {
+        [System.IO.File]::Move($wardCandidate, $wardBin)
+    }
+    catch {
+        throw 'Ward appeared during the source build; the existing binary was preserved.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $wardCandidate) {
+        Remove-Item -Force -LiteralPath $wardCandidate
+    }
+}
+
+& $wardBin codex install --scope user --dry-run
+if ($LASTEXITCODE -ne 0) { throw 'Ward integration dry run failed.' }
+& $wardBin codex install --scope user
+if ($LASTEXITCODE -ne 0) { throw 'Ward integration install failed.' }
+```
+
+If the dry run reports legacy sandbox settings, repeat it and the installation
+with `--migrate-permissions` only after reviewing the permission change.
+
+Remove the user-global integration and source-installed binary with the
+repository-owned uninstaller. Audit state and its key are preserved.
+
+```sh
+./uninstall.sh
+```
+
+```powershell
+.\uninstall.ps1
+```
+
+Tagged releases use the checksum-verifying `install.sh` or `install.ps1`.
+Those installers activate compatible Core configuration automatically. When
+legacy migration is required they leave the verified binary installed and
+print exact dry-run and activation commands instead of changing permissions.
+
+The first exact Hook definition requires Host trust unless the Host supplies a
+managed trusted definition. Ward cannot verify that trust from `hooks.json`.
+Ward keeps a
+stable binary path and Hook definition so binary updates do not intentionally
+create repeated Ward approval work.
 
 ## CLI
 
@@ -134,88 +252,71 @@ ward --version
 ward evaluate --input - --json
 
 ward hook codex-pre-tool-use
-ward hook codex-permission-request
-ward hook codex-post-tool-use
+ward hook codex-session-start
 
-ward policy validate [--file PATH] [--json]
-ward codex install --scope user --profile baseline [--migrate-permissions] [--dry-run]
+ward codex install --scope user [--migrate-permissions] [--dry-run]
 ward codex uninstall --scope user [--dry-run]
 ward doctor [--project PATH] [--json]
 
 ward audit show [--project PATH] [--since DURATION] [--json]
 ward audit verify [--project PATH] [--json]
 ward audit stats [--project PATH] [--since DURATION] [--json]
-ward audit prune [--before DURATION] [--dry-run]
 ward audit repair [--project PATH] [--dry-run] [--json]
 ```
 
-The machine contracts are `ward-request/v1`, `ward-decision/v1`,
+Legacy hook subcommands and `--profile baseline` are accepted only as hidden
+transition inputs and are never installed or advertised.
+
+Machine contracts remain `ward-request/v1`, `ward-decision/v1`,
 `ward-audit-event/v1`, and `ward-doctor/v1`.
 
-## Codex installation
+| Exit | Meaning |
+| --- | --- |
+| `0` | Command completed; a valid decision may still be deny or defer. |
+| `1` | Runtime or operating-system failure. |
+| `2` | Invalid CLI usage. |
+| `3` | Malformed or unavailable machine input for direct CLI commands such as `ward evaluate`. |
+| `4` | Reserved policy compatibility failure. |
+| `5` | Audit storage, integrity, or repair failure. |
+| `6` | Codex integration or Doctor health failure. |
 
-First inspect the proposed change:
-
-```sh
-ward codex install --scope user --profile baseline --dry-run
-```
-
-If any Codex configuration layer contains the legacy `sandbox_mode`, Ward
-refuses installation without changing files. An explicit migration is required:
-
-```sh
-ward codex install --scope user --profile baseline --migrate-permissions --dry-run
-ward codex install --scope user --profile baseline --migrate-permissions
-```
-
-Migration preserves `approval_policy`; it does not turn approvals on or off.
-Installation and removal modify only Ward-owned hook/profile entries and keep a
-journal for conflict-safe restoration. Audit state is preserved on uninstall.
-The installer rejects unsafe control-file ownership, write permissions, and
-symbolic links before reading or replacing those files.
-
-Command network authority is not inferred from `defer`. A fresh Ward profile
-keeps command networking disabled, matching the least-privilege `:workspace`
-default. When—and only when—the user explicitly migrates legacy
-`sandbox_mode = "danger-full-access"`, Ward writes `network.enabled = true` so
-previously authorized package fetches remain available. Ward refuses the more
-ambiguous legacy `[sandbox_workspace_write]` table for manual migration rather
-than guessing. Consequently, `defer` means the Host decides; it does not
-promise that every safe command has filesystem or network access.
+Malformed event payloads delivered to recognized Hook commands are handled by
+the adapter instead of exit `3`. Malformed `PreToolUse` input is silent, records
+no audit event, returns the request to the Host permission flow, and exits `0`.
+Malformed `SessionStart` input emits one bounded, redacted warning and exits `0`
+unless writing that warning itself fails with runtime exit `1`. The hidden
+legacy PermissionRequest and PostToolUse commands are silent exit-`0` no-ops.
+Hook name or argument errors remain CLI usage exit `2`. These Hook semantics do
+not turn malformed input into a Ward permission decision.
 
 ## Audit semantics
 
-A Pre event is an attempted request and a Ward decision, not proof that a tool
-ran. A matching PermissionRequest is recorded as `approval_requested`; a
-matching Post event is `post_observed`, which still does not prove success.
-When neither arrives, disposition remains `unknown`.
+New runtime records are only attributable Pre `deny` and `error` attempts.
+They are not proof that a tool executed. A defer does not open or mutate the
+audit store.
 
-On macOS/Linux the state root is
-`${XDG_STATE_HOME:-$HOME/.local/state}/ward/v1`. On Windows it is
-`%LOCALAPPDATA%\Ward\state\v1`.
+`ward-audit-event/v1` remains a historical superset so older defer,
+PermissionRequest, and Post records continue to verify and display. Ward never
+rewrites those chains. Stored data excludes raw commands, patches, paths,
+environment, output, transcripts, and secrets.
 
-The development build supports retention previews with
-`ward audit prune --dry-run`, but mutation pruning is intentionally disabled
-and exits with an audit error. Crash-safe cross-platform pruning requires a
-generation-manifest storage contract and remains a release blocker; Ward will
-not revive the earlier non-atomic rewrite path merely to satisfy retention
-limits.
+`ward audit repair` can only advance a stale signed head over an already
+authenticated forward tail. Public pruning is excluded from v0.1; sparse event
+volume and retention status are monitored before a crash-safe generation
+format is justified.
 
-`ward audit repair` is deliberately narrow: after a crash between an
-authenticated append and head update, it can advance only a stale signed head
-to an already verified forward tail. It cannot rewrite events or repair an
-invalid MAC. Doctor remains failed until an operator explicitly requests the
-repair.
+## Rollout
 
-## Rollout gate
+Harness Toolkit may pin a reviewed development commit only as an
+**Experimental** source module at `modules/security/ward`. That pin neither
+installs Ward nor proves any release gate.
 
-Ward will not publish `v0.1.0-rc.1` or enter Harness Toolkit until isolated
-platform E2E passes, Plugin Doctor/audit has a reviewed Host-side management
-path, and twenty real Tasks complete with zero Ward-added prompts, zero secret
-or catastrophic escapes, zero unresolved false deny, and zero need to disable
-Ward. Requiring a human to relay routine diagnostics from a terminal is not
-RC-complete. Toolkit will then pin the reviewed Ward commit by exact SHA at
-`modules/security/ward` using the relative URL `../ward.git`.
+`v0.1.0-rc.1` remains blocked until actual trusted Codex Hook dispatch plus
+macOS, Linux/WSL, and native Windows permission-profile E2E
+pass and twenty real Tasks complete with zero Ward-added prompts, zero
+destructive or protected-secret escapes, zero unresolved normal-workflow false
+deny, zero defer audit mutations, and zero need to disable Ward.
 
-See [CHARTER.md](CHARTER.md), [SECURITY.md](SECURITY.md), and
+See [CHARTER.md](CHARTER.md), [SECURITY.md](SECURITY.md),
+[docs/codex-integration.md](docs/codex-integration.md), and
 [RELEASING.md](RELEASING.md).

@@ -54,6 +54,9 @@ type Store struct {
 	totalMaxBytes   int64
 	lockTimeout     time.Duration
 	mu              sync.Mutex
+	// scanCheckpoint is an internal test seam for a slow segment reader. The
+	// production path leaves it nil and performs only the context check.
+	scanCheckpoint func(context.Context) error
 }
 
 type projectState struct {
@@ -66,17 +69,35 @@ type projectState struct {
 }
 
 func NewStore(options Options) (*Store, error) {
-	return openStore(options, true)
+	return NewStoreContext(context.Background(), options)
+}
+
+// NewStoreContext applies the caller's deadline to audit identity and catalog
+// initialization. Hook callers use this constructor so audit degradation can
+// never consume the Host's entire command-hook timeout.
+func NewStoreContext(ctx context.Context, options Options) (*Store, error) {
+	return openStore(ctx, options, true)
 }
 
 // OpenStore opens an initialized audit store without creating or repairing
 // any path. Read-only commands and Doctor should use this constructor so a
 // missing or insecure store cannot become a false PASS through inspection.
 func OpenStore(options Options) (*Store, error) {
-	return openStore(options, false)
+	return OpenStoreContext(context.Background(), options)
 }
 
-func openStore(options Options, create bool) (*Store, error) {
+// OpenStoreContext is the read-only, deadline-aware form of OpenStore.
+func OpenStoreContext(ctx context.Context, options Options) (*Store, error) {
+	return openStore(ctx, options, false)
+}
+
+func openStore(ctx context.Context, options Options, create bool) (*Store, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -104,18 +125,18 @@ func openStore(options Options, create bool) (*Store, error) {
 		return nil, fmt.Errorf("inspect audit state directory: %w", err)
 	}
 	if create {
-		if err := ensurePrivateDirectory(stateDir); err != nil {
+		if err := ensurePrivateDirectoryContext(ctx, stateDir); err != nil {
 			return nil, fmt.Errorf("prepare audit state directory: %w", err)
 		}
-	} else if err := inspectPrivateDirectory(stateDir); err != nil {
+	} else if err := inspectPrivateDirectoryContext(ctx, stateDir); err != nil {
 		return nil, err
 	}
 	projectsDir := filepath.Join(stateDir, "projects")
 	if create {
-		if err := ensurePrivateDirectory(projectsDir); err != nil {
+		if err := ensurePrivateDirectoryContext(ctx, projectsDir); err != nil {
 			return nil, fmt.Errorf("prepare project state directory: %w", err)
 		}
-	} else if err := inspectPrivateDirectory(projectsDir); err != nil {
+	} else if err := inspectPrivateDirectoryContext(ctx, projectsDir); err != nil {
 		return nil, err
 	}
 
@@ -128,11 +149,11 @@ func openStore(options Options, create bool) (*Store, error) {
 	if create {
 		mode = lockExclusive
 	}
-	identityLock, err := acquireFileLock(context.Background(), catalogLockPath, mode, lockTimeout, create)
+	identityLock, err := acquireFileLock(ctx, catalogLockPath, mode, lockTimeout, create)
 	if err != nil {
 		return nil, err
 	}
-	masterKey, err := openAuditIdentity(stateDir, projectsDir, create, !stateExisted, now, randomSource)
+	masterKey, err := openAuditIdentityContext(ctx, stateDir, projectsDir, create, !stateExisted, now, randomSource)
 	identityLock.release()
 	if err != nil {
 		return nil, err
@@ -230,16 +251,33 @@ func (s *Store) project(cwd string) (projectState, error) {
 	}, nil
 }
 
-// Record persists a metadata-only audit event. Its error is observability for
-// the caller; the method has no evaluator-decision return and cannot modify the
-// supplied Decision.
+// Record persists a metadata-only audit event for Ward's current sparse writer.
+// New records are limited to PreToolUse deny and error decisions. Historical
+// ward-audit-event/v1 records can contain defer, PermissionRequest, and Post
+// events; read-side validation deliberately remains broader so those chains
+// continue to verify without migration or rewriting.
+//
+// Its error is observability for the caller; the method has no
+// evaluator-decision return and cannot modify the supplied Decision.
 func (s *Store) Record(ctx context.Context, input RecordInput) error {
-	event, project, err := s.prepareEvent(input)
+	return s.record(ctx, input, validateRecordInput)
+}
+
+func (s *Store) record(ctx context.Context, input RecordInput, validate func(RecordInput) error) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	event, project, err := s.prepareEvent(input, validate)
 	if err != nil {
 		return err
 	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	if err := s.ensureRegisteredProject(ctx, project); err != nil {
 		return err
@@ -250,24 +288,59 @@ func (s *Store) Record(ctx context.Context, input RecordInput) error {
 	}
 	defer lock.release()
 
-	chain, err := s.readVerifiedLog(project)
+	chain, err := s.readVerifiedLogContext(ctx, project)
 	if err != nil {
 		return err
 	}
 	event.Sequence = chain.nextSequence()
 	event.PreviousMAC = chain.lastMAC()
-	event.RecordMAC, err = signJSON(project.key, "ward-audit-record/v1", eventWithoutMAC(event))
+	event.RecordMAC, err = signJSONContext(ctx, project.key, "ward-audit-record/v1", eventWithoutMAC(event))
 	if err != nil {
 		return fmt.Errorf("sign audit event: %w", err)
 	}
-	if err := appendEvent(project, event, s.segmentMaxBytes); err != nil {
+	head, err := prepareHeadContext(ctx, project, event.Sequence, event.RecordMAC, s.now().UTC())
+	if err != nil {
 		return err
 	}
-	return writeHead(project, event.Sequence, event.RecordMAC, s.now().UTC())
+	if err := appendEventContext(ctx, project, event, s.segmentMaxBytes); err != nil {
+		return err
+	}
+	// Once the event append commits, finish its already-signed head update even
+	// if the caller deadline expires between the two writes. All unbounded
+	// chain scanning and signing happened under ctx before this commit phase.
+	return writePreparedHeadContext(context.WithoutCancel(ctx), project, head)
 }
 
-func (s *Store) prepareEvent(input RecordInput) (Event, projectState, error) {
-	if err := validateRecordInput(input); err != nil {
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("audit context is nil")
+	}
+	return ctx.Err()
+}
+
+func (s *Store) lockContext(ctx context.Context) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if s.mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if s.mu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *Store) prepareEvent(input RecordInput, validate func(RecordInput) error) (Event, projectState, error) {
+	if err := validate(input); err != nil {
 		return Event{}, projectState{}, err
 	}
 	project, err := s.project(input.CWD)
@@ -330,22 +403,35 @@ func (s *Store) prepareEvent(input RecordInput) (Event, projectState, error) {
 }
 
 func validateRecordInput(input RecordInput) error {
-	if strings.TrimSpace(input.CWD) == "" {
-		return fmt.Errorf("%w: cwd is required", ErrInvalidEvent)
+	if err := validateRecordMetadata(input); err != nil {
+		return err
 	}
-	if input.ToolName == "" || len(input.ToolName) > 256 {
-		return fmt.Errorf("%w: invalid tool name", ErrInvalidEvent)
+	if input.Phase != PhasePre {
+		return fmt.Errorf("%w: new audit records require pre phase", ErrInvalidEvent)
 	}
-	if len(input.RuleID) > 256 || len(input.RiskClass) > 256 || len(input.EngineVersion) > 128 {
-		return fmt.Errorf("%w: metadata field too long", ErrInvalidEvent)
+	if input.HostDisposition != HostUnknown {
+		return fmt.Errorf("%w: new audit records require unknown host disposition", ErrInvalidEvent)
+	}
+	if input.CoverageGapCode != "" {
+		return fmt.Errorf("%w: new audit records must not contain a coverage gap", ErrInvalidEvent)
+	}
+	switch input.Decision {
+	case DecisionDeny, DecisionError:
+		return nil
+	default:
+		return fmt.Errorf("%w: new audit records require deny or error decision", ErrInvalidEvent)
+	}
+}
+
+// validateHistoricalRecordInput accepts the complete ward-audit-event/v1
+// vocabulary. It is read-side compatibility logic, not an alternate current
+// writer contract.
+func validateHistoricalRecordInput(input RecordInput) error {
+	if err := validateRecordMetadata(input); err != nil {
+		return err
 	}
 	if input.CoverageGapCode != "" && input.Decision != DecisionDefer {
 		return fmt.Errorf("%w: coverage gap requires defer decision", ErrInvalidEvent)
-	}
-	switch input.ToolKind {
-	case ToolShell, ToolPatch, ToolMCP, ToolLocal, ToolUnknown:
-	default:
-		return fmt.Errorf("%w: unsupported tool kind", ErrInvalidEvent)
 	}
 	switch input.Phase {
 	case PhasePre:
@@ -377,6 +463,24 @@ func validateRecordInput(input RecordInput) error {
 	return nil
 }
 
+func validateRecordMetadata(input RecordInput) error {
+	if strings.TrimSpace(input.CWD) == "" {
+		return fmt.Errorf("%w: cwd is required", ErrInvalidEvent)
+	}
+	if input.ToolName == "" || len(input.ToolName) > 256 {
+		return fmt.Errorf("%w: invalid tool name", ErrInvalidEvent)
+	}
+	if len(input.RuleID) > 256 || len(input.RiskClass) > 256 || len(input.EngineVersion) > 128 {
+		return fmt.Errorf("%w: metadata field too long", ErrInvalidEvent)
+	}
+	switch input.ToolKind {
+	case ToolShell, ToolPatch, ToolMCP, ToolLocal, ToolUnknown:
+	default:
+		return fmt.Errorf("%w: unsupported tool kind", ErrInvalidEvent)
+	}
+	return nil
+}
+
 func validateStoredEvent(event Event) error {
 	if event.Schema != EventSchemaV1 || event.Sequence == 0 || event.Timestamp.IsZero() || event.ProjectID == "" || event.InputFingerprint == "" || event.ToolFingerprint == "" || event.RequestFingerprint == "" || event.RecordMAC == "" {
 		return ErrInvalidEvent
@@ -387,7 +491,7 @@ func validateStoredEvent(event Event) error {
 	if event.CoverageGapCode != "" && !validPersistedCoverageGapCode(event.CoverageGapCode) {
 		return ErrInvalidEvent
 	}
-	return validateRecordInput(RecordInput{
+	return validateHistoricalRecordInput(RecordInput{
 		CWD:             "persisted",
 		Phase:           event.Phase,
 		HostDisposition: event.HostDisposition,
@@ -495,6 +599,20 @@ func signJSON(key []byte, domain string, value any) (string, error) {
 	return keyedHex(key, domain, encoded), nil
 }
 
+func signJSONContext(ctx context.Context, key []byte, domain string, value any) (string, error) {
+	if err := contextError(ctx); err != nil {
+		return "", err
+	}
+	mac, err := signJSON(key, domain, value)
+	if err != nil {
+		return "", err
+	}
+	if err := contextError(ctx); err != nil {
+		return "", err
+	}
+	return mac, nil
+}
+
 func verifyHexMAC(expected, actual string) bool {
 	expectedBytes, expectedErr := hex.DecodeString(expected)
 	actualBytes, actualErr := hex.DecodeString(actual)
@@ -516,6 +634,13 @@ func zeroBytes(value []byte) {
 }
 
 func ensurePrivateDirectory(path string) error {
+	return ensurePrivateDirectoryContext(context.Background(), path)
+}
+
+func ensurePrivateDirectoryContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
@@ -529,10 +654,17 @@ func ensurePrivateDirectory(path string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("state path must be a real directory")
 	}
-	return securePrivateDirectory(path)
+	return securePrivateDirectoryContext(ctx, path)
 }
 
 func inspectPrivateDirectory(path string) error {
+	return inspectPrivateDirectoryContext(context.Background(), path)
+}
+
+func inspectPrivateDirectoryContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %s", ErrNotInitialized, filepath.Base(path))
@@ -543,10 +675,17 @@ func inspectPrivateDirectory(path string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("state path must be a real directory")
 	}
-	return inspectPrivateDirectoryPermissions(path)
+	return inspectPrivateDirectoryPermissionsContext(ctx, path)
 }
 
 func loadExistingMasterKey(path string) ([]byte, error) {
+	return loadExistingMasterKeyContext(context.Background(), path)
+}
+
+func loadExistingMasterKeyContext(ctx context.Context, path string) ([]byte, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotInitialized
@@ -557,7 +696,7 @@ func loadExistingMasterKey(path string) ([]byte, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, errors.New("audit master key must be a regular file")
 	}
-	if err := inspectPrivateFilePermissions(path); err != nil {
+	if err := inspectPrivateFilePermissionsContext(ctx, path); err != nil {
 		return nil, fmt.Errorf("unsafe audit master key permissions: %w", err)
 	}
 	key, err := os.ReadFile(path)
@@ -568,16 +707,27 @@ func loadExistingMasterKey(path string) ([]byte, error) {
 		zeroBytes(key)
 		return nil, errors.New("audit master key has invalid length")
 	}
+	if err := contextError(ctx); err != nil {
+		zeroBytes(key)
+		return nil, err
+	}
 	return key, nil
 }
 
 func loadOrCreateMasterKey(path string, randomSource io.Reader) ([]byte, error) {
+	return loadOrCreateMasterKeyContext(context.Background(), path, randomSource)
+}
+
+func loadOrCreateMasterKeyContext(ctx context.Context, path string, randomSource io.Reader) ([]byte, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return nil, errors.New("audit master key must be a regular file")
 		}
-		if err := securePrivateFile(path); err != nil {
+		if err := securePrivateFileContext(ctx, path); err != nil {
 			return nil, fmt.Errorf("secure audit master key: %w", err)
 		}
 		key, err := os.ReadFile(path)
@@ -588,6 +738,10 @@ func loadOrCreateMasterKey(path string, randomSource io.Reader) ([]byte, error) 
 			zeroBytes(key)
 			return nil, errors.New("audit master key has invalid length")
 		}
+		if err := contextError(ctx); err != nil {
+			zeroBytes(key)
+			return nil, err
+		}
 		return key, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -595,13 +749,16 @@ func loadOrCreateMasterKey(path string, randomSource io.Reader) ([]byte, error) 
 	}
 
 	key := make([]byte, masterKeySize)
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	if _, err := io.ReadFull(randomSource, key); err != nil {
 		return nil, fmt.Errorf("generate audit master key: %w", err)
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		zeroBytes(key)
-		return loadOrCreateMasterKey(path, randomSource)
+		return loadOrCreateMasterKeyContext(ctx, path, randomSource)
 	}
 	if err != nil {
 		zeroBytes(key)
@@ -618,7 +775,7 @@ func loadOrCreateMasterKey(path string, randomSource io.Reader) ([]byte, error) 
 		zeroBytes(key)
 		return nil, fmt.Errorf("close audit master key: %w", closeErr)
 	}
-	if err := securePrivateFile(path); err != nil {
+	if err := securePrivateFileContext(ctx, path); err != nil {
 		zeroBytes(key)
 		return nil, fmt.Errorf("secure audit master key: %w", err)
 	}

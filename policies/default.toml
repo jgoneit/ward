@@ -1,8 +1,5 @@
 schema = "ward.policy.v1"
 
-# Ward's non-removable baseline is embedded in the Go policy package. This file
-# demonstrates the only supported extension shape: additive deny rules. There
-# are intentionally no allow, exception, mode, or replacement fields.
-[deny]
-paths = []
-commands = []
+# The v0.1 ambient kernel is fixed. Runtime command and path deny extensions
+# are intentionally unsupported; evaluator boundaries come from trusted Host
+# context rather than user TOML.

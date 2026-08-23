@@ -3,6 +3,7 @@ package audit
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,6 +107,13 @@ func parseSegmentName(name string) (int, string, bool) {
 }
 
 func listSegments(dir string) ([]segmentInfo, error) {
+	return listSegmentsContext(context.Background(), dir)
+}
+
+func listSegmentsContext(ctx context.Context, dir string) ([]segmentInfo, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -115,6 +123,9 @@ func listSegments(dir string) ([]segmentInfo, error) {
 	}
 	segments := make([]segmentInfo, 0)
 	for _, entry := range entries {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		index, day, ok := parseSegmentName(entry.Name())
 		if !ok {
 			continue
@@ -126,10 +137,13 @@ func listSegments(dir string) ([]segmentInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("inspect audit segment: %w", err)
 		}
-		if err := inspectPrivateFilePermissions(filepath.Join(dir, entry.Name())); err != nil {
+		if err := inspectPrivateFilePermissionsContext(ctx, filepath.Join(dir, entry.Name())); err != nil {
 			return nil, integrity(0, "unsafe_segment_permissions")
 		}
 		segments = append(segments, segmentInfo{index: index, day: day, path: filepath.Join(dir, entry.Name()), size: info.Size()})
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
 	}
 	sort.Slice(segments, func(i, j int) bool { return segments[i].index < segments[j].index })
 	for i := 1; i < len(segments); i++ {
@@ -141,15 +155,23 @@ func listSegments(dir string) ([]segmentInfo, error) {
 }
 
 func (s *Store) readVerifiedLog(project projectState) (chainState, error) {
-	return s.readVerifiedLogMode(project, true)
+	return s.readVerifiedLogContext(context.Background(), project)
 }
 
 func (s *Store) readVerifiedChain(project projectState) (chainState, error) {
-	return s.readVerifiedLogMode(project, false)
+	return s.readVerifiedChainContext(context.Background(), project)
 }
 
-func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool) (chainState, error) {
-	segments, err := listSegments(project.dir)
+func (s *Store) readVerifiedLogContext(ctx context.Context, project projectState) (chainState, error) {
+	return s.readVerifiedLogMode(ctx, project, true)
+}
+
+func (s *Store) readVerifiedChainContext(ctx context.Context, project projectState) (chainState, error) {
+	return s.readVerifiedLogMode(ctx, project, false)
+}
+
+func (s *Store) readVerifiedLogMode(ctx context.Context, project projectState, verifyHeadRecord bool) (chainState, error) {
+	segments, err := listSegmentsContext(ctx, project.dir)
 	if err != nil {
 		return chainState{}, err
 	}
@@ -158,14 +180,30 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 	expectedPreviousMAC := ""
 	globalLine := 0
 	for _, segment := range segments {
-		file, err := openRegularFile(segment.path)
+		if err := contextError(ctx); err != nil {
+			return chainState{}, err
+		}
+		file, err := openRegularFileContext(ctx, segment.path)
 		if err != nil {
 			return chainState{}, fmt.Errorf("open audit segment: %w", err)
 		}
-		scanner := bufio.NewScanner(file)
+		scanner := bufio.NewScanner(&contextReader{ctx: ctx, reader: file})
 		scanner.Buffer(make([]byte, 4096), s.maxRecordBytes)
 		segmentLines := 0
-		for scanner.Scan() {
+		for {
+			if err := contextError(ctx); err != nil {
+				_ = file.Close()
+				return chainState{}, err
+			}
+			if s.scanCheckpoint != nil {
+				if err := s.scanCheckpoint(ctx); err != nil {
+					_ = file.Close()
+					return chainState{}, err
+				}
+			}
+			if !scanner.Scan() {
+				break
+			}
 			segmentLines++
 			globalLine++
 			data := scanner.Bytes()
@@ -194,7 +232,7 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 					_ = file.Close()
 					return chainState{}, integrity(globalLine, "invalid_anchor_fields")
 				}
-				expectedMAC, err := signJSON(project.key, "ward-audit-anchor/v1", anchorWithoutMAC(anchor))
+				expectedMAC, err := signJSONContext(ctx, project.key, "ward-audit-anchor/v1", anchorWithoutMAC(anchor))
 				if err != nil {
 					_ = file.Close()
 					return chainState{}, fmt.Errorf("verify audit anchor: %w", err)
@@ -234,7 +272,7 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 				_ = file.Close()
 				return chainState{}, integrity(globalLine, "chain_mismatch")
 			}
-			expectedMAC, err := signJSON(project.key, "ward-audit-record/v1", eventWithoutMAC(event))
+			expectedMAC, err := signJSONContext(ctx, project.key, "ward-audit-record/v1", eventWithoutMAC(event))
 			if err != nil {
 				_ = file.Close()
 				return chainState{}, fmt.Errorf("verify audit event: %w", err)
@@ -249,6 +287,9 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 		}
 		if err := scanner.Err(); err != nil {
 			_ = file.Close()
+			if contextErr := contextError(ctx); contextErr != nil {
+				return chainState{}, contextErr
+			}
 			return chainState{}, integrity(globalLine+1, "record_read_failure")
 		}
 		if err := file.Close(); err != nil {
@@ -259,7 +300,7 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 		}
 	}
 	if verifyHeadRecord {
-		if err := verifyHead(project, state, len(segments) > 0); err != nil {
+		if err := verifyHeadContext(ctx, project, state, len(segments) > 0); err != nil {
 			return chainState{}, err
 		}
 	}
@@ -267,7 +308,11 @@ func (s *Store) readVerifiedLogMode(project projectState, verifyHeadRecord bool)
 }
 
 func verifyHead(project projectState, state chainState, hasSegments bool) error {
-	head, exists, err := readHead(project)
+	return verifyHeadContext(context.Background(), project, state, hasSegments)
+}
+
+func verifyHeadContext(ctx context.Context, project projectState, state chainState, hasSegments bool) error {
+	head, exists, err := readHeadContext(ctx, project)
 	if err != nil {
 		return err
 	}
@@ -284,19 +329,29 @@ func verifyHead(project projectState, state chainState, hasSegments bool) error 
 }
 
 func readHead(project projectState) (headRecord, bool, error) {
-	data, err := os.ReadFile(project.headPath)
+	return readHeadContext(context.Background(), project)
+}
+
+func readHeadContext(ctx context.Context, project projectState) (headRecord, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return headRecord{}, false, err
+	}
+	info, err := os.Lstat(project.headPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return headRecord{}, false, nil
 	}
-	if err != nil {
-		return headRecord{}, false, fmt.Errorf("read audit head: %w", err)
-	}
-	info, err := os.Lstat(project.headPath)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return headRecord{}, false, integrity(0, "unsafe_head")
 	}
-	if err := inspectPrivateFilePermissions(project.headPath); err != nil {
+	if err := inspectPrivateFilePermissionsContext(ctx, project.headPath); err != nil {
 		return headRecord{}, false, integrity(0, "unsafe_head_permissions")
+	}
+	data, err := os.ReadFile(project.headPath)
+	if err != nil {
+		return headRecord{}, false, fmt.Errorf("read audit head: %w", err)
+	}
+	if err := contextError(ctx); err != nil {
+		return headRecord{}, false, err
 	}
 	var head headRecord
 	if err := decodeStrictJSON(data, &head); err != nil {
@@ -305,7 +360,7 @@ func readHead(project projectState) (headRecord, bool, error) {
 	if head.Schema != "ward-audit-head/v1" || head.ProjectID != project.id || head.LastSequence == 0 || head.LastMAC == "" || head.UpdatedAt.IsZero() || head.RecordMAC == "" {
 		return headRecord{}, false, integrity(0, "invalid_head_fields")
 	}
-	expectedMAC, err := signJSON(project.key, "ward-audit-head/v1", headWithoutMAC(head))
+	expectedMAC, err := signJSONContext(ctx, project.key, "ward-audit-head/v1", headWithoutMAC(head))
 	if err != nil {
 		return headRecord{}, false, fmt.Errorf("verify audit head: %w", err)
 	}
@@ -316,6 +371,21 @@ func readHead(project projectState) (headRecord, bool, error) {
 }
 
 func writeHead(project projectState, sequence uint64, lastMAC string, timestamp time.Time) error {
+	return writeHeadContext(context.Background(), project, sequence, lastMAC, timestamp)
+}
+
+func writeHeadContext(ctx context.Context, project projectState, sequence uint64, lastMAC string, timestamp time.Time) error {
+	encoded, err := prepareHeadContext(ctx, project, sequence, lastMAC, timestamp)
+	if err != nil {
+		return err
+	}
+	return writePreparedHeadContext(ctx, project, encoded)
+}
+
+func prepareHeadContext(ctx context.Context, project projectState, sequence uint64, lastMAC string, timestamp time.Time) ([]byte, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	head := headRecord{
 		Schema:       "ward-audit-head/v1",
 		ProjectID:    project.id,
@@ -324,13 +394,23 @@ func writeHead(project projectState, sequence uint64, lastMAC string, timestamp 
 		UpdatedAt:    timestamp,
 	}
 	var err error
-	head.RecordMAC, err = signJSON(project.key, "ward-audit-head/v1", headWithoutMAC(head))
+	head.RecordMAC, err = signJSONContext(ctx, project.key, "ward-audit-head/v1", headWithoutMAC(head))
 	if err != nil {
-		return fmt.Errorf("sign audit head: %w", err)
+		return nil, fmt.Errorf("sign audit head: %w", err)
 	}
 	encoded, err := json.Marshal(head)
 	if err != nil {
-		return fmt.Errorf("encode audit head: %w", err)
+		return nil, fmt.Errorf("encode audit head: %w", err)
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+func writePreparedHeadContext(ctx context.Context, project projectState, encoded []byte) error {
+	if err := contextError(ctx); err != nil {
+		return err
 	}
 	temporary, err := os.CreateTemp(project.dir, ".head-*.tmp")
 	if err != nil {
@@ -341,11 +421,11 @@ func writeHead(project projectState, sequence uint64, lastMAC string, timestamp 
 		_ = temporary.Close()
 		_ = os.Remove(temporaryPath)
 	}
-	if err := securePrivateFile(temporaryPath); err != nil {
+	if err := securePrivateFileContext(ctx, temporaryPath); err != nil {
 		cleanup()
 		return fmt.Errorf("secure temporary audit head: %w", err)
 	}
-	if err := writeAndSync(temporary, encoded); err != nil {
+	if err := writeAndSyncContext(ctx, temporary, encoded); err != nil {
 		cleanup()
 		return fmt.Errorf("write temporary audit head: %w", err)
 	}
@@ -353,11 +433,33 @@ func writeHead(project projectState, sequence uint64, lastMAC string, timestamp 
 		_ = os.Remove(temporaryPath)
 		return fmt.Errorf("close temporary audit head: %w", err)
 	}
+	if err := contextError(ctx); err != nil {
+		_ = os.Remove(temporaryPath)
+		return err
+	}
 	if err := replaceFile(temporaryPath, project.headPath); err != nil {
 		_ = os.Remove(temporaryPath)
 		return fmt.Errorf("replace audit head: %w", err)
 	}
+	// The replacement is committed; finish durability without converting a
+	// post-commit deadline into a false failure or a stale-head rollback.
 	return syncDirectory(project.dir)
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(buffer []byte) (int, error) {
+	if err := contextError(r.ctx); err != nil {
+		return 0, err
+	}
+	read, err := r.reader.Read(buffer)
+	if contextErr := contextError(r.ctx); contextErr != nil && read == 0 {
+		return 0, contextErr
+	}
+	return read, err
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
@@ -378,6 +480,13 @@ func integrity(line int, code string) error {
 }
 
 func openRegularFile(path string) (*os.File, error) {
+	return openRegularFileContext(context.Background(), path)
+}
+
+func openRegularFileContext(ctx context.Context, path string) (*os.File, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -385,13 +494,20 @@ func openRegularFile(path string) (*os.File, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, errors.New("audit segment must be a regular file")
 	}
-	if err := inspectPrivateFilePermissions(path); err != nil {
+	if err := inspectPrivateFilePermissionsContext(ctx, path); err != nil {
 		return nil, err
 	}
 	return os.Open(path)
 }
 
 func appendEvent(project projectState, event Event, maxSegmentBytes int64) error {
+	return appendEventContext(context.Background(), project, event, maxSegmentBytes)
+}
+
+func appendEventContext(ctx context.Context, project projectState, event Event, maxSegmentBytes int64) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 	encoded, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encode audit event: %w", err)
@@ -401,7 +517,10 @@ func appendEvent(project projectState, event Event, maxSegmentBytes int64) error
 	if int64(len(encoded)) > maxSegmentBytes {
 		return fmt.Errorf("%w: event exceeds segment limit", ErrInvalidEvent)
 	}
-	segments, err := listSegments(project.dir)
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	segments, err := listSegmentsContext(ctx, project.dir)
 	if err != nil {
 		return err
 	}
@@ -420,14 +539,25 @@ func appendEvent(project projectState, event Event, maxSegmentBytes int64) error
 	if path == "" {
 		path = filepath.Join(project.dir, segmentName(index, event.Timestamp))
 	}
-	return appendLine(path, encoded)
+	return appendLineContext(ctx, path, encoded)
 }
 
 func appendLine(path string, encoded []byte) error {
+	return appendLineContext(context.Background(), path, encoded)
+}
+
+func appendLineContext(ctx context.Context, path string, encoded []byte) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	originalSize := int64(0)
+	existed := false
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return errors.New("audit segment must be a regular file")
 		}
+		existed = true
+		originalSize = info.Size()
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect audit segment: %w", err)
 	}
@@ -435,21 +565,72 @@ func appendLine(path string, encoded []byte) error {
 	if err != nil {
 		return fmt.Errorf("open audit segment for append: %w", err)
 	}
-	writeErr := writeAndSync(file, encoded)
+	writeErr := writeAndSyncContext(ctx, file, encoded)
 	closeErr := file.Close()
 	if writeErr != nil {
-		return fmt.Errorf("append audit event: %w", writeErr)
+		return rollbackAppendError(path, existed, originalSize, fmt.Errorf("append audit event: %w", writeErr))
 	}
 	if closeErr != nil {
-		return fmt.Errorf("close audit segment: %w", closeErr)
+		return rollbackAppendError(path, existed, originalSize, fmt.Errorf("close audit segment: %w", closeErr))
 	}
-	if err := securePrivateFile(path); err != nil {
-		return fmt.Errorf("secure audit segment: %w", err)
+	if err := securePrivateFileContext(ctx, path); err != nil {
+		return rollbackAppendError(path, existed, originalSize, fmt.Errorf("secure audit segment: %w", err))
 	}
 	return nil
 }
 
+func rollbackAppendError(path string, existed bool, originalSize int64, primary error) error {
+	var rollbackErr error
+	if existed {
+		if err := os.Truncate(path, originalSize); err != nil {
+			rollbackErr = err
+		} else if file, err := os.OpenFile(path, os.O_WRONLY, 0); err != nil {
+			rollbackErr = err
+		} else {
+			syncErr := file.Sync()
+			closeErr := file.Close()
+			rollbackErr = errors.Join(syncErr, closeErr)
+		}
+	} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		rollbackErr = err
+	}
+	if rollbackErr == nil {
+		rollbackErr = syncDirectory(filepath.Dir(path))
+	}
+	if rollbackErr != nil {
+		return errors.Join(primary, fmt.Errorf("rollback audit append: %w", rollbackErr))
+	}
+	return primary
+}
+
+func writeAndSyncContext(ctx context.Context, file *os.File, value []byte) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	written, err := file.Write(value)
+	if err != nil {
+		return err
+	}
+	if written != len(value) {
+		return io.ErrShortWrite
+	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	return contextError(ctx)
+}
+
 func syncDirectory(path string) error {
+	return syncDirectoryContext(context.Background(), path)
+}
+
+func syncDirectoryContext(ctx context.Context, path string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -465,5 +646,5 @@ func syncDirectory(path string) error {
 	if closeErr != nil {
 		return fmt.Errorf("close audit directory: %w", closeErr)
 	}
-	return nil
+	return contextError(ctx)
 }

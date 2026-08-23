@@ -1,99 +1,110 @@
 package codex
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/jgoneit/ward/internal/contract"
 	"github.com/jgoneit/ward/internal/evaluator"
-	"github.com/jgoneit/ward/internal/policy"
 )
 
-func TestUnknownToolPathShapeDefersButKnownFilesystemReadDenies(t *testing.T) {
-	engine, err := evaluator.New(policy.Default())
-	if err != nil {
-		t.Fatal(err)
+func TestUnknownHostedAndReadOnlyMCPToolsDefer(t *testing.T) {
+	engine := adapterEvaluator(t, "/workspace")
+	for name, tool := range map[string]string{
+		"unknown local":     "custom_status_tool",
+		"hosted MCP":        "mcp__github__delete_file",
+		"filesystem read":   "mcp__filesystem__read_file",
+		"filesystem search": "mcp__filesystem__search_files",
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload := officialFixture(EventPreToolUse)
+			payload["tool_name"] = tool
+			payload["tool_input"] = map[string]any{"path": ".env"}
+			raw, _ := jsonMarshal(payload)
+			invocation, err := Decode(raw, EventPreToolUse)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision := engine.Evaluate(invocation.Request); decision.Outcome != contract.OutcomeDefer {
+				t.Fatalf("decision = %#v, want defer", decision)
+			}
+		})
 	}
+}
 
-	unknownRaw := []byte(`{
-  "session_id":"thr_1","cwd":"/workspace","hook_event_name":"PreToolUse",
-	"transcript_path":null,"model":"gpt-test","permission_mode":"default","turn_id":"turn_1",
-  "tool_name":"custom_status_tool","tool_use_id":"call_1","tool_input":{"path":".env"}
-}`)
-	unknown, err := Decode(unknownRaw, EventPreToolUse)
+func TestOfficialFilesystemDeleteOfGitMetadataDenies(t *testing.T) {
+	engine := adapterEvaluator(t, "/workspace")
+	payload := officialFixture(EventPreToolUse)
+	payload["tool_name"] = "mcp__filesystem__delete_file"
+	payload["tool_input"] = map[string]any{"path": "/workspace/.git/config"}
+	raw, _ := jsonMarshal(payload)
+	invocation, err := Decode(raw, EventPreToolUse)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision := engine.Evaluate(unknown.Request); decision.Outcome != contract.OutcomeDefer {
-		t.Fatalf("unknown tool decision = %#v, want coverage-gap defer", decision)
+	decision := engine.Evaluate(invocation.Request)
+	if decision.Outcome != contract.OutcomeDeny || decision.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
+		t.Fatalf("decision = %#v", decision)
 	}
+}
 
-	knownRaw := []byte(`{
-  "session_id":"thr_1","cwd":"/workspace","hook_event_name":"PreToolUse",
-	"transcript_path":null,"model":"gpt-test","permission_mode":"default","turn_id":"turn_1",
-  "tool_name":"mcp__filesystem__read_file","tool_use_id":"call_2","tool_input":{"path":".env"}
-}`)
-	known, err := Decode(knownRaw, EventPreToolUse)
-	if err != nil {
-		t.Fatal(err)
+func TestStructuredDeleteUsesOnlyReviewedTargetRole(t *testing.T) {
+	engine := adapterEvaluator(t, "/workspace")
+	tests := []struct {
+		name      string
+		toolInput map[string]any
+		wantPaths []string
+		want      contract.Outcome
+	}{
+		{
+			name:      "ordinary target with workspace context",
+			toolInput: map[string]any{"path": "obsolete.txt", "cwd": "/workspace"},
+			wantPaths: []string{"obsolete.txt"},
+			want:      contract.OutcomeDefer,
+		},
+		{
+			name:      "workspace target is nonrecursive",
+			toolInput: map[string]any{"path": "/workspace", "cwd": "/tmp"},
+			wantPaths: []string{"/workspace"},
+			want:      contract.OutcomeDefer,
+		},
+		{
+			name:      "conflicting target aliases",
+			toolInput: map[string]any{"path": "ordinary.txt", "file_path": "/workspace"},
+			wantPaths: nil,
+			want:      contract.OutcomeDefer,
+		},
 	}
-	if decision := engine.Evaluate(known.Request); decision.Outcome != contract.OutcomeDeny {
-		t.Fatalf("known filesystem read decision = %#v, want deny", decision)
-	}
-
-	customSuffixRaw := []byte(`{
-  "session_id":"thr_1","cwd":"/workspace","hook_event_name":"PreToolUse",
-	"transcript_path":null,"model":"gpt-test","permission_mode":"default","turn_id":"turn_1",
-  "tool_name":"mcp__filesystem__read_text_file","tool_use_id":"call_3","tool_input":{"path":"nested/.env.customer"}
-}`)
-	customSuffix, err := Decode(customSuffixRaw, EventPreToolUse)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decision := engine.Evaluate(customSuffix.Request); decision.Outcome != contract.OutcomeDeny {
-		t.Fatalf("supported filesystem custom env decision = %#v, want hook deny", decision)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := officialFixture(EventPreToolUse)
+			payload["tool_name"] = "mcp__filesystem__delete_file"
+			payload["tool_input"] = test.toolInput
+			raw, _ := jsonMarshal(payload)
+			invocation, err := Decode(raw, EventPreToolUse)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(invocation.Request.Input.Paths, test.wantPaths) {
+				t.Fatalf("paths = %#v, want %#v", invocation.Request.Input.Paths, test.wantPaths)
+			}
+			if decision := engine.Evaluate(invocation.Request); decision.Outcome != test.want {
+				t.Fatalf("decision = %#v, want %s", decision, test.want)
+			}
+		})
 	}
 }
 
 func TestStructuredMoveRolesSurviveAdapterRoundTrip(t *testing.T) {
-	activePolicy, err := policy.WithExactProtectedPaths(policy.Default(), []string{
-		"/workspace/z-protected/credential",
-		"/workspace/a-protected/credential",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	engine, err := evaluator.New(activePolicy)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	engine := adapterEvaluator(t, "/workspace")
 	tests := []struct {
-		name        string
-		toolInput   string
-		wantPaths   []string
-		wantSource  string
-		wantDest    string
-		wantOutcome contract.Outcome
-		wantRule    string
+		name, toolInput, wantSource, wantDest string
+		wantPaths                             []string
+		wantOutcome                           contract.Outcome
 	}{
-		{
-			name:        "protected source sorts after ordinary destination",
-			toolInput:   `{"source":"z-protected","destination":"a-backup"}`,
-			wantPaths:   []string{"a-backup", "z-protected"},
-			wantSource:  "z-protected",
-			wantDest:    "a-backup",
-			wantOutcome: contract.OutcomeDeny,
-			wantRule:    "WARD_SECRET_PATH",
-		},
-		{
-			name:        "ordinary source sorts after protected parent destination",
-			toolInput:   `{"source_path":"z-source","destination_path":"a-protected"}`,
-			wantPaths:   []string{"a-protected", "z-source"},
-			wantSource:  "z-source",
-			wantDest:    "a-protected",
-			wantOutcome: contract.OutcomeDefer,
-		},
+		{"workspace boundary source", `{"source":"/workspace","destination":"/backup"}`, "/workspace", "/backup", []string{"/backup", "/workspace"}, contract.OutcomeDefer},
+		{"workspace boundary destination", `{"source":"/ordinary","destination":"/workspace"}`, "/ordinary", "/workspace", []string{"/ordinary", "/workspace"}, contract.OutcomeDefer},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -110,15 +121,14 @@ func TestStructuredMoveRolesSurviveAdapterRoundTrip(t *testing.T) {
 			if !reflect.DeepEqual(input.Paths, tt.wantPaths) || input.SourcePath != tt.wantSource || input.DestinationPath != tt.wantDest {
 				t.Fatalf("adapter lost move roles: %#v", input)
 			}
-			decision := engine.Evaluate(invocation.Request)
-			if decision.Outcome != tt.wantOutcome || decision.RuleID != tt.wantRule {
-				t.Fatalf("round-trip decision = %#v", decision)
+			if decision := engine.Evaluate(invocation.Request); decision.Outcome != tt.wantOutcome {
+				t.Fatalf("decision = %#v, want %s", decision, tt.wantOutcome)
 			}
 		})
 	}
 }
 
-func TestStructuredMoveConflictingAliasesNeverFallBackToSortedPosition(t *testing.T) {
+func TestStructuredMoveConflictingAliasesNeverGuesses(t *testing.T) {
 	raw := []byte(`{
   "session_id":"thr_1","cwd":"/workspace","hook_event_name":"PreToolUse",
 	"transcript_path":null,"model":"gpt-test","permission_mode":"default","turn_id":"turn_1",
@@ -132,12 +142,27 @@ func TestStructuredMoveConflictingAliasesNeverFallBackToSortedPosition(t *testin
 	if invocation.Request.Input.SourcePath != "" || invocation.Request.Input.DestinationPath != "a-destination" {
 		t.Fatalf("conflicting aliases were guessed: %#v", invocation.Request.Input)
 	}
-	engine, err := evaluator.New(policy.Default())
+	decision := adapterEvaluator(t, "/workspace").Evaluate(invocation.Request)
+	if decision.Outcome != contract.OutcomeDefer || decision.CoverageGap == nil || decision.CoverageGap.Code != "missing_structured_move_roles" {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func adapterEvaluator(t *testing.T, cwd string) *evaluator.Evaluator {
+	t.Helper()
+	boundaries, err := evaluator.ResolveBoundarySet(evaluator.BoundaryOptions{CWD: cwd, HomeDir: "/Users/alice", WardControlPaths: []string{"/Users/alice/.codex/ward"}, GOOS: "darwin"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision := engine.Evaluate(invocation.Request)
-	if decision.Outcome != contract.OutcomeDefer || decision.CoverageGap == nil || decision.CoverageGap.Code != "missing_structured_move_roles" {
-		t.Fatalf("conflicting role decision = %#v", decision)
+	active, err := evaluator.New(boundaries)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return active
+}
+
+// jsonMarshal keeps fixture construction readable without importing internal
+// adapter helpers into production code.
+func jsonMarshal(value any) ([]byte, error) {
+	return json.Marshal(value)
 }
