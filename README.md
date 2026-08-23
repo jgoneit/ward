@@ -136,13 +136,50 @@ the actual user HOME (the default `~/.codex` topology). Other enterprise or
 nested layouts stop as an unsafe/unsupported topology rather than being
 rewritten or silently accepted.
 
+This source flow is fresh-install-only. It stops before creating a directory or
+building when the stable Ward binary already exists, because replacing that
+path would immediately change any trusted Hook that references it. Update an
+existing installation with the tagged transactional installer instead:
+
 ```sh
+./install.sh --version vX.Y.Z
+```
+
+```powershell
+.\install.ps1 -Version vX.Y.Z
+```
+
+```sh
+set -eu
+
+ward_bin="${CODEX_HOME:-$HOME/.codex}/ward/bin/ward"
+if [ -e "$ward_bin" ] || [ -L "$ward_bin" ]; then
+  printf '%s\n' 'Ward is already installed; use ./install.sh --version vX.Y.Z for a transactional update.' >&2
+  exit 1
+fi
+
 go test ./...
 go vet ./...
 
-ward_bin="${CODEX_HOME:-$HOME/.codex}/ward/bin/ward"
-mkdir -p "$(dirname "$ward_bin")"
-go build -o "$ward_bin" ./cmd/ward
+ward_dir=$(dirname "$ward_bin")
+mkdir -p "$ward_dir"
+ward_candidate=$(mktemp "$ward_dir/.ward-source-build.XXXXXX")
+cleanup_source_build() {
+  if [ -n "${ward_candidate:-}" ] && { [ -e "$ward_candidate" ] || [ -L "$ward_candidate" ]; }; then
+    unlink "$ward_candidate" 2>/dev/null || :
+  fi
+}
+trap cleanup_source_build 0
+trap 'exit 1' 1 2 15
+
+go build -o "$ward_candidate" ./cmd/ward
+if ! ln "$ward_candidate" "$ward_bin"; then
+  printf '%s\n' 'Ward appeared during the source build; the existing binary was preserved.' >&2
+  exit 1
+fi
+unlink "$ward_candidate"
+ward_candidate=
+
 "$ward_bin" codex install --scope user --dry-run
 "$ward_bin" codex install --scope user
 ```
@@ -150,12 +187,37 @@ go build -o "$ward_bin" ./cmd/ward
 PowerShell:
 
 ```powershell
+$ErrorActionPreference = 'Stop'
 $codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $wardBin = Join-Path $codexDir 'ward\bin\ward.exe'
-New-Item -ItemType Directory -Force -Path (Split-Path $wardBin) | Out-Null
-go build -o $wardBin ./cmd/ward
+$existingWard = Get-Item -Force -LiteralPath $wardBin -ErrorAction SilentlyContinue
+if ($null -ne $existingWard) {
+    throw 'Ward is already installed; use .\install.ps1 -Version vX.Y.Z for a transactional update.'
+}
+
+$wardDir = Split-Path $wardBin
+New-Item -ItemType Directory -Force -Path $wardDir | Out-Null
+$wardCandidate = Join-Path $wardDir ('.ward-source-build-' + [guid]::NewGuid().ToString('N') + '.exe')
+try {
+    go build -o $wardCandidate ./cmd/ward
+    if ($LASTEXITCODE -ne 0) { throw 'Ward source build failed.' }
+    try {
+        [System.IO.File]::Move($wardCandidate, $wardBin)
+    }
+    catch {
+        throw 'Ward appeared during the source build; the existing binary was preserved.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $wardCandidate) {
+        Remove-Item -Force -LiteralPath $wardCandidate
+    }
+}
+
 & $wardBin codex install --scope user --dry-run
+if ($LASTEXITCODE -ne 0) { throw 'Ward integration dry run failed.' }
 & $wardBin codex install --scope user
+if ($LASTEXITCODE -ne 0) { throw 'Ward integration install failed.' }
 ```
 
 If the dry run reports legacy sandbox settings, repeat it and the installation
@@ -213,10 +275,19 @@ Machine contracts remain `ward-request/v1`, `ward-decision/v1`,
 | `0` | Command completed; a valid decision may still be deny or defer. |
 | `1` | Runtime or operating-system failure. |
 | `2` | Invalid CLI usage. |
-| `3` | Malformed or unavailable machine input. |
+| `3` | Malformed or unavailable machine input for direct CLI commands such as `ward evaluate`. |
 | `4` | Reserved policy compatibility failure. |
 | `5` | Audit storage, integrity, or repair failure. |
 | `6` | Codex integration or Doctor health failure. |
+
+Malformed event payloads delivered to recognized Hook commands are handled by
+the adapter instead of exit `3`. Malformed `PreToolUse` input is silent, records
+no audit event, returns the request to the Host permission flow, and exits `0`.
+Malformed `SessionStart` input emits one bounded, redacted warning and exits `0`
+unless writing that warning itself fails with runtime exit `1`. The hidden
+legacy PermissionRequest and PostToolUse commands are silent exit-`0` no-ops.
+Hook name or argument errors remain CLI usage exit `2`. These Hook semantics do
+not turn malformed input into a Ward permission decision.
 
 ## Audit semantics
 

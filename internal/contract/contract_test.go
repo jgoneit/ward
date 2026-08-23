@@ -189,6 +189,93 @@ func TestMachineSchemaDocumentsUseCanonicalNames(t *testing.T) {
 	}
 }
 
+func TestReadmeFreshSourceInstallGuardsStableBinaryBeforeBuild(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+	sectionStart := strings.Index(readme, "## Build and install from source")
+	sectionEnd := strings.Index(readme, "## CLI")
+	if sectionStart < 0 || sectionEnd <= sectionStart {
+		t.Fatal("README source-install section is missing")
+	}
+	section := readme[sectionStart:sectionEnd]
+	normalizedSection := strings.Join(strings.Fields(section), " ")
+	for _, required := range []string{
+		"This source flow is fresh-install-only.",
+		"Update an existing installation with the tagged transactional installer instead:",
+		"./install.sh --version vX.Y.Z",
+		`.\install.ps1 -Version vX.Y.Z`,
+	} {
+		if !strings.Contains(normalizedSection, required) {
+			t.Fatalf("README source-install contract lacks %q", required)
+		}
+	}
+
+	assertOrder := func(name string, markers ...string) {
+		t.Helper()
+		cursor := 0
+		for _, marker := range markers {
+			index := strings.Index(section[cursor:], marker)
+			if index < 0 {
+				t.Fatalf("%s source-install contract lacks %q", name, marker)
+			}
+			cursor += index + len(marker)
+		}
+	}
+	assertOrder("POSIX",
+		`ward_bin="${CODEX_HOME:-$HOME/.codex}/ward/bin/ward"`,
+		`if [ -e "$ward_bin" ] || [ -L "$ward_bin" ]; then`,
+		"exit 1",
+		`ward_dir=$(dirname "$ward_bin")`,
+		`ward_candidate=$(mktemp "$ward_dir/.ward-source-build.XXXXXX")`,
+		`go build -o "$ward_candidate" ./cmd/ward`,
+		`ln "$ward_candidate" "$ward_bin"`,
+	)
+	assertOrder("PowerShell",
+		`$wardBin = Join-Path $codexDir 'ward\bin\ward.exe'`,
+		`Get-Item -Force -LiteralPath $wardBin -ErrorAction SilentlyContinue`,
+		`if ($null -ne $existingWard)`,
+		"throw 'Ward is already installed;",
+		`$wardCandidate = Join-Path $wardDir`,
+		`go build -o $wardCandidate ./cmd/ward`,
+		`[System.IO.File]::Move($wardCandidate, $wardBin)`,
+	)
+	for _, forbidden := range []string{
+		`go build -o "$ward_bin"`,
+		`go build -o $wardBin`,
+	} {
+		if strings.Contains(section, forbidden) {
+			t.Fatalf("README source-install contract writes directly to the stable binary with %q", forbidden)
+		}
+	}
+}
+
+func TestReadmeDistinguishesDirectCLIAndHookMalformedInput(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := strings.Join(strings.Fields(string(raw)), " ")
+	for _, required := range []string{
+		"Malformed or unavailable machine input for direct CLI commands such as `ward evaluate`.",
+		"Malformed event payloads delivered to recognized Hook commands are handled by the adapter instead of exit `3`.",
+		"Malformed `PreToolUse` input is silent, records no audit event, returns the request to the Host permission flow, and exits `0`.",
+		"Malformed `SessionStart` input emits one bounded, redacted warning and exits `0` unless writing that warning itself fails with runtime exit `1`.",
+		"The hidden legacy PermissionRequest and PostToolUse commands are silent exit-`0` no-ops.",
+		"Hook name or argument errors remain CLI usage exit `2`.",
+	} {
+		if !strings.Contains(normalized, required) {
+			t.Fatalf("README malformed-input contract lacks %q", required)
+		}
+	}
+}
+
 func TestDecisionJSONNeverHasAllowOutcome(t *testing.T) {
 	t.Parallel()
 

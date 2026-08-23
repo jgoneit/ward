@@ -81,6 +81,25 @@ func TestMalformedPreHookDefersSilentlyWithoutAuditIdentity(t *testing.T) {
 	}
 }
 
+func TestMalformedSessionStartReturnsOneRedactedWarningWithoutAuditIdentity(t *testing.T) {
+	isolatedUserEnvironment(t)
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"hook", "codex-session-start"}, strings.NewReader(`{"private-canary":"value"}`), &out, &errOut)
+	if code != exitOK || errOut.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if bytes.Count(out.Bytes(), []byte{'\n'}) != 1 || !strings.Contains(out.String(), "session.payload") || strings.Contains(out.String(), "private-canary") {
+		t.Fatalf("malformed SessionStart warning is missing, repeated, or unredacted: %q", out.String())
+	}
+	stateDir, err := audit.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("malformed SessionStart created audit identity: %v", err)
+	}
+}
+
 func TestLegacyPermissionAndPostHooksAreQuietNoOps(t *testing.T) {
 	isolatedUserEnvironment(t)
 	for _, name := range []string{"codex-permission-request", "codex-post-tool-use"} {
