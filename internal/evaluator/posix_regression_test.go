@@ -180,6 +180,63 @@ func TestFindMindepthZeroAndOneDoNotNarrowWholeTreeDelete(t *testing.T) {
 	}
 }
 
+func TestFindMindepthSignedValuesFollowHostSemantics(t *testing.T) {
+	tests := []struct {
+		name        string
+		value       string
+		goos        string
+		wantNarrows bool
+		wantValid   bool
+	}{
+		{"Darwin plus zero", "+0", "darwin", false, true},
+		{"Darwin plus one", "+1", "darwin", false, true},
+		{"Darwin plus two", "+2", "darwin", true, true},
+		{"Linux plus one", "+1", "linux", false, false},
+		{"Linux plus two", "+2", "linux", false, false},
+		{"Windows plus one", "+1", "windows", false, false},
+		{"Windows plus two", "+2", "windows", false, false},
+		{"Linux unsigned zero", "0", "linux", false, true},
+		{"Linux unsigned one", "1", "linux", false, true},
+		{"Linux unsigned two", "2", "linux", true, true},
+		{"Darwin overflow", "18446744073709551616", "darwin", false, true},
+		{"Linux overflow", "18446744073709551616", "linux", true, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotNarrows, gotValid := findMindepthNarrows(test.value, test.goos)
+			if gotNarrows != test.wantNarrows || gotValid != test.wantValid {
+				t.Fatalf("findMindepthNarrows(%q, %q) = (%t, %t), want (%t, %t)", test.value, test.goos, gotNarrows, gotValid, test.wantNarrows, test.wantValid)
+			}
+		})
+	}
+}
+
+func TestLinuxFindSignedMindepthDefersUnsupportedValue(t *testing.T) {
+	boundaries, err := ResolveBoundarySet(BoundaryOptions{
+		CWD:              "/workspace",
+		HomeDir:          "/home/alice",
+		WardControlPaths: []string{"/home/alice/.local/state/ward/v1"},
+		GOOS:             "linux",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := New(boundaries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unsigned := request("bash", "find . -mindepth 1 -delete")
+	if got := active.Evaluate(unsigned); got.Outcome != contract.OutcomeDeny || got.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
+		t.Fatalf("unsigned mindepth decision = %#v", got)
+	}
+
+	signed := request("bash", "find . -mindepth +1 -delete")
+	if got := active.Evaluate(signed); got.Outcome != contract.OutcomeDefer || got.RuleID != "" || got.CoverageGap == nil || got.CoverageGap.Code != "find_command_action" {
+		t.Fatalf("signed mindepth decision = %#v", got)
+	}
+}
+
 func TestLinuxGNUmoveOptionsPreserveCriticalSourceClassification(t *testing.T) {
 	boundaries, err := ResolveBoundarySet(BoundaryOptions{
 		CWD:              "/workspace",

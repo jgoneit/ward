@@ -1400,6 +1400,9 @@ func findHasNarrowingExpression(args []literalArg, goos string) bool {
 
 func findMindepthNarrows(value, goos string) (bool, bool) {
 	if strings.HasPrefix(value, "+") {
+		if goos != "darwin" {
+			return false, false
+		}
 		value = strings.TrimPrefix(value, "+")
 	}
 	if value == "" {
