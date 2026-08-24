@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -49,6 +50,71 @@ func TestWindowsAtomicIntegrationPreservesProtectedMetadata(t *testing.T) {
 		}
 		assertWindowsSecurityFingerprint(t, options.Paths.ConfigFile, beforeConfig)
 		assertWindowsSecurityFingerprint(t, options.Paths.HooksFile, beforeHooks)
+	})
+
+	t.Run("v1 migration and uninstall", func(t *testing.T) {
+		options := fixtureOptions(t)
+		originalConfig := []byte("approval_policy = \"never\"\r\nsandbox_mode = \"workspace-write\"\r\n")
+		originalHooks := []byte("{\r\n  \"description\": \"native Windows v1\"\r\n}\r\n")
+		writeV1Installation(t, options, originalConfig, originalHooks)
+		setDistinctiveProtectedWindowsDACL(t, options.Paths.ConfigFile)
+		setDistinctiveProtectedWindowsDACL(t, options.Paths.HooksFile)
+		beforeConfig := windowsSecurityFingerprint(t, options.Paths.ConfigFile)
+		beforeHooks := windowsSecurityFingerprint(t, options.Paths.HooksFile)
+
+		if _, err := Install(options); err != nil {
+			t.Fatal(err)
+		}
+		assertWindowsSecurityFingerprint(t, options.Paths.ConfigFile, beforeConfig)
+		assertWindowsSecurityFingerprint(t, options.Paths.HooksFile, beforeHooks)
+		if _, err := Uninstall(options); err != nil {
+			t.Fatal(err)
+		}
+		assertWindowsSecurityFingerprint(t, options.Paths.ConfigFile, beforeConfig)
+		assertWindowsSecurityFingerprint(t, options.Paths.HooksFile, beforeHooks)
+	})
+
+	t.Run("v1 migration injected rollback", func(t *testing.T) {
+		options := fixtureOptions(t)
+		writeV1Installation(t, options, []byte("approval_policy = \"never\"\n"), []byte(`{"description":"native Windows v1 rollback"}`))
+		setDistinctiveProtectedWindowsDACL(t, options.Paths.ConfigFile)
+		setDistinctiveProtectedWindowsDACL(t, options.Paths.HooksFile)
+		beforeConfig := windowsSecurityFingerprint(t, options.Paths.ConfigFile)
+		beforeHooks := windowsSecurityFingerprint(t, options.Paths.HooksFile)
+		beforeConfigBytes, err := os.ReadFile(options.Paths.ConfigFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeHooksBytes, err := os.ReadFile(options.Paths.HooksFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		injected := errors.New("injected v1 hooks write failure")
+		production := writeAtomically
+		writeAtomically = func(path string, data []byte, mode os.FileMode, metadata platformFileMetadata) error {
+			if path == options.Paths.HooksFile {
+				return injected
+			}
+			return production(path, data, mode, metadata)
+		}
+		t.Cleanup(func() { writeAtomically = production })
+
+		if _, err := Install(options); !errors.Is(err, injected) {
+			t.Fatalf("Install(v1) error=%v", err)
+		}
+		assertWindowsSecurityFingerprint(t, options.Paths.ConfigFile, beforeConfig)
+		assertWindowsSecurityFingerprint(t, options.Paths.HooksFile, beforeHooks)
+		afterConfigBytes, err := os.ReadFile(options.Paths.ConfigFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterHooksBytes, err := os.ReadFile(options.Paths.HooksFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(afterConfigBytes, beforeConfigBytes) || !bytes.Equal(afterHooksBytes, beforeHooksBytes) {
+			t.Fatal("v1 rollback changed integration bytes")
+		}
 	})
 }
 

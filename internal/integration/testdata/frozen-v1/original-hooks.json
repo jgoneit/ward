@@ -1,0 +1,17 @@
+{
+  "description": "frozen pre-v2 host hooks",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/bin/true",
+            "timeout": 1,
+            "type": "command"
+          }
+        ],
+        "matcher": "^Read$"
+      }
+    ]
+  }
+}

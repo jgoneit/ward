@@ -1,7 +1,9 @@
 package integration
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -125,18 +127,8 @@ func migrateV1(options Options, journal integrationJournal) (Result, error) {
 	if !hooksExists || !configExists {
 		return result, fmt.Errorf("%w: v1 integration file is missing", ErrConflict)
 	}
-	baseHooks, removedHooks, err := unmergeHooks(hooksBefore, journal.BinaryPath)
-	if err != nil || !removedHooks {
-		if err == nil {
-			err = fmt.Errorf("%w: v1 Ward hooks are missing", ErrConflict)
-		}
-		return result, err
-	}
-	baseConfig, removedConfig, err := uninstallConfig(configBefore, journal.ConfigEdits)
-	if err != nil || !removedConfig {
-		if err == nil {
-			err = fmt.Errorf("%w: v1 Ward config is missing", ErrConflict)
-		}
+	baseHooks, baseConfig, err := validateAndRemoveV1Integration(options.Paths, journal, hooksBefore, configBefore)
+	if err != nil {
 		return result, err
 	}
 	migrationOptions := options
@@ -150,7 +142,7 @@ func migrateV1(options Options, journal integrationJournal) (Result, error) {
 		}
 		return result, err
 	}
-	configAfter, edits, configChanged, err := installConfig(baseConfig, migrationOptions)
+	configAfter, edits, configChanged, err := installConfigForV1Migration(baseConfig, migrationOptions, journal.ConfigEdits)
 	if err != nil || !configChanged {
 		if err == nil {
 			err = fmt.Errorf("%w: v2 config was not produced", ErrConflict)
@@ -175,6 +167,47 @@ func migrateV1(options Options, journal integrationJournal) (Result, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+// validateAndRemoveV1Integration is the common, mutation-free ownership gate
+// for both migration and direct uninstall. A v1 journal bound the complete
+// hooks/config files, so no semantic fallback is safe after either file or the
+// journal has changed.
+func validateAndRemoveV1Integration(paths Paths, journal integrationJournal, hooksBefore, configBefore []byte) ([]byte, []byte, error) {
+	if digest(hooksBefore) != journal.HooksDigest || digest(configBefore) != journal.ConfigDigest {
+		return nil, nil, fmt.Errorf("%w: v1 integration bytes do not match the journal", ErrConflict)
+	}
+	baseHooks, removedHooks, err := unmergeLegacyHooksExact(hooksBefore, journal.BinaryPath)
+	if err != nil || !removedHooks {
+		if err == nil {
+			err = fmt.Errorf("%w: v1 Ward hooks are missing", ErrConflict)
+		}
+		return nil, nil, err
+	}
+	if journal.HooksOriginallyAbsent && !journal.HooksObjectOriginallyAbsent {
+		return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
+	}
+	if journal.HooksObjectOriginallyAbsent {
+		_, baseHookMap, err := decodeHookRoot(baseHooks)
+		if err != nil || len(baseHookMap) != 0 {
+			return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
+		}
+	}
+	if journal.HooksOriginallyAbsent && !hooksJSONIsEmpty(baseHooks) {
+		return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
+	}
+
+	baseConfig, removedConfig, err := uninstallV1ConfigExact(configBefore, journal.ConfigEdits, journal.ProfileName, paths)
+	if err != nil || !removedConfig {
+		if err == nil {
+			err = fmt.Errorf("%w: v1 Ward config is missing", ErrConflict)
+		}
+		return nil, nil, err
+	}
+	if journal.ConfigOriginallyAbsent && len(baseConfig) != 0 {
+		return nil, nil, fmt.Errorf("%w: v1 config history is inconsistent", ErrConflict)
+	}
+	return baseHooks, baseConfig, nil
 }
 
 // Uninstall removes only exact Ward-owned v1 or v2 bytes and restores the
@@ -240,11 +273,17 @@ func Uninstall(options Options) (Result, error) {
 	if !hooksExists || !configExists {
 		return result, fmt.Errorf("%w: installed Codex integration file is missing", ErrConflict)
 	}
-	hooksAfter, hooksChanged, err := unmergeHooks(hooksBefore, journal.BinaryPath)
-	if err != nil {
-		return result, err
+	var hooksAfter, configAfter []byte
+	var hooksChanged, configChanged bool
+	if journal.Schema == journalSchemaV1 {
+		hooksAfter, configAfter, err = validateAndRemoveV1Integration(options.Paths, journal, hooksBefore, configBefore)
+		hooksChanged, configChanged = err == nil, err == nil
+	} else {
+		hooksAfter, hooksChanged, err = unmergeHooks(hooksBefore, journal.BinaryPath)
+		if err == nil {
+			configAfter, configChanged, err = uninstallConfig(configBefore, journal.ConfigEdits)
+		}
 	}
-	configAfter, configChanged, err := uninstallConfig(configBefore, journal.ConfigEdits)
 	if err != nil {
 		return result, err
 	}
@@ -480,6 +519,11 @@ func decodeJournal(raw []byte) (integrationJournal, error) {
 	if err := json.Unmarshal(raw, &journal); err != nil {
 		return journal, fmt.Errorf("%w: invalid integration journal: %v", ErrConflict, err)
 	}
+	if journal.Schema == journalSchemaV1 {
+		if err := validateV1JournalShape(raw); err != nil {
+			return journal, err
+		}
+	}
 	if (journal.Schema != journalSchemaV1 && journal.Schema != journalSchemaV2) || journal.BinaryPath == "" || journal.ProfileName == "" || !validDigest(journal.HooksDigest) || !validDigest(journal.ConfigDigest) {
 		return journal, fmt.Errorf("%w: unsupported integration journal", ErrConflict)
 	}
@@ -487,6 +531,91 @@ func decodeJournal(raw []byte) (integrationJournal, error) {
 		return journal, fmt.Errorf("%w: unsupported integration journal", ErrConflict)
 	}
 	return journal, nil
+}
+
+func validateV1JournalShape(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+	}
+	required := []string{
+		"schema", "binary_path", "profile_name",
+		"hooks_originally_absent", "hooks_object_originally_absent", "config_originally_absent",
+		"config_edits", "hooks_digest", "config_digest", "credential_paths_digest",
+	}
+	if !hasExactJSONFields(fields, required, nil) {
+		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+	}
+	for _, name := range []string{"schema", "binary_path", "profile_name", "hooks_digest", "config_digest", "credential_paths_digest"} {
+		if _, ok := decodeJSONString(fields[name]); !ok {
+			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+		}
+	}
+	for _, name := range []string{"hooks_originally_absent", "hooks_object_originally_absent", "config_originally_absent"} {
+		value := string(bytes.TrimSpace(fields[name]))
+		if value != "true" && value != "false" {
+			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+		}
+	}
+	var edits map[string]json.RawMessage
+	if err := json.Unmarshal(fields["config_edits"], &edits); err != nil || edits == nil {
+		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+	}
+	if !hasExactJSONFields(edits, []string{"profile_append"}, []string{"sandbox_original", "sandbox_replacement", "selector_block"}) {
+		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+	}
+	if !nonemptyBase64JSONString(edits["profile_append"]) {
+		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+	}
+	for _, name := range []string{"sandbox_original", "sandbox_replacement", "selector_block"} {
+		if value, exists := edits[name]; exists && !nonemptyBase64JSONString(value) {
+			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
+		}
+	}
+	return nil
+}
+
+func decodeJSONString(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func nonemptyBase64JSONString(raw json.RawMessage) bool {
+	value, ok := decodeJSONString(raw)
+	if !ok || value == "" {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	return err == nil && len(decoded) > 0 && base64.StdEncoding.EncodeToString(decoded) == value
+}
+
+func hasExactJSONFields(fields map[string]json.RawMessage, required, optional []string) bool {
+	allowed := make(map[string]struct{}, len(required)+len(optional))
+	for _, name := range required {
+		allowed[name] = struct{}{}
+		if _, exists := fields[name]; !exists {
+			return false
+		}
+	}
+	for _, name := range optional {
+		allowed[name] = struct{}{}
+	}
+	if len(fields) > len(allowed) {
+		return false
+	}
+	for name := range fields {
+		if _, exists := allowed[name]; !exists {
+			return false
+		}
+	}
+	return true
 }
 
 func validDigest(value string) bool {
