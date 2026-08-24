@@ -734,6 +734,12 @@ func TestV1MigrationAcceptsHistoricalPOSIXPathsWithHashAndLiteralBackslash(t *te
 	}
 }
 
+func TestLegacyV1AbsolutePathAcceptsWindowsShortName(t *testing.T) {
+	if !validLegacyV1AbsolutePath(`C:\Users\RUNNER~1\AppData\Local\Temp\ward`) {
+		t.Fatal("historical Windows 8.3 absolute path was rejected")
+	}
+}
+
 func TestV1MigrationPreservesHistoricalPreselectedWardProfile(t *testing.T) {
 	for _, test := range []struct {
 		name            string

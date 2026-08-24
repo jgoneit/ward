@@ -770,7 +770,10 @@ func parseLegacyV1PathRule(line string) (legacyV1PathRule, bool) {
 }
 
 func validLegacyV1AbsolutePath(value string) bool {
-	if value == "" || strings.ContainsAny(value, "~*?[]") {
+	// A tilde after an absolute root is a literal path character, including in
+	// Windows 8.3 names such as RUNNER~1. The historical generator quoted these
+	// paths and did not perform shell home expansion.
+	if value == "" || strings.ContainsAny(value, "*?[]") {
 		return false
 	}
 	for _, character := range value {
