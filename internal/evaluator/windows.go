@@ -724,12 +724,13 @@ func splitLiteralWindowsStatements(command string, powershell bool) ([]string, b
 	if strings.TrimSpace(command) == "" || strings.ContainsRune(command, '\x00') {
 		return nil, false
 	}
-	if powershell && strings.ContainsRune(command, '`') {
-		return nil, false
-	}
 	var statements []string
 	var current strings.Builder
 	var quote rune
+	commentBoundary := true
+	inLineComment := false
+	skipLineFeed := false
+	trailingLineComment := false
 	flush := func() bool {
 		value := strings.TrimSpace(current.String())
 		current.Reset()
@@ -740,22 +741,49 @@ func splitLiteralWindowsStatements(command string, powershell bool) ([]string, b
 		return true
 	}
 	for index, char := range command {
+		if skipLineFeed {
+			skipLineFeed = false
+			if char == '\n' {
+				continue
+			}
+		}
+		if inLineComment {
+			if char == '\r' || char == '\n' {
+				inLineComment = false
+				commentBoundary = true
+				if char == '\r' {
+					skipLineFeed = true
+				}
+			}
+			continue
+		}
+		if powershell && char == '`' {
+			return nil, false
+		}
 		if quote != 0 {
 			current.WriteRune(char)
 			if char == quote {
 				quote = 0
+				commentBoundary = true
 			}
 			continue
 		}
 		if char == '"' || powershell && char == '\'' {
 			quote = char
 			current.WriteRune(char)
+			commentBoundary = false
 			continue
 		}
-		if powershell && char == '#' {
-			return nil, false
+		if powershell && char == '#' && commentBoundary {
+			flush()
+			inLineComment = true
+			trailingLineComment = true
+			continue
 		}
 		if char == '\r' || char == '\n' || powershell && char == ';' || !powershell && char == '&' {
+			if powershell && (char == '\r' || char == '\n') && trailingLineComment && strings.TrimSpace(current.String()) == "" {
+				continue
+			}
 			if !powershell && char == '&' {
 				previousAmpersand := index > 0 && command[index-1] == '&'
 				nextAmpersand := index+1 < len(command) && command[index+1] == '&'
@@ -766,11 +794,15 @@ func splitLiteralWindowsStatements(command string, powershell bool) ([]string, b
 			if !flush() {
 				return nil, false
 			}
+			commentBoundary = true
+			trailingLineComment = false
 			continue
 		}
 		if powershell && char == '&' {
 			if strings.TrimSpace(current.String()) == "" {
 				current.WriteRune(char)
+				commentBoundary = false
+				trailingLineComment = false
 				continue
 			}
 			return nil, false
@@ -779,8 +811,22 @@ func splitLiteralWindowsStatements(command string, powershell bool) ([]string, b
 			return nil, false
 		}
 		current.WriteRune(char)
+		if unicode.IsSpace(char) {
+			commentBoundary = true
+			continue
+		}
+		commentBoundary = powershell && strings.ContainsRune(")}]", char)
+		trailingLineComment = false
 	}
-	if quote != 0 || !flush() {
+	if quote != 0 {
+		return nil, false
+	}
+	if strings.TrimSpace(current.String()) != "" {
+		flush()
+	} else if !trailingLineComment {
+		return nil, false
+	}
+	if len(statements) == 0 {
 		return nil, false
 	}
 	return statements, true

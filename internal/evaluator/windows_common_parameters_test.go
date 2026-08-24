@@ -246,13 +246,79 @@ func TestPowerShellAdjacentQuotedTokensDefer(t *testing.T) {
 	}
 }
 
-func TestPowerShellBackticksAndCommentsDefer(t *testing.T) {
+func TestPowerShellActiveBackticksAndBlockCommentsDefer(t *testing.T) {
 	for _, command := range []string{
 		"Remove-Item -ErrorVariable \"safe`\" C:/workspace/.git/config",
-		"Write-Output safe # ignored; Remove-Item C:/workspace/.git/config",
+		"Remove-Item -Recurse C:/workspace <# reviewed #>",
 	} {
 		t.Run(command, func(t *testing.T) {
 			assertPowerShellDecision(t, command, contract.OutcomeDefer, "", "ambiguous_powershell")
+		})
+	}
+}
+
+func TestPowerShellLineCommentsPreserveLiteralStatements(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		outcome contract.Outcome
+		ruleID  string
+		gapCode string
+	}{
+		{
+			name:    "destructive prefix",
+			command: `Remove-Item -Recurse C:\workspace # cleanup`,
+			outcome: contract.OutcomeDeny,
+			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
+		},
+		{
+			name:    "destructive prefix before CRLF",
+			command: "Remove-Item -Recurse C:\\workspace # cleanup\r\nWrite-Output safe",
+			outcome: contract.OutcomeDeny,
+			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
+		},
+		{
+			name:    "comment before destructive statement",
+			command: "# reviewed\r\nRemove-Item -Recurse C:\\workspace",
+			outcome: contract.OutcomeDeny,
+			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
+		},
+		{
+			name:    "quoted target before comment",
+			command: `Remove-Item -Recurse 'C:\workspace'# cleanup`,
+			outcome: contract.OutcomeDeny,
+			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
+		},
+		{
+			name:    "comment contents are ignored",
+			command: "Write-Output safe # ignored; Remove-Item C:/workspace/.git/config ` $env:WARD_PATH",
+			outcome: contract.OutcomeDefer,
+		},
+		{
+			name:    "quoted hash stays literal",
+			command: `Write-Output 'safe # literal'`,
+			outcome: contract.OutcomeDefer,
+		},
+		{
+			name:    "token hash stays literal",
+			command: `Write-Output safe#literal`,
+			outcome: contract.OutcomeDefer,
+		},
+		{
+			name:    "target hash stays literal",
+			command: `Remove-Item -Recurse C:\workspace#cleanup`,
+			outcome: contract.OutcomeDefer,
+		},
+		{
+			name:    "all comment remains ambiguous",
+			command: `# cleanup only`,
+			outcome: contract.OutcomeDefer,
+			gapCode: "ambiguous_powershell",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertPowerShellDecision(t, test.command, test.outcome, test.ruleID, test.gapCode)
 		})
 	}
 }
@@ -359,6 +425,21 @@ if ($accepted) { throw "noninteractive binder accepted literal Credential" }`
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("PowerShell comment remainder mutated source: %v", err)
+	}
+
+	commentDeleteSource := filepath.Join(testDir, "comment-delete-source.txt")
+	if err := os.WriteFile(commentDeleteSource, []byte("ward comment fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commentDeleteEnvironment := append(environment, "WARD_COMMENT_DELETE_SOURCE="+commentDeleteSource)
+	commentDeleteScript := `Remove-Item -LiteralPath $env:WARD_COMMENT_DELETE_SOURCE # reviewed trailing comment`
+	command = exec.Command(pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", commentDeleteScript)
+	command.Env = commentDeleteEnvironment
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("PowerShell destructive-prefix comment probe failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(commentDeleteSource); !os.IsNotExist(err) {
+		t.Fatalf("PowerShell did not execute the command before the comment: %v", err)
 	}
 }
 
