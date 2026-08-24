@@ -81,6 +81,14 @@ func TestInstallConfigRejectsUndefinedNamedParent(t *testing.T) {
 	}
 }
 
+func TestFreshInstallConfigStillRejectsPreselectedWardProfile(t *testing.T) {
+	options := fixtureOptions(t)
+	original := []byte(`default_permissions = "ward-baseline"` + "\n")
+	if _, _, _, err := installConfig(original, options); !errors.Is(err, ErrConflict) {
+		t.Fatalf("installConfig() error=%v, want self-parent conflict", err)
+	}
+}
+
 func TestInstallConfigRejectsNamedParentFilesystemAuthority(t *testing.T) {
 	options := fixtureOptions(t)
 	for name, original := range map[string]string{

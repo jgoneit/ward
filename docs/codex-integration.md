@@ -38,7 +38,9 @@ Journal v2 records the pre-Ward bytes and Ward-owned digests. An existing
 three-Hook installation is upgraded atomically: the wildcard Pre entry is
 replaced, Ward PermissionRequest/Post entries are removed, SessionStart is
 added, and unrelated configuration is preserved. Rerun and uninstall are
-idempotent. Modified owned bytes or an additive user policy are conflicts.
+idempotent. Because the v1 journal bound each complete file, any hooks/config
+change after v1 installation makes automatic migration a conflict. Modified
+owned bytes or an additive user policy are conflicts.
 
 `approval_policy` is never edited. A named active permission profile is a safe
 parent only when it directly extends `:workspace` or `:read-only`, has no

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +19,12 @@ const maxNestedShellDepth = 3
 var (
 	dropDatabaseSQL      = regexp.MustCompile(`(?i)^drop[[:space:]]+database[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:"[^"]+"|[a-z0-9_.-]+)(?:[[:space:]]+(?:with[[:space:]]*)?\([^;]*\))?[[:space:]]*;?$`)
 	dropDatabaseMySQLSQL = regexp.MustCompile(`(?i)^drop[[:space:]]+database[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:` + "`[^`]+`" + `|[a-z0-9_.-]+)[[:space:]]*;?$`)
-	dropSchemaCascadeSQL = regexp.MustCompile(`(?i)^drop[[:space:]]+schema[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?(?:"[^"]+"|[a-z0-9_.-]+)[[:space:]]+cascade[[:space:]]*;?$`)
+	dropSchemaCascadeSQL = regexp.MustCompile(
+		`(?i)^drop[[:space:]]+schema[[:space:]]+(?:if[[:space:]]+exists[[:space:]]+)?` +
+			`(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)` +
+			`(?:[[:space:]]*,[[:space:]]*(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*))*` +
+			`[[:space:]]+cascade[[:space:]]*;?$`,
+	)
 )
 
 type literalArg struct {
@@ -473,7 +479,7 @@ func (e *Evaluator) posixCallSuccessState(call *syntax.CallExpr, current posixCW
 			removed = operands[:len(operands)-1]
 		}
 	case "find":
-		if hasLiteral(args, "-delete") && !findHasNarrowingExpression(args) {
+		if hasLiteral(args, "-delete") && !findHasNarrowingExpression(args, e.boundaries.goos) {
 			paths, _ := reviewedFindSearchPaths(args)
 			removed = e.posixResolvedOperands(paths, current)
 		}
@@ -857,7 +863,7 @@ func (e *Evaluator) evaluatePOSIXCall(call *syntax.CallExpr, cwd string, depth i
 	result.addGap(operationGap)
 
 	if base == "mv" {
-		result.merge(e.evaluateMoveAncestors(unwrapped[1:], cwd, cwdUncertain))
+		result.merge(e.evaluatePOSIXMoveAncestors(unwrapped[1:], cwd, cwdUncertain))
 		if result.deny != nil {
 			return result
 		}
@@ -1022,9 +1028,9 @@ func unwrapOperationGlobalOptions(base string, args []literalArg) ([]literalArg,
 		case "git":
 			switch {
 			case value == "--paginate" || value == "-p" || value == "--no-pager" || value == "-P" ||
-				value == "--no-replace-objects" || value == "--bare" || value == "--no-optional-locks" ||
-				value == "--literal-pathspecs" || value == "--glob-pathspecs" || value == "--noglob-pathspecs" ||
-				value == "--icase-pathspecs":
+				value == "--no-replace-objects" || value == "--bare" || value == "--no-lazy-fetch" || value == "--no-optional-locks" ||
+				value == "--literal-pathspecs" || value == "--no-literal-pathspecs" || value == "--glob-pathspecs" || value == "--noglob-pathspecs" ||
+				value == "--icase-pathspecs" || value == "--no-advice":
 				current = current[1:]
 				continue
 			case value == "-c":
@@ -1051,6 +1057,9 @@ func unwrapOperationGlobalOptions(base string, args []literalArg) ([]literalArg,
 				literalOptionAssignment(value, "--exec-path"):
 				current = current[1:]
 				continue
+			case strings.HasPrefix(value, "--attr-source="):
+				current = current[1:]
+				continue
 			}
 		case "terraform":
 			if value == "-no-color" {
@@ -1074,6 +1083,10 @@ func unwrapOperationGlobalOptions(base string, args []literalArg) ([]literalArg,
 				continue
 			}
 			if kubectlAssignedGlobalOption(value) {
+				current = current[1:]
+				continue
+			}
+			if kubectlAttachedGlobalOption(value) {
 				current = current[1:]
 				continue
 			}
@@ -1107,7 +1120,25 @@ func literalOptionAssignment(value, name string) bool {
 
 func validGitConfigOverride(value string) bool {
 	key, _, _ := strings.Cut(value, "=")
+	firstDot := strings.Index(key, ".")
+	lastDot := strings.LastIndex(key, ".")
+	if firstDot > 0 && lastDot > firstDot {
+		return validGitConfigPart(key[:firstDot]) && validGitConfigPart(key[lastDot+1:]) &&
+			key[firstDot+1:lastDot] != "" && !strings.ContainsAny(key[firstDot+1:lastDot], "\x00\r\n")
+	}
 	return validGitConfigKey(key)
+}
+
+func validGitConfigPart(part string) bool {
+	if part == "" || !asciiAlphaNumeric(rune(part[0])) {
+		return false
+	}
+	for _, char := range part[1:] {
+		if char != '-' && !asciiAlphaNumeric(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func validGitConfigKey(key string) bool {
@@ -1116,13 +1147,8 @@ func validGitConfigKey(key string) bool {
 		return false
 	}
 	for _, part := range parts {
-		if part == "" || !asciiAlphaNumeric(rune(part[0])) {
+		if !validGitConfigPart(part) {
 			return false
-		}
-		for _, char := range part[1:] {
-			if char != '-' && !asciiAlphaNumeric(char) {
-				return false
-			}
 		}
 	}
 	return true
@@ -1136,7 +1162,11 @@ func kubectlBooleanGlobalOption(value string) bool {
 	name, assignedValue, assigned := strings.Cut(value, "=")
 	switch name {
 	case "--disable-compression", "--insecure-skip-tls-verify", "--match-server-version", "--warnings-as-errors":
-		return !assigned || assignedValue == "true" || assignedValue == "false"
+		if !assigned {
+			return true
+		}
+		_, err := strconv.ParseBool(assignedValue)
+		return err == nil
 	default:
 		return false
 	}
@@ -1145,9 +1175,9 @@ func kubectlBooleanGlobalOption(value string) bool {
 func kubectlValueGlobalOption(value string) bool {
 	switch value {
 	case "--as", "--as-group", "--as-uid", "--cache-dir", "--certificate-authority", "--client-certificate",
-		"--client-key", "--cluster", "--context", "--kubeconfig", "--namespace", "-n", "--profile",
+		"--client-key", "--cluster", "--context", "--kubeconfig", "--kuberc", "--namespace", "-n", "--profile",
 		"--profile-output", "--request-timeout", "--server", "-s", "--tls-server-name", "--token", "--user",
-		"--v", "--vmodule", "--log-flush-frequency":
+		"--v", "-v", "--vmodule", "--log-flush-frequency":
 		return true
 	default:
 		return false
@@ -1156,7 +1186,7 @@ func kubectlValueGlobalOption(value string) bool {
 
 func kubectlAssignedGlobalOption(value string) bool {
 	name, assignedValue, found := strings.Cut(value, "=")
-	if !found || assignedValue == "" {
+	if !found {
 		return false
 	}
 	if kubectlValueGlobalOption(name) {
@@ -1166,13 +1196,16 @@ func kubectlAssignedGlobalOption(value string) bool {
 }
 
 func validKubectlGlobalOptionValue(name, value string) bool {
-	if value == "" || !kubectlValueGlobalOption(name) {
+	if !kubectlValueGlobalOption(name) {
 		return false
+	}
+	if value == "" {
+		return name == "--namespace" || name == "-n" || name == "--profile-output"
 	}
 	switch name {
 	case "--profile":
 		switch strings.ToLower(value) {
-		case "none", "cpu", "heap", "allocs", "goroutine", "threadcreate", "block", "mutex":
+		case "none", "cpu", "heap", "allocs", "goroutine", "threadcreate", "block", "mutex", "trace":
 			return true
 		default:
 			return false
@@ -1180,7 +1213,7 @@ func validKubectlGlobalOptionValue(name, value string) bool {
 	case "--request-timeout", "--log-flush-frequency":
 		_, err := time.ParseDuration(value)
 		return err == nil
-	case "--v":
+	case "--v", "-v":
 		for _, char := range value {
 			if char < '0' || char > '9' {
 				return false
@@ -1201,6 +1234,22 @@ func validKubectlGlobalOptionValue(name, value string) bool {
 		}
 	}
 	return true
+}
+
+func kubectlAttachedGlobalOption(value string) bool {
+	if len(value) <= 2 || value[0] != '-' || value[1] == '-' {
+		return false
+	}
+	name := value[:2]
+	assigned := strings.TrimPrefix(value[2:], "=")
+	switch name {
+	case "-n", "-s":
+		return assigned != ""
+	case "-v":
+		return validKubectlGlobalOptionValue("-v", assigned)
+	default:
+		return false
+	}
 }
 
 func dockerBooleanGlobalOption(value string) bool {
@@ -1255,7 +1304,7 @@ func validDockerGlobalOptionValue(name, value string) bool {
 func (e *Evaluator) evaluateFindPaths(args []literalArg, cwd string, cwdUncertain bool) scanResult {
 	result := scanResult{}
 	deleteOperation := hasLiteral(args, "-delete")
-	if deleteOperation && findHasNarrowingExpression(args) {
+	if deleteOperation && findHasNarrowingExpression(args, e.boundaries.goos) {
 		result.addGap(gap("find_command_action", "A find selection expression narrows the delete operation."))
 		return result
 	}
@@ -1287,7 +1336,7 @@ func (e *Evaluator) evaluateFindPaths(args []literalArg, cwd string, cwdUncertai
 	return result
 }
 
-func findHasNarrowingExpression(args []literalArg) bool {
+func findHasNarrowingExpression(args []literalArg, goos string) bool {
 	index := 0
 	for index < len(args) {
 		if !args[index].static {
@@ -1323,6 +1372,7 @@ func findHasNarrowingExpression(args []literalArg) bool {
 		}
 		index++
 	}
+	mindepthNarrows := false
 	for ; index < len(args); index++ {
 		if !args[index].static {
 			return true
@@ -1330,11 +1380,47 @@ func findHasNarrowingExpression(args []literalArg) bool {
 		switch args[index].value {
 		case "-delete", "-depth":
 			continue
+		case "-mindepth":
+			if index+1 >= len(args) || !args[index+1].static {
+				return true
+			}
+			var valid bool
+			mindepthNarrows, valid = findMindepthNarrows(args[index+1].value, goos)
+			if !valid {
+				return true
+			}
+			index++
+			continue
 		default:
 			return true
 		}
 	}
-	return false
+	return mindepthNarrows
+}
+
+func findMindepthNarrows(value, goos string) (bool, bool) {
+	if strings.HasPrefix(value, "+") {
+		if goos != "darwin" {
+			return false, false
+		}
+		value = strings.TrimPrefix(value, "+")
+	}
+	if value == "" {
+		return false, false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false, false
+		}
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		if goos == "darwin" {
+			return false, true
+		}
+		return true, true
+	}
+	return parsed > 1, true
 }
 
 func findDereferencesCommandLine(args []literalArg) bool {
@@ -2022,6 +2108,290 @@ func (e *Evaluator) evaluateMoveAncestors(args []literalArg, cwd string, cwdUnce
 	return result
 }
 
+type gnuMoveOperands struct {
+	sources              []string
+	exchangeDestinations []string
+}
+
+func (e *Evaluator) evaluatePOSIXMoveAncestors(args []literalArg, cwd string, cwdUncertain bool) scanResult {
+	if e.boundaries.goos != "linux" {
+		return e.evaluateMoveAncestors(args, cwd, cwdUncertain)
+	}
+	parsed, ok := reviewedGNUmoveOperands(args)
+	if !ok {
+		return scanResult{gap: gap("complex_move_operands", "A move option is outside Ward source classification.")}
+	}
+	result := scanResult{}
+	for _, candidate := range append(parsed.sources, parsed.exchangeDestinations...) {
+		protected, ambiguous := e.classifyCriticalRelocationTarget(candidate, cwd, cwdUncertain)
+		if ambiguous {
+			result.addGap(gap("dynamic_path", "A relative move source depends on a prior current-directory change."))
+			continue
+		}
+		if protected {
+			return denied("WARD_DESTRUCTIVE_FILESYSTEM", destructiveFSReason)
+		}
+	}
+	return result
+}
+
+func reviewedGNUmoveOperands(args []literalArg) (gnuMoveOperands, bool) {
+	operands := make([]string, 0, len(args))
+	optionsDone := false
+	targetDirectory := ""
+	targetDirectorySeen := false
+	noTargetDirectory := false
+	exchange := false
+	backup := false
+	noClobber := false
+	updateMode := ""
+
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !arg.static {
+			return gnuMoveOperands{}, false
+		}
+		value := arg.value
+		if !optionsDone && value == "--" {
+			optionsDone = true
+			continue
+		}
+		if optionsDone || !strings.HasPrefix(value, "-") || value == "-" {
+			operands = append(operands, value)
+			continue
+		}
+
+		switch value {
+		case "-f", "--force":
+			noClobber = false
+		case "-i", "--interactive":
+			noClobber = false
+		case "-n", "--no-clobber":
+			noClobber = true
+		case "-b", "--backup":
+			backup = true
+		case "-u", "--update":
+			updateMode = "older"
+		case "-T", "--no-target-directory":
+			noTargetDirectory = true
+		case "--exchange":
+			exchange = true
+		case "-v", "--verbose", "--debug", "--strip-trailing-slashes", "-Z", "--context", "--no-copy":
+			continue
+		case "-t", "--target-directory", "--target-d":
+			if targetDirectorySeen || index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+				return gnuMoveOperands{}, false
+			}
+			targetDirectory, targetDirectorySeen = args[index+1].value, true
+			index++
+		case "-S", "--suffix":
+			if index+1 >= len(args) || !args[index+1].static {
+				return gnuMoveOperands{}, false
+			}
+			index++
+		default:
+			if gnuMoveTargetDirectoryOption(value) {
+				if targetDirectorySeen || index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+					return gnuMoveOperands{}, false
+				}
+				targetDirectory, targetDirectorySeen = args[index+1].value, true
+				index++
+				continue
+			}
+			name, assigned, found := strings.Cut(value, "=")
+			switch {
+			case found && gnuMoveTargetDirectoryOption(name):
+				if targetDirectorySeen || assigned == "" {
+					return gnuMoveOperands{}, false
+				}
+				targetDirectory, targetDirectorySeen = assigned, true
+			case found && name == "--backup":
+				if !validGNUmoveBackupControl(assigned) {
+					return gnuMoveOperands{}, false
+				}
+				backup = true
+			case found && name == "--suffix":
+				// GNU mv accepts an explicitly empty suffix.
+				continue
+			case found && name == "--update":
+				mode, valid := gnuMoveUpdateMode(assigned)
+				if !valid {
+					return gnuMoveOperands{}, false
+				}
+				updateMode = mode
+			case found && name == "--context":
+				// --context is a switch; GNU mv rejects every assigned form.
+				return gnuMoveOperands{}, false
+			default:
+				consumed, shortBackup, shortNoClobber, shortNoTarget, shortUpdate, valid := parseGNUmoveShortOptions(value)
+				if !valid {
+					return gnuMoveOperands{}, false
+				}
+				if shortBackup {
+					backup = true
+				}
+				if shortNoClobber != nil {
+					noClobber = *shortNoClobber
+				}
+				noTargetDirectory = noTargetDirectory || shortNoTarget
+				if shortUpdate != "" {
+					updateMode = shortUpdate
+				}
+				if consumed != "" {
+					switch consumed {
+					case "target-directory":
+						if targetDirectorySeen {
+							return gnuMoveOperands{}, false
+						}
+						shortValue := gnuMoveAttachedShortValue(value, 't')
+						if shortValue == "" {
+							if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+								return gnuMoveOperands{}, false
+							}
+							shortValue = args[index+1].value
+							index++
+						}
+						targetDirectory, targetDirectorySeen = shortValue, true
+					case "suffix":
+						if gnuMoveAttachedShortValue(value, 'S') == "" {
+							if index+1 >= len(args) || !args[index+1].static {
+								return gnuMoveOperands{}, false
+							}
+							index++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if targetDirectorySeen && noTargetDirectory || backup && exchange || backup && (noClobber || updateMode == "none") {
+		return gnuMoveOperands{}, false
+	}
+	parsed := gnuMoveOperands{}
+	switch {
+	case exchange && targetDirectorySeen:
+		if len(operands) == 0 {
+			return gnuMoveOperands{}, false
+		}
+		parsed.sources = append(parsed.sources, operands...)
+		for _, source := range operands {
+			base := path.Base(strings.TrimRight(strings.ReplaceAll(source, `\`, "/"), "/"))
+			if base == "." || base == "/" || base == "" {
+				return gnuMoveOperands{}, false
+			}
+			parsed.exchangeDestinations = append(parsed.exchangeDestinations, path.Join(targetDirectory, base))
+		}
+	case exchange:
+		if len(operands) != 2 {
+			return gnuMoveOperands{}, false
+		}
+		parsed.sources = append(parsed.sources, operands...)
+	case targetDirectorySeen:
+		if len(operands) == 0 {
+			return gnuMoveOperands{}, false
+		}
+		parsed.sources = append(parsed.sources, operands...)
+	case noTargetDirectory:
+		if len(operands) != 2 {
+			return gnuMoveOperands{}, false
+		}
+		parsed.sources = append(parsed.sources, operands[0])
+	default:
+		if len(operands) < 2 {
+			return gnuMoveOperands{}, false
+		}
+		parsed.sources = append(parsed.sources, operands[:len(operands)-1]...)
+	}
+	return parsed, true
+}
+
+func validGNUmoveBackupControl(value string) bool {
+	if value == "" {
+		return true
+	}
+	value = strings.ToLower(value)
+	if stringIn(value, []string{"none", "off", "numbered", "t", "existing", "nil", "simple", "never"}) {
+		return true
+	}
+	// GNU's enum binder permits unambiguous prefixes; a single "n" is
+	// ambiguous across numbered, none, nil, and never.
+	return strings.HasPrefix("numbered", value) && len(value) >= 2 ||
+		strings.HasPrefix("existing", value) || strings.HasPrefix("simple", value) ||
+		strings.HasPrefix("never", value) && len(value) >= 2 || strings.HasPrefix("nil", value) && len(value) >= 2 ||
+		strings.HasPrefix("off", value)
+}
+
+func gnuMoveUpdateMode(value string) (string, bool) {
+	value = strings.ToLower(value)
+	for _, mode := range []string{"all", "none", "none-fail", "older"} {
+		if value == mode {
+			return mode, true
+		}
+	}
+	if strings.HasPrefix("older", value) && value != "" {
+		return "older", true
+	}
+	if strings.HasPrefix("all", value) && value != "" {
+		return "all", true
+	}
+	// "n" is ambiguous between none and none-fail.
+	if len(value) >= 2 && strings.HasPrefix("none", value) && !strings.HasPrefix("none-fail", value) {
+		return "none", true
+	}
+	if strings.HasPrefix("none-fail", value) && len(value) > len("none") {
+		return "none-fail", true
+	}
+	return "", false
+}
+
+func gnuMoveTargetDirectoryOption(value string) bool {
+	return value == "--target-directory" ||
+		strings.HasPrefix(value, "--target-d") && strings.HasPrefix("--target-directory", value)
+}
+
+func parseGNUmoveShortOptions(value string) (consumes string, backup bool, noClobber *bool, noTarget bool, update string, valid bool) {
+	if len(value) < 2 || value[0] != '-' || strings.HasPrefix(value, "--") {
+		return "", false, nil, false, "", false
+	}
+	valid = true
+	for index := 1; index < len(value); index++ {
+		switch value[index] {
+		case 'f', 'i':
+			state := false
+			noClobber = &state
+		case 'n':
+			state := true
+			noClobber = &state
+		case 'b':
+			backup = true
+		case 'u':
+			update = "older"
+		case 'T':
+			noTarget = true
+		case 'v', 'Z':
+			continue
+		case 't':
+			return "target-directory", backup, noClobber, noTarget, update, true
+		case 'S':
+			return "suffix", backup, noClobber, noTarget, update, true
+		default:
+			return "", false, nil, false, "", false
+		}
+	}
+	return "", backup, noClobber, noTarget, update, true
+}
+
+func gnuMoveAttachedShortValue(value string, option byte) string {
+	for index := 1; index < len(value); index++ {
+		if value[index] != option {
+			continue
+		}
+		return value[index+1:]
+	}
+	return ""
+}
+
 func (e *Evaluator) evaluateMoveTargetDirectory(args []literalArg, cwd string, cwdUncertain bool) scanResult {
 	optionsDone := false
 	result := scanResult{}
@@ -2157,6 +2527,13 @@ func destructiveGit(args []literalArg) bool {
 
 func destructiveGitReset(args []literalArg) bool {
 	mode := ""
+	patchMode := false
+	autoAdvanceSet := false
+	autoAdvance := false
+	diffContext := false
+	pathspecFromFile := false
+	pathspecFromFileEmpty := false
+	pathspecFileNUL := false
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if !arg.static {
@@ -2172,28 +2549,91 @@ func destructiveGitReset(args []literalArg) bool {
 		switch value {
 		case "-h", "--help":
 			return false
-		case "--hard", "--soft", "--mixed", "--merge", "--keep", "-p", "--patch":
-			if mode != "" && mode != value {
-				return false
-			}
+		case "--hard", "--soft", "--mixed", "--merge", "--keep":
 			mode = value
-		case "-q", "--quiet", "--no-refresh", "--refresh", "-N", "--intent-to-add",
-			"--no-intent-to-add", "--pathspec-file-nul", "--recurse-submodules", "--no-recurse-submodules":
+		case "-p", "--patch":
+			patchMode = true
+		case "--no-patch":
+			patchMode = false
+		case "--auto-advance":
+			autoAdvanceSet, autoAdvance = true, true
+		case "--no-auto-advance":
+			autoAdvanceSet, autoAdvance = true, false
+		case "-q", "--quiet", "--no-quiet", "--no-refresh", "--refresh", "-N", "--intent-to-add",
+			"--no-intent-to-add", "--recurse-submodules", "--no-recurse-submodules":
 			continue
+		case "--pathspec-file-nul":
+			pathspecFileNUL = true
+		case "--no-pathspec-file-nul":
+			pathspecFileNUL = false
+		case "--no-pathspec-from-file":
+			pathspecFromFile, pathspecFromFileEmpty = false, false
 		case "--pathspec-from-file":
-			if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+			if index+1 >= len(args) || !args[index+1].static {
 				return false
 			}
+			pathspecFromFile = true
+			pathspecFromFileEmpty = args[index+1].value == ""
+			index++
+		case "-U", "--unified", "--inter-hunk-context":
+			if index+1 >= len(args) || !args[index+1].static || !validGitContextLines(args[index+1].value) {
+				return false
+			}
+			diffContext = true
 			index++
 		default:
-			if literalOptionAssignment(value, "--pathspec-from-file") ||
-				strings.HasPrefix(value, "--recurse-submodules=") && len(value) > len("--recurse-submodules=") {
+			if strings.HasPrefix(value, "--pathspec-from-file=") {
+				pathspecFromFile = true
+				pathspecFromFileEmpty = strings.TrimPrefix(value, "--pathspec-from-file=") == ""
+				continue
+			}
+			if strings.HasPrefix(value, "--recurse-submodules=") &&
+				validGitBoolean(strings.TrimPrefix(value, "--recurse-submodules="), true) {
+				continue
+			}
+			if strings.HasPrefix(value, "-U") && len(value) > len("-U") && validGitContextLines(strings.TrimPrefix(value, "-U")) {
+				diffContext = true
+				continue
+			}
+			if name, assigned, found := strings.Cut(value, "="); found &&
+				(name == "--unified" || name == "--inter-hunk-context") && validGitContextLines(assigned) {
+				diffContext = true
 				continue
 			}
 			return false
 		}
 	}
-	return mode == "--hard"
+	if patchMode && mode != "" || diffContext && !patchMode || autoAdvanceSet && !autoAdvance && !patchMode {
+		return false
+	}
+	if pathspecFileNUL && (!pathspecFromFile || pathspecFromFileEmpty) {
+		return false
+	}
+	return mode == "--hard" && !patchMode
+}
+
+func validGitBoolean(value string, allowEmpty bool) bool {
+	if value == "" {
+		return allowEmpty
+	}
+	switch strings.ToLower(value) {
+	case "true", "false", "yes", "no", "on", "off", "1", "0":
+		return true
+	default:
+		return false
+	}
+}
+
+func validGitContextLines(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func destructiveGitClean(args []literalArg) bool {
@@ -2215,11 +2655,13 @@ func destructiveGitClean(args []literalArg) bool {
 			return false
 		case "--force":
 			force = true
-		case "--directories":
-			directories = true
+		case "--no-force":
+			force = false
 		case "--dry-run":
 			dryRun = true
-		case "--interactive", "--quiet":
+		case "--no-dry-run":
+			dryRun = false
+		case "--interactive", "--no-interactive", "--quiet", "--no-quiet":
 			continue
 		case "--exclude", "-e":
 			if index+1 >= len(args) || !args[index+1].static {
@@ -2227,7 +2669,7 @@ func destructiveGitClean(args []literalArg) bool {
 			}
 			index++
 		default:
-			if strings.HasPrefix(value, "--exclude=") && len(value) > len("--exclude=") {
+			if strings.HasPrefix(value, "--exclude=") {
 				continue
 			}
 			if strings.HasPrefix(value, "--") || !parseGitCleanShortOptions(value, &force, &directories, &dryRun) {
@@ -2288,10 +2730,16 @@ func destructiveGitPush(args []literalArg) bool {
 				return false
 			case "-f", "--force":
 				force = true
+			case "--no-force":
+				force = false
 			case "--mirror":
 				mirror = true
+			case "--no-mirror":
+				mirror = false
 			case "-n", "--dry-run":
 				dryRun = true
+			case "--no-dry-run":
+				dryRun = false
 			case "--repo", "--receive-pack", "--exec", "--push-option", "-o":
 				if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
 					return false
@@ -2300,10 +2748,21 @@ func destructiveGitPush(args []literalArg) bool {
 					repositorySeen = true
 				}
 				index++
-			case "--all", "--branches", "--tags", "--follow-tags", "--atomic", "--delete", "--prune",
-				"--porcelain", "--quiet", "-q", "--verbose", "-v", "--set-upstream", "-u",
+			case "--recurse-submodules":
+				if index+1 >= len(args) || !args[index+1].static || !validGitPushRecurseSubmodules(args[index+1].value) {
+					return false
+				}
+				index++
+			case "--no-repo":
+				repositorySeen = false
+			case "--all", "--no-all", "--branches", "--no-branches", "--tags", "--no-tags",
+				"--follow-tags", "--no-follow-tags", "--atomic", "--no-atomic", "--delete", "--no-delete", "-d",
+				"--prune", "--no-prune", "--porcelain", "--no-porcelain", "--quiet", "--no-quiet", "-q",
+				"--verbose", "--no-verbose", "-v", "--set-upstream", "--no-set-upstream", "-u",
 				"--no-verify", "--ipv4", "-4", "--ipv6", "-6", "--force-if-includes",
-				"--force-with-lease":
+				"--no-force-if-includes", "--force-with-lease", "--no-force-with-lease", "--progress", "--no-progress",
+				"--signed", "--no-signed", "--thin", "--no-thin", "--verify",
+				"--no-receive-pack", "--no-exec", "--no-push-option", "--no-recurse-submodules":
 				continue
 			default:
 				name, assigned, hasAssignment := strings.Cut(value, "=")
@@ -2317,11 +2776,23 @@ func destructiveGitPush(args []literalArg) bool {
 					}
 					continue
 				case "--force-with-lease", "--signed", "--recurse-submodules":
-					if hasAssignment && assigned != "" {
+					if hasAssignment && assigned != "" &&
+						(name != "--signed" || validGitPushSigned(assigned)) &&
+						(name != "--recurse-submodules" || validGitPushRecurseSubmodules(assigned)) {
 						continue
 					}
 				}
 				if strings.HasPrefix(value, "-o") && len(value) > 2 {
+					continue
+				}
+				validShort, consumesNext := parseGitPushShortOptions(value, &force, &dryRun)
+				if validShort {
+					if consumesNext {
+						if index+1 >= len(args) || !args[index+1].static || args[index+1].value == "" {
+							return false
+						}
+						index++
+					}
 					continue
 				}
 				return false
@@ -2337,6 +2808,35 @@ func destructiveGitPush(args []literalArg) bool {
 		}
 	}
 	return !dryRun && (force || mirror || forcedRefspec)
+}
+
+func parseGitPushShortOptions(value string, force, dryRun *bool) (bool, bool) {
+	if len(value) < 2 || value[0] != '-' || strings.HasPrefix(value, "--") {
+		return false, false
+	}
+	for index := 1; index < len(value); index++ {
+		switch value[index] {
+		case 'f':
+			*force = true
+		case 'n':
+			*dryRun = true
+		case 'v', 'q', 'u', 'd', '4', '6':
+			continue
+		case 'o':
+			return true, index+1 == len(value)
+		default:
+			return false, false
+		}
+	}
+	return true, false
+}
+
+func validGitPushSigned(value string) bool {
+	return validGitBoolean(value, false) || value == "if-asked"
+}
+
+func validGitPushRecurseSubmodules(value string) bool {
+	return stringIn(value, []string{"check", "on-demand", "no", "only"})
 }
 
 func destructiveTerraform(args []literalArg) bool {
@@ -2449,6 +2949,14 @@ func destructiveCompose(args []literalArg) (bool, *contract.CoverageGap) {
 			return false, gap("dynamic_compose_option", "A Docker Compose option contains runtime expansion.")
 		}
 		switch value := current[0].value; {
+		case value == "--compatibility" || value == "--all-resources":
+			current = current[1:]
+		case strings.HasPrefix(value, "--compatibility=") || strings.HasPrefix(value, "--all-resources="):
+			_, assigned, _ := strings.Cut(value, "=")
+			if _, valid := composeBooleanValue(assigned); !valid {
+				return false, gap("unsupported_compose_option", "A Docker Compose boolean option is outside Ward classification.")
+			}
+			current = current[1:]
 		case composeValueOption(value):
 			if len(current) < 2 || !current[1].static || !validComposeGlobalValue(value, current[1].value) {
 				return false, gap("unsupported_compose_option", "A Docker Compose option is missing a literal argument.")
@@ -2486,7 +2994,7 @@ func destructiveCompose(args []literalArg) (bool, *contract.CoverageGap) {
 func composeValueOption(value string) bool {
 	switch value {
 	case "-f", "--file", "--env-file", "--profile", "--project-directory", "-p", "--project-name",
-		"--ansi", "--parallel":
+		"--ansi", "--parallel", "--progress":
 		return true
 	default:
 		return false
@@ -2494,7 +3002,7 @@ func composeValueOption(value string) bool {
 }
 
 func composeAssignedValueOption(value string) bool {
-	for _, name := range []string{"--file", "--env-file", "--profile", "--project-directory", "--project-name", "--ansi", "--parallel"} {
+	for _, name := range []string{"--file", "--env-file", "--profile", "--project-directory", "--project-name", "--ansi", "--parallel", "--progress"} {
 		if strings.HasPrefix(value, name+"=") {
 			return validComposeGlobalValue(name, strings.TrimPrefix(value, name+"="))
 		}
@@ -2503,23 +3011,18 @@ func composeAssignedValueOption(value string) bool {
 }
 
 func validComposeGlobalValue(name, value string) bool {
-	if value == "" {
-		return false
-	}
 	switch name {
 	case "--ansi":
-		return value == "auto" || value == "always" || value == "never"
+		return value == "" || stringIn(strings.ToLower(value), []string{"auto", "always", "never"})
+	case "--progress":
+		return value == "" || stringIn(value, []string{"auto", "tty", "plain", "json", "quiet"})
 	case "--parallel":
-		if value == "-1" {
-			return true
-		}
-		for _, char := range value {
-			if char < '0' || char > '9' {
-				return false
-			}
-		}
+		return validComposeInteger(value)
+	case "-f", "--file", "--env-file", "--profile", "--project-directory", "-p", "--project-name":
+		return true
+	default:
+		return false
 	}
-	return true
 }
 
 func composeAttachedShortValueOption(value string) bool {
@@ -2528,11 +3031,22 @@ func composeAttachedShortValueOption(value string) bool {
 
 func destructiveComposeDown(args []literalArg, dryRun bool) (bool, *contract.CoverageGap) {
 	volumes := false
+	optionsDone := false
 	for index := 0; index < len(args); index++ {
 		if !args[index].static {
 			return false, gap("dynamic_compose_option", "A Docker Compose down option contains runtime expansion.")
 		}
 		value := args[index].value
+		if !optionsDone && value == "--" {
+			optionsDone = true
+			continue
+		}
+		if optionsDone {
+			if !validComposeServiceName(value, true) {
+				return false, gap("unsupported_compose_option", "A Docker Compose service name is outside Ward classification.")
+			}
+			continue
+		}
 		switch value {
 		case "-v", "--volumes":
 			volumes = true
@@ -2548,7 +3062,7 @@ func destructiveComposeDown(args []literalArg, dryRun bool) (bool, *contract.Cov
 		default:
 			name, assigned, found := strings.Cut(value, "=")
 			if found && (name == "--volumes" || name == "-v") {
-				parsed, valid := composeDryRunValue(assigned)
+				parsed, valid := composeBooleanValue(assigned)
 				if !valid {
 					return false, gap("unsupported_compose_option", "A Docker Compose volumes value is outside Ward classification.")
 				}
@@ -2566,13 +3080,26 @@ func destructiveComposeDown(args []literalArg, dryRun bool) (bool, *contract.Cov
 			if found && (name == "--timeout" || name == "--rmi") && validComposeDownValue(name, assigned) {
 				continue
 			}
-			if found && name == "--remove-orphans" && (assigned == "true" || assigned == "false") {
+			if found && name == "--remove-orphans" {
+				if _, valid := composeBooleanValue(assigned); !valid {
+					return false, gap("unsupported_compose_option", "A Docker Compose remove-orphans value is outside Ward classification.")
+				}
 				continue
 			}
-			if strings.HasPrefix(value, "-t") && len(value) > 2 && validComposeDownValue("-t", strings.TrimPrefix(value, "-t")) {
-				continue
+			if strings.HasPrefix(value, "-") && !strings.HasPrefix(value, "--") {
+				parsedVolumes, consumesNext, valid := parseComposeDownShortOptions(value, volumes)
+				if valid {
+					volumes = parsedVolumes
+					if consumesNext {
+						if index+1 >= len(args) || !args[index+1].static || !validComposeDownValue("-t", args[index+1].value) {
+							return false, gap("unsupported_compose_option", "A Docker Compose timeout is missing a valid literal argument.")
+						}
+						index++
+					}
+					continue
+				}
 			}
-			if validComposeServiceName(value) {
+			if validComposeServiceName(value, false) {
 				continue
 			}
 			return false, gap("unsupported_compose_option", "A Docker Compose down option is outside Ward classification.")
@@ -2582,18 +3109,23 @@ func destructiveComposeDown(args []literalArg, dryRun bool) (bool, *contract.Cov
 }
 
 func composeDryRunValue(value string) (bool, bool) {
-	switch strings.ToLower(value) {
-	case "true", "1":
-		return true, true
-	case "false", "0":
-		return false, true
-	default:
-		return false, false
-	}
+	return composeBooleanValue(value)
 }
 
-func validComposeServiceName(value string) bool {
-	if value == "" || !asciiAlphaNumeric(rune(value[0])) {
+func composeBooleanValue(value string) (bool, bool) {
+	parsed, err := strconv.ParseBool(value)
+	return parsed, err == nil
+}
+
+func validComposeServiceName(value string, optionsDone bool) bool {
+	if value == "" {
+		return false
+	}
+	first := rune(value[0])
+	if !asciiAlphaNumeric(first) && first != '_' && first != '.' && !(optionsDone && first == '-') {
+		return false
+	}
+	if len(value) == 1 && !asciiAlphaNumeric(first) {
 		return false
 	}
 	for _, char := range value[1:] {
@@ -2611,21 +3143,50 @@ func validComposeDownValue(name, value string) bool {
 	if name == "--rmi" {
 		return value == "all" || value == "local"
 	}
-	for _, char := range value {
-		if char < '0' || char > '9' {
-			return false
+	return validComposeInteger(value)
+}
+
+func validComposeInteger(value string) bool {
+	if !signedDecimal(value) {
+		return false
+	}
+	_, err := strconv.ParseInt(value, 10, 64)
+	return err == nil
+}
+
+func parseComposeDownShortOptions(value string, volumes bool) (bool, bool, bool) {
+	if len(value) < 2 || value[0] != '-' || strings.HasPrefix(value, "--") {
+		return volumes, false, false
+	}
+	for index := 1; index < len(value); index++ {
+		switch value[index] {
+		case 'v':
+			if index+1 < len(value) && value[index+1] == '=' {
+				parsed, valid := composeBooleanValue(value[index+2:])
+				return parsed, false, valid
+			}
+			volumes = true
+		case 't':
+			attached := strings.TrimPrefix(value[index+1:], "=")
+			if attached == "" {
+				return volumes, true, true
+			}
+			return volumes, false, validComposeDownValue("-t", attached)
+		default:
+			return volumes, false, false
 		}
 	}
-	return true
+	return volumes, false, true
 }
 
 func destructiveKubectl(args []literalArg) (bool, *contract.CoverageGap) {
 	if len(args) < 2 || !literalAt(args, 0, "delete") {
 		return false, nil
 	}
-	resourceType := ""
 	optionsDone := false
 	dryRun := false
+	resourceMode := ""
+	destructiveResource := false
 	for index := 1; index < len(args); index++ {
 		arg := args[index]
 		if !arg.static {
@@ -2635,14 +3196,13 @@ func destructiveKubectl(args []literalArg) (bool, *contract.CoverageGap) {
 			optionsDone = true
 			continue
 		}
-		if !optionsDone && strings.HasPrefix(arg.value, "-") {
-			lower := strings.ToLower(arg.value)
-			if lower == "--dry-run" {
+		if !optionsDone && strings.HasPrefix(arg.value, "-") && arg.value != "-" {
+			if arg.value == "--dry-run" {
 				dryRun = true
 				continue
 			}
-			if strings.HasPrefix(lower, "--dry-run=") {
-				parsed, valid := kubectlDryRunValue(strings.TrimPrefix(lower, "--dry-run="))
+			if strings.HasPrefix(arg.value, "--dry-run=") {
+				parsed, valid := kubectlDryRunValue(strings.TrimPrefix(arg.value, "--dry-run="))
 				if !valid {
 					return false, gap("unsupported_kubectl_delete_option", "A kubectl dry-run mode is outside Ward classification.")
 				}
@@ -2656,19 +3216,46 @@ func destructiveKubectl(args []literalArg) (bool, *contract.CoverageGap) {
 			index = next - 1
 			continue
 		}
-		if resourceType == "" {
-			resourceType = strings.ToLower(arg.value)
+		if resourceMode == "" {
+			if strings.Contains(arg.value, "/") {
+				resourceMode = "tuple"
+				typeName, valid := kubectlResourceTuple(arg.value)
+				if !valid {
+					return false, gap("unsupported_kubectl_resource_type", "A kubectl resource tuple is outside Ward classification.")
+				}
+				destructiveResource = destructiveResource || kubectlNamespaceResource(typeName)
+				continue
+			}
+			resourceMode = "type"
+			resourceTypes, valid := kubectlResourceTypeList(arg.value)
+			if !valid {
+				return false, gap("unsupported_kubectl_resource_type", "A kubectl resource type is outside Ward classification.")
+			}
+			for _, resourceType := range resourceTypes {
+				destructiveResource = destructiveResource || kubectlNamespaceResource(resourceType)
+			}
+			continue
+		}
+		if resourceMode == "tuple" {
+			typeName, valid := kubectlResourceTuple(arg.value)
+			if !valid {
+				return false, gap("unsupported_kubectl_resource_type", "A kubectl resource tuple is outside Ward classification.")
+			}
+			destructiveResource = destructiveResource || kubectlNamespaceResource(typeName)
+			continue
+		}
+		if strings.Contains(arg.value, "/") {
+			return false, gap("unsupported_kubectl_resource_type", "Mixed kubectl resource type and tuple forms are outside Ward classification.")
 		}
 	}
 	if dryRun {
 		return false, nil
 	}
-	return resourceType == "namespace" || resourceType == "namespaces" || resourceType == "ns" ||
-		strings.HasPrefix(resourceType, "namespace/") || strings.HasPrefix(resourceType, "namespaces/") || strings.HasPrefix(resourceType, "ns/"), nil
+	return destructiveResource, nil
 }
 
 func kubectlDryRunValue(value string) (bool, bool) {
-	switch strings.ToLower(value) {
+	switch value {
 	case "client", "server", "true", "1", "t":
 		return true, true
 	case "none", "false", "0", "f":
@@ -2690,13 +3277,22 @@ func reviewedKubectlDeleteOption(args []literalArg, index int) (int, bool) {
 		}
 		return index + 2, true
 	}
-	if stringIn(value, []string{"--all", "--force", "--ignore-not-found", "--now", "--recursive", "-R", "--wait"}) {
+	if kubectlAttachedGlobalOption(value) {
+		return index + 1, true
+	}
+	if stringIn(value, []string{"--all", "--all-namespaces", "-A", "--force", "--ignore-not-found", "--interactive", "-i", "--now", "--recursive", "-R", "--wait"}) {
 		return index + 1, true
 	}
 	if name, assigned, found := strings.Cut(value, "="); found &&
-		stringIn(name, []string{"--all", "--force", "--ignore-not-found", "--now", "--recursive", "--wait"}) &&
-		(assigned == "true" || assigned == "false") {
+		stringIn(name, []string{"--all", "--all-namespaces", "-A", "--force", "--ignore-not-found", "--interactive", "-i", "--now", "--recursive", "-R", "--wait"}) {
+		_, err := strconv.ParseBool(assigned)
+		return index + 1, err == nil
+	}
+	if value == "--cascade" {
 		return index + 1, true
+	}
+	if strings.HasPrefix(value, "--cascade=") {
+		return index + 1, stringIn(strings.TrimPrefix(value, "--cascade="), []string{"background", "foreground", "orphan"})
 	}
 	if stringIn(value, []string{
 		"-f", "--filename", "--field-selector", "--grace-period", "-k", "--kustomize",
@@ -2715,7 +3311,76 @@ func reviewedKubectlDeleteOption(args []literalArg, index int) (int, bool) {
 			return index + 1, true
 		}
 	}
+	if strings.HasPrefix(value, "-") && !strings.HasPrefix(value, "--") {
+		return index + 1, reviewedKubectlDeleteShortCluster(value)
+	}
 	return index, false
+}
+
+func reviewedKubectlDeleteShortCluster(value string) bool {
+	if len(value) < 2 || value[0] != '-' || value[1] == '-' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		switch value[index] {
+		case 'A', 'i', 'R':
+			if index+1 < len(value) && value[index+1] == '=' {
+				_, err := strconv.ParseBool(value[index+2:])
+				return err == nil
+			}
+		case 'v':
+			assigned := strings.TrimPrefix(value[index+1:], "=")
+			return validKubectlGlobalOptionValue("-v", assigned)
+		case 'n', 's':
+			assigned := strings.TrimPrefix(value[index+1:], "=")
+			return assigned != ""
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func kubectlResourceTypeList(value string) ([]string, bool) {
+	parts := strings.Split(strings.ToLower(value), ",")
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, part := range parts {
+		if !validKubectlResourceType(part) {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+func kubectlResourceTuple(value string) (string, bool) {
+	typeName, resourceName, found := strings.Cut(strings.ToLower(value), "/")
+	if !found || !validKubectlResourceType(typeName) || resourceName == "" || strings.Contains(resourceName, "/") || strings.ContainsAny(resourceName, " \t\r\n,") {
+		return "", false
+	}
+	return typeName, true
+}
+
+func validKubectlResourceType(value string) bool {
+	if value == "" || !asciiAlphaNumeric(rune(value[0])) {
+		return false
+	}
+	for _, char := range value[1:] {
+		if !asciiAlphaNumeric(char) && char != '-' && char != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func kubectlNamespaceResource(value string) bool {
+	switch strings.ToLower(value) {
+	case "namespace", "namespaces", "ns":
+		return true
+	default:
+		return false
+	}
 }
 
 func containsDestructiveSQL(base string, args []literalArg) bool {

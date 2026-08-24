@@ -118,6 +118,52 @@ func unmergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
 	return encodeHookRoot(root, hooks)
 }
 
+// unmergeLegacyHooksExact is the v1 migration ownership gate. A valid v1
+// installation has one exact wildcard handler for each of PreToolUse,
+// PermissionRequest, and PostToolUse, and no other Ward-like handler in a
+// managed event. Validation completes before any transformed bytes are used.
+func unmergeLegacyHooksExact(original []byte, binaryPath string) ([]byte, bool, error) {
+	_, hooks, err := decodeHookRoot(original)
+	if err != nil {
+		return nil, false, err
+	}
+	counts := make(map[string]int, len(legacyWardHookSpecs))
+	for _, event := range managedHookEvents() {
+		groups, err := decodeGroups(hooks[event])
+		if err != nil {
+			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
+		}
+		for _, rawGroup := range groups {
+			group, err := decodeGroup(rawGroup)
+			if err != nil {
+				return nil, false, err
+			}
+			handlers, err := decodeHandlers(group["hooks"])
+			if err != nil {
+				return nil, false, err
+			}
+			for _, rawHandler := range handlers {
+				legacy, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
+				if err != nil {
+					return nil, false, err
+				}
+				if desired || conflict {
+					return nil, false, fmt.Errorf("%w: v1 Ward hook ownership differs from the journal", ErrConflict)
+				}
+				if legacy {
+					counts[event]++
+				}
+			}
+		}
+	}
+	for _, spec := range legacyWardHookSpecs {
+		if counts[spec.Event] != 1 {
+			return nil, false, fmt.Errorf("%w: v1 Ward hook ownership differs from the journal", ErrConflict)
+		}
+	}
+	return unmergeHooks(original, binaryPath)
+}
+
 func containsWardHandler(original []byte, binaryPath string) (bool, error) {
 	_, hooks, err := decodeHookRoot(original)
 	if err != nil {

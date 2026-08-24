@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -172,7 +174,24 @@ func TestInstallRejectsAnyAdditiveUserPolicy(t *testing.T) {
 func TestInstallMigratesExactV1JournalAtomically(t *testing.T) {
 	options := fixtureOptions(t)
 	originalConfig := []byte("approval_policy   = \"on-request\" # exact\nsandbox_mode = \"workspace-write\"\n")
-	originalHooks := []byte(`{"description":"legacy user bytes"}`)
+	originalHooks := []byte(`{
+  "description": "legacy user bytes",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/bin/true",
+            "timeout": 1,
+            "type": "command"
+          }
+        ],
+        "matcher": "^Read$"
+      }
+    ]
+  }
+}
+`)
 	writeV1Installation(t, options, originalConfig, originalHooks)
 
 	result, err := Install(options)
@@ -199,6 +218,9 @@ func TestInstallMigratesExactV1JournalAtomically(t *testing.T) {
 	hooksAfter, _ := os.ReadFile(options.Paths.HooksFile)
 	if !bytes.Equal(configAfter, originalConfig) {
 		t.Fatalf("v1 migration lost original config: %q", configAfter)
+	}
+	if !bytes.Equal(hooksAfter, originalHooks) {
+		t.Fatalf("v1 migration lost canonical original hooks bytes:\ngot=%q\nwant=%q", hooksAfter, originalHooks)
 	}
 	assertJSONEqual(t, hooksAfter, originalHooks)
 }
@@ -338,17 +360,38 @@ func TestDecodeJournalRejectsDuplicateAuthorityFields(t *testing.T) {
 func writeV1Installation(t *testing.T, options Options, originalConfig, originalHooks []byte) {
 	t.Helper()
 	writeExecutable(t, options.Paths.BinaryPath)
-	newline := "\n"
+	newline := detectNewline(originalConfig)
 	selector := []byte(strings.Join([]string{legacySelectorBegin, `default_permissions = "ward-baseline"`, legacySelectorEnd, ""}, newline))
 	working := append([]byte(nil), originalConfig...)
-	edits := configEdits{SelectorBlock: selector}
+	edits := configEdits{}
+	networkEnabled := false
 	if assignments := findAssignments(working, "sandbox_mode"); len(assignments) == 1 {
+		if mode, ok := parseTOMLString(assignments[0].Value); ok {
+			networkEnabled = mode == "danger-full-access"
+		}
 		edits.SandboxOriginal = append([]byte(nil), assignments[0].Raw...)
 		edits.SandboxReplacement = []byte("# ward:migrated-sandbox-mode:v1" + assignments[0].Newline)
 		working = replaceRange(working, assignments[0].Start, assignments[0].End, edits.SandboxReplacement)
 	}
-	working = append(append([]byte(nil), selector...), working...)
-	profile := []byte("\n" + legacyProfileBegin + "\n[permissions.ward-baseline]\nextends = \":workspace\"\n" + legacyProfileEnd + "\n")
+	defaults := findAssignments(working, "default_permissions")
+	preselected := false
+	if len(defaults) == 1 && defaults[0].TopLevel {
+		selected, ok := parseTOMLString(defaults[0].Value)
+		preselected = ok && selected == options.profileName()
+	}
+	if !preselected {
+		edits.SelectorBlock = selector
+		working = append(append([]byte(nil), selector...), working...)
+	}
+	prefix := ""
+	if len(working) > 0 {
+		if bytes.HasSuffix(working, []byte(newline)) {
+			prefix = newline
+		} else {
+			prefix = newline + newline
+		}
+	}
+	profile := []byte(prefix + legacyV1FixtureProfileBody(t, newline, options, networkEnabled))
 	edits.ProfileAppend = profile
 	working = append(working, profile...)
 	hooks := legacyHooksFixture(t, options.Paths.BinaryPath, originalHooks)
@@ -359,7 +402,9 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 	}
 	journal := integrationJournal{
 		Schema: journalSchemaV1, BinaryPath: filepath.Clean(options.Paths.BinaryPath), ProfileName: options.profileName(),
+		HooksOriginallyAbsent:       originalHooks == nil,
 		HooksObjectOriginallyAbsent: hooksObjectAbsent(originalHooks),
+		ConfigOriginallyAbsent:      originalConfig == nil,
 		ConfigEdits:                 edits, HooksDigest: digest(hooks), ConfigDigest: digest(working),
 		CredentialPathsDigest: credentialPathsDigest(nil, nil),
 	}
@@ -372,6 +417,92 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 	if err := audit.SecurePrivateFile(journalPath); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// legacyV1FixtureProfileBody rebuilds the variable path slice around the
+// frozen generator-owned prefix/workspace rules. Keeping synthetic fixtures on
+// the real historical grammar prevents permissive validators from passing on
+// abbreviated test-only profiles.
+func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, networkEnabled bool) string {
+	t.Helper()
+	frozen, err := os.ReadFile(filepath.Join("testdata", "frozen-v1", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(frozen)
+	profileStart := strings.Index(text, legacyProfileBegin)
+	dynamicAnchor := legacyV1DynamicPrefixLastLine + "\n"
+	dynamicStart := strings.Index(text, dynamicAnchor)
+	workspaceHeader := `[permissions.ward-baseline.filesystem.":workspace_roots"]` + "\n"
+	workspaceStart := strings.Index(text, workspaceHeader)
+	if profileStart < 0 || dynamicStart < profileStart || workspaceStart < 0 {
+		t.Fatal("frozen v1 profile anchors are incomplete")
+	}
+	workspaceEndAnchor := legacyV1WorkspaceLastLine + "\n"
+	workspaceRelativeEnd := strings.Index(text[workspaceStart:], workspaceEndAnchor)
+	if workspaceRelativeEnd < 0 {
+		t.Fatal("frozen v1 profile anchors are incomplete")
+	}
+	dynamicStart += len(dynamicAnchor)
+	workspaceEnd := workspaceStart + workspaceRelativeEnd + len(workspaceEndAnchor)
+	prefix := text[profileStart:dynamicStart]
+	workspace := text[workspaceStart:workspaceEnd]
+	if profile := options.profileName(); profile != DefaultProfileName {
+		prefix = strings.ReplaceAll(prefix, "permissions."+DefaultProfileName, "permissions."+profile)
+		workspace = strings.ReplaceAll(workspace, "permissions."+DefaultProfileName, "permissions."+profile)
+	}
+
+	boundaries := legacyV1KnownBoundaryDirectories(options.Paths)
+	seenBoundaries := make(map[string]struct{}, len(boundaries)+len(options.Paths.CredentialDirectories))
+	for _, value := range boundaries {
+		seenBoundaries[value] = struct{}{}
+	}
+	for _, value := range options.Paths.CredentialDirectories {
+		value = filepath.Clean(value)
+		if value == "." || value == "" {
+			continue
+		}
+		if _, exists := seenBoundaries[value]; exists {
+			continue
+		}
+		seenBoundaries[value] = struct{}{}
+		boundaries = append(boundaries, value)
+	}
+	sort.Strings(boundaries)
+
+	var dynamic strings.Builder
+	for _, value := range boundaries {
+		dynamic.WriteString(strconv.Quote(value) + ` = "read"` + "\n")
+	}
+	protected := legacyV1KnownProtectedPaths(options.Paths)
+	seenProtected := make(map[string]struct{}, len(protected)+len(options.Paths.CredentialFiles))
+	for _, value := range protected {
+		seenProtected[value] = struct{}{}
+	}
+	for _, value := range options.Paths.CredentialFiles {
+		if value == "" {
+			continue
+		}
+		if _, exists := seenProtected[value]; exists {
+			continue
+		}
+		seenProtected[value] = struct{}{}
+		protected = append(protected, value)
+	}
+	for _, value := range protected {
+		dynamic.WriteString(strconv.Quote(value) + ` = "deny"` + "\n")
+	}
+	dynamic.WriteString(strconv.Quote(options.Paths.BinaryPath) + ` = "read"` + "\n\n")
+
+	tail := legacyProfileEnd + "\n"
+	if networkEnabled {
+		tail = "\n[permissions." + options.profileName() + ".network]\nenabled = true\n" + legacyProfileEnd + "\n"
+	}
+	body := prefix + dynamic.String() + workspace + tail
+	if newline == "\r\n" {
+		body = strings.ReplaceAll(body, "\n", newline)
+	}
+	return body
 }
 
 func fixtureOptions(t *testing.T) Options {
