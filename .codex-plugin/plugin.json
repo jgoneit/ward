@@ -1,6 +1,6 @@
 {
   "name": "ward",
-  "version": "0.1.0-dev.0+codex.20260819154508",
+  "version": "0.1.0-dev.0+codex.20260825135512",
   "description": "Recover from Ward denials and inspect its ambient Codex safety kernel.",
   "author": {
     "name": "jgoneit"
