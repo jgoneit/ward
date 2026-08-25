@@ -1,5 +1,0 @@
-schema = "ward.policy.v1"
-
-# The v0.1 ambient kernel is fixed. Runtime command and path deny extensions
-# are intentionally unsupported; evaluator boundaries come from trusted Host
-# context rather than user TOML.

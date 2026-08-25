@@ -47,7 +47,7 @@ func TestDecodePreToolUseBash(t *testing.T) {
 }
 
 func TestDecodeCopiesRawToolInput(t *testing.T) {
-	raw, err := json.Marshal(officialFixture(EventPreToolUse))
+	raw, err := json.Marshal(officialFixture())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,51 +64,15 @@ func TestDecodeCopiesRawToolInput(t *testing.T) {
 	}
 }
 
-func TestDecodePermissionRequestDoesNotRequireToolUseID(t *testing.T) {
-	raw := []byte(`{
-  "session_id":"thr_1",
-	"transcript_path":null,
-  "cwd":"/workspace",
-  "hook_event_name":"PermissionRequest",
-	"model":"gpt-test",
-	"permission_mode":"default",
-  "turn_id":"turn_1",
-  "tool_name":"apply_patch",
-  "tool_input":{"command":"*** Begin Patch\n*** Delete File: key.pem\n*** End Patch"}
-}`)
-	got, err := Decode(raw, EventPermissionRequest)
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	if got.Request.Tool != "apply_patch" {
-		t.Fatalf("tool = %q, want apply_patch", got.Request.Tool)
-	}
-}
-
-func TestDecodePostToolUseIgnoresResponseBytes(t *testing.T) {
-	raw := []byte(`{
-  "session_id":"thr_1",
-	"transcript_path":null,
-  "cwd":"/workspace",
-  "hook_event_name":"PostToolUse",
-	"model":"gpt-test",
-	"permission_mode":"default",
-  "turn_id":"turn_1",
-  "tool_name":"Bash",
-  "tool_use_id":"call_1",
-  "tool_input":{"command":"printf safe"},
-  "tool_response":{"output":"TOP_SECRET"}
-}`)
-	got, err := Decode(raw, EventPostToolUse)
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	encoded, err := json.Marshal(got.Request)
+func TestDecodeRejectsUnsupportedExpectedEvent(t *testing.T) {
+	raw, err := json.Marshal(officialFixture())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) == "" || contains(string(encoded), "TOP_SECRET") {
-		t.Fatalf("response leaked into request: %s", encoded)
+	for _, event := range []string{"PermissionRequest", "PostToolUse"} {
+		if _, err := Decode(raw, event); !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("Decode(%q) error = %v, want invalid payload", event, err)
+		}
 	}
 }
 
@@ -173,7 +137,7 @@ func TestDecodeAcceptsOfficialHandlerInputProjections(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			payload := officialFixture(EventPreToolUse)
+			payload := officialFixture()
 			payload["tool_name"] = tt.toolName
 			payload["tool_input"] = tt.toolInput
 			raw, err := json.Marshal(payload)
@@ -208,7 +172,7 @@ func TestDecodeLocalToolWithoutPathProducesValidCoverageSentinel(t *testing.T) {
 }
 
 func TestDecodeGenericWritePreservesStructuredShape(t *testing.T) {
-	payload := officialFixture(EventPreToolUse)
+	payload := officialFixture()
 	payload["tool_name"] = "Write"
 	payload["tool_input"] = map[string]any{"file_path": ".env", "content": "not persisted by adapter"}
 	raw, err := json.Marshal(payload)
@@ -231,7 +195,7 @@ func TestDecodeRejectsMismatchedOrMalformedPayload(t *testing.T) {
 		event string
 		is    error
 	}{
-		{"event mismatch", `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"PostToolUse","model":"m","permission_mode":"default","turn_id":"t","tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"true"},"tool_response":{}}`, EventPreToolUse, ErrEventMismatch},
+		{"event mismatch", `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"UnexpectedEvent","model":"m","permission_mode":"default","turn_id":"t","tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"true"}}`, EventPreToolUse, ErrEventMismatch},
 		{"missing identity", `{"transcript_path":null,"cwd":"/w","hook_event_name":"PreToolUse","model":"m","permission_mode":"default","turn_id":"t","tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"true"}}`, EventPreToolUse, ErrInvalidPayload},
 		{"missing command", `{"session_id":"s","transcript_path":null,"cwd":"/w","hook_event_name":"PreToolUse","model":"m","permission_mode":"default","turn_id":"t","tool_name":"Bash","tool_use_id":"c","tool_input":{}}`, EventPreToolUse, ErrInvalidPayload},
 		{"non-object input", `{"session_id":"s","cwd":"/w","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"c","tool_input":[]}`, EventPreToolUse, ErrInvalidPayload},
@@ -250,48 +214,23 @@ func TestDecodeRejectsMismatchedOrMalformedPayload(t *testing.T) {
 }
 
 func TestDecodeRequiresOfficialTopLevelFields(t *testing.T) {
-	tests := []struct {
-		name     string
-		event    string
-		required []string
-		payload  map[string]any
-	}{
-		{
-			name:     "pre",
-			event:    EventPreToolUse,
-			required: []string{"session_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "turn_id", "tool_name", "tool_use_id", "tool_input"},
-			payload:  officialFixture(EventPreToolUse),
-		},
-		{
-			name:     "permission",
-			event:    EventPermissionRequest,
-			required: []string{"session_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "turn_id", "tool_name", "tool_input"},
-			payload:  officialFixture(EventPermissionRequest),
-		},
-		{
-			name:     "post",
-			event:    EventPostToolUse,
-			required: []string{"session_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "turn_id", "tool_name", "tool_use_id", "tool_input", "tool_response"},
-			payload:  officialFixture(EventPostToolUse),
-		},
-	}
-	for _, tt := range tests {
-		for _, missing := range tt.required {
-			t.Run(tt.name+"/missing_"+missing, func(t *testing.T) {
-				payload := make(map[string]any, len(tt.payload))
-				for key, value := range tt.payload {
-					payload[key] = value
-				}
-				delete(payload, missing)
-				raw, err := json.Marshal(payload)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := Decode(raw, tt.event); !errors.Is(err, ErrInvalidPayload) {
-					t.Fatalf("Decode() error = %v, want invalid payload", err)
-				}
-			})
-		}
+	required := []string{"session_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "turn_id", "tool_name", "tool_use_id", "tool_input"}
+	fixture := officialFixture()
+	for _, missing := range required {
+		t.Run("missing_"+missing, func(t *testing.T) {
+			payload := make(map[string]any, len(fixture))
+			for key, value := range fixture {
+				payload[key] = value
+			}
+			delete(payload, missing)
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Decode(raw, EventPreToolUse); !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("Decode() error = %v, want invalid payload", err)
+			}
+		})
 	}
 }
 
@@ -302,7 +241,7 @@ func TestDecodeValidatesOfficialFieldTypes(t *testing.T) {
 		"turn id":         func(payload map[string]any) { payload["turn_id"] = 42 },
 	} {
 		t.Run(name, func(t *testing.T) {
-			payload := officialFixture(EventPreToolUse)
+			payload := officialFixture()
 			mutate(payload)
 			raw, err := json.Marshal(payload)
 			if err != nil {
@@ -316,7 +255,7 @@ func TestDecodeValidatesOfficialFieldTypes(t *testing.T) {
 }
 
 func TestDecodeAcceptsFuturePermissionModeWithinMetadataLimit(t *testing.T) {
-	payload := officialFixture(EventPreToolUse)
+	payload := officialFixture()
 	payload["permission_mode"] = "future-reviewed-mode"
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -376,7 +315,7 @@ func TestDestructiveToolMatcherHasOnlyCanonicalAmbientNames(t *testing.T) {
 }
 
 func TestDecodeRejectsOversizedMetadata(t *testing.T) {
-	payload := officialFixture(EventPreToolUse)
+	payload := officialFixture()
 	payload["permission_mode"] = strings.Repeat("x", maxMetadataBytes+1)
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -388,7 +327,7 @@ func TestDecodeRejectsOversizedMetadata(t *testing.T) {
 }
 
 func TestDecodeRejectsRelativeCWDForToolAndSessionEvents(t *testing.T) {
-	toolPayload := officialFixture(EventPreToolUse)
+	toolPayload := officialFixture()
 	toolPayload["cwd"] = "."
 	raw, _ := json.Marshal(toolPayload)
 	if _, err := Decode(raw, EventPreToolUse); err == nil {
@@ -405,25 +344,19 @@ func TestDecodeRejectsRelativeCWDForToolAndSessionEvents(t *testing.T) {
 	}
 }
 
-func officialFixture(event string) map[string]any {
-	payload := map[string]any{
+func officialFixture() map[string]any {
+	return map[string]any{
 		"session_id":      "session-1",
 		"transcript_path": nil,
 		"cwd":             "/workspace",
-		"hook_event_name": event,
+		"hook_event_name": EventPreToolUse,
 		"model":           "gpt-test",
 		"permission_mode": "default",
 		"turn_id":         "turn-1",
 		"tool_name":       "Bash",
+		"tool_use_id":     "call-1",
 		"tool_input":      map[string]any{"command": "true"},
 	}
-	if event != EventPermissionRequest {
-		payload["tool_use_id"] = "call-1"
-	}
-	if event == EventPostToolUse {
-		payload["tool_response"] = map[string]any{"output": "must not persist"}
-	}
-	return payload
 }
 
 func TestDecodeRejectsOversizedPayload(t *testing.T) {
@@ -431,13 +364,4 @@ func TestDecodeRejectsOversizedPayload(t *testing.T) {
 	if !errors.Is(err, ErrInvalidPayload) {
 		t.Fatalf("Decode() error = %v, want invalid payload", err)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

@@ -15,10 +15,8 @@ import (
 )
 
 const (
-	EventSessionStart      = "SessionStart"
-	EventPreToolUse        = "PreToolUse"
-	EventPermissionRequest = "PermissionRequest"
-	EventPostToolUse       = "PostToolUse"
+	EventSessionStart = "SessionStart"
+	EventPreToolUse   = "PreToolUse"
 
 	// DestructiveToolNames is the single canonical tool-name alternation used
 	// by Ward's ambient PreToolUse hook. Codex presents shell execution as Bash;
@@ -38,9 +36,8 @@ var (
 	ErrEventMismatch  = errors.New("Codex hook event mismatch")
 )
 
-// Payload is the stable subset of the Codex hook wire format used by Ward.
-// It intentionally omits tool_response so post-hook output cannot enter Ward's
-// canonical request or audit input.
+// Payload is the stable subset of the Codex PreToolUse hook wire format used
+// by Ward.
 type Payload struct {
 	SessionID      string          `json:"session_id"`
 	TranscriptPath json.RawMessage `json:"transcript_path"`
@@ -138,7 +135,7 @@ func DecodeSessionStart(data []byte) (SessionStartInvocation, error) {
 // tool input. Unknown top-level fields are deliberately accepted for forward
 // compatibility with Codex.
 func Decode(data []byte, expectedEvent string) (Invocation, error) {
-	if expectedEvent != EventPreToolUse && expectedEvent != EventPermissionRequest && expectedEvent != EventPostToolUse {
+	if expectedEvent != EventPreToolUse {
 		return Invocation{}, fmt.Errorf("%w: unsupported expected event %q", ErrInvalidPayload, expectedEvent)
 	}
 	if len(data) > MaxPayloadBytes {
@@ -163,7 +160,7 @@ func Decode(data []byte, expectedEvent string) (Invocation, error) {
 		return Invocation{}, fmt.Errorf("%w: multiple JSON values", ErrInvalidPayload)
 	}
 
-	if err := validateOfficialFields(fields, payload, expectedEvent); err != nil {
+	if err := validateOfficialFields(fields, payload); err != nil {
 		return Invocation{}, err
 	}
 	if payload.HookEventName != expectedEvent {
@@ -194,7 +191,7 @@ func Decode(data []byte, expectedEvent string) (Invocation, error) {
 	}, nil
 }
 
-func validateOfficialFields(fields map[string]json.RawMessage, payload Payload, expectedEvent string) error {
+func validateOfficialFields(fields map[string]json.RawMessage, payload Payload) error {
 	for _, key := range []string{"session_id", "cwd", "hook_event_name", "model", "permission_mode", "turn_id", "tool_name", "tool_input", "transcript_path"} {
 		if _, exists := fields[key]; !exists {
 			return fmt.Errorf("%w: %s is required", ErrInvalidPayload, key)
@@ -222,18 +219,11 @@ func validateOfficialFields(fields map[string]json.RawMessage, payload Payload, 
 	if len(bytes.TrimSpace(payload.ToolInput)) == 0 || bytes.Equal(bytes.TrimSpace(payload.ToolInput), []byte("null")) {
 		return fmt.Errorf("%w: tool_input is required", ErrInvalidPayload)
 	}
-	if expectedEvent != EventPermissionRequest {
-		if _, exists := fields["tool_use_id"]; !exists || strings.TrimSpace(payload.ToolUseID) == "" {
-			return fmt.Errorf("%w: tool_use_id is required for %s", ErrInvalidPayload, expectedEvent)
-		}
-		if len(payload.ToolUseID) > maxMetadataBytes {
-			return fmt.Errorf("%w: tool_use_id exceeds metadata size limit", ErrInvalidPayload)
-		}
+	if _, exists := fields["tool_use_id"]; !exists || strings.TrimSpace(payload.ToolUseID) == "" {
+		return fmt.Errorf("%w: tool_use_id is required for %s", ErrInvalidPayload, EventPreToolUse)
 	}
-	if expectedEvent == EventPostToolUse {
-		if _, exists := fields["tool_response"]; !exists {
-			return fmt.Errorf("%w: tool_response is required for %s", ErrInvalidPayload, expectedEvent)
-		}
+	if len(payload.ToolUseID) > maxMetadataBytes {
+		return fmt.Errorf("%w: tool_use_id exceeds metadata size limit", ErrInvalidPayload)
 	}
 	return nil
 }

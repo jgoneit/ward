@@ -11,8 +11,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strings"
 
 	"github.com/jgoneit/ward/internal/audit"
@@ -741,28 +739,4 @@ func removeEmptyHooksObject(raw []byte) ([]byte, error) {
 func digest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-// credentialPathsDigest remains for v1 journal fixtures and migration only.
-func credentialPathsDigest(files, directories []string) string {
-	normalized := make([]string, 0, len(files)+len(directories))
-	seen := map[string]struct{}{}
-	appendNormalized := func(kind string, candidates []string) {
-		for _, candidate := range candidates {
-			clean := filepath.Clean(candidate)
-			if runtime.GOOS == "windows" {
-				clean = strings.ToLower(clean)
-			}
-			clean = kind + "\x00" + clean
-			if _, exists := seen[clean]; !exists {
-				seen[clean] = struct{}{}
-				normalized = append(normalized, clean)
-			}
-		}
-	}
-	appendNormalized("file", files)
-	appendNormalized("directory", directories)
-	sort.Strings(normalized)
-	encoded, _ := json.Marshal(normalized)
-	return digest(append([]byte("ward-credential-paths/v1\x00"), encoded...))
 }

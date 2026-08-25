@@ -334,11 +334,5 @@ func CleanPaths(paths Paths) Paths {
 	paths.BinaryPath = filepath.Clean(paths.BinaryPath)
 	paths.UserPolicyPath = filepath.Clean(paths.UserPolicyPath)
 	paths.StateDir = filepath.Clean(paths.StateDir)
-	for index := range paths.CredentialFiles {
-		paths.CredentialFiles[index] = filepath.Clean(paths.CredentialFiles[index])
-	}
-	for index := range paths.CredentialDirectories {
-		paths.CredentialDirectories[index] = filepath.Clean(paths.CredentialDirectories[index])
-	}
 	return paths
 }

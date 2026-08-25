@@ -22,12 +22,6 @@ type UserPaths struct {
 	ConfigFile string
 	HooksFile  string
 	PolicyFile string
-	// CredentialFiles and CredentialDirectories are retained for source
-	// compatibility with v1 callers. The ambient kernel deliberately leaves
-	// HOME auth stores to Host permissions, so Resolve never populates them.
-	CredentialFiles           []string
-	CredentialDirectories     []string
-	CredentialPathsIncomplete bool
 }
 
 func ResolveUser() (UserPaths, error) {
