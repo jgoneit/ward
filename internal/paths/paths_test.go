@@ -48,8 +48,12 @@ func TestResolveLeavesHomeAuthStoresToHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.CredentialFiles) != 0 || len(got.CredentialDirectories) != 0 || got.CredentialPathsIncomplete {
-		t.Fatalf("ambient paths captured Host auth stores: %#v", got)
+	want, err := Resolve(Environment{GOOS: "linux", Home: home, Getenv: func(string) string { return "" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("Host auth environment changed ambient paths: got=%#v want=%#v", got, want)
 	}
 }
 

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -357,7 +358,17 @@ func TestDecodeJournalRejectsDuplicateAuthorityFields(t *testing.T) {
 	}
 }
 
+type legacyV1CredentialPaths struct {
+	files       []string
+	directories []string
+}
+
 func writeV1Installation(t *testing.T, options Options, originalConfig, originalHooks []byte) {
+	t.Helper()
+	writeV1InstallationWithCredentialPaths(t, options, originalConfig, originalHooks, legacyV1CredentialPaths{})
+}
+
+func writeV1InstallationWithCredentialPaths(t *testing.T, options Options, originalConfig, originalHooks []byte, credentialPaths legacyV1CredentialPaths) {
 	t.Helper()
 	writeExecutable(t, options.Paths.BinaryPath)
 	newline := detectNewline(originalConfig)
@@ -391,7 +402,7 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 			prefix = newline + newline
 		}
 	}
-	profile := []byte(prefix + legacyV1FixtureProfileBody(t, newline, options, networkEnabled))
+	profile := []byte(prefix + legacyV1FixtureProfileBody(t, newline, options, networkEnabled, credentialPaths))
 	edits.ProfileAppend = profile
 	working = append(working, profile...)
 	hooks := legacyHooksFixture(t, options.Paths.BinaryPath, originalHooks)
@@ -406,7 +417,7 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 		HooksObjectOriginallyAbsent: hooksObjectAbsent(originalHooks),
 		ConfigOriginallyAbsent:      originalConfig == nil,
 		ConfigEdits:                 edits, HooksDigest: digest(hooks), ConfigDigest: digest(working),
-		CredentialPathsDigest: credentialPathsDigest(nil, nil),
+		CredentialPathsDigest: credentialPathsDigest(credentialPaths.files, credentialPaths.directories),
 	}
 	raw, err := encodeJournal(journal)
 	if err != nil {
@@ -423,7 +434,7 @@ func writeV1Installation(t *testing.T, options Options, originalConfig, original
 // frozen generator-owned prefix/workspace rules. Keeping synthetic fixtures on
 // the real historical grammar prevents permissive validators from passing on
 // abbreviated test-only profiles.
-func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, networkEnabled bool) string {
+func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, networkEnabled bool, credentialPaths legacyV1CredentialPaths) string {
 	t.Helper()
 	frozen, err := os.ReadFile(filepath.Join("testdata", "frozen-v1", "config.toml"))
 	if err != nil {
@@ -453,11 +464,11 @@ func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, n
 	}
 
 	boundaries := legacyV1KnownBoundaryDirectories(options.Paths)
-	seenBoundaries := make(map[string]struct{}, len(boundaries)+len(options.Paths.CredentialDirectories))
+	seenBoundaries := make(map[string]struct{}, len(boundaries)+len(credentialPaths.directories))
 	for _, value := range boundaries {
 		seenBoundaries[value] = struct{}{}
 	}
-	for _, value := range options.Paths.CredentialDirectories {
+	for _, value := range credentialPaths.directories {
 		value = filepath.Clean(value)
 		if value == "." || value == "" {
 			continue
@@ -475,11 +486,11 @@ func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, n
 		dynamic.WriteString(strconv.Quote(value) + ` = "read"` + "\n")
 	}
 	protected := legacyV1KnownProtectedPaths(options.Paths)
-	seenProtected := make(map[string]struct{}, len(protected)+len(options.Paths.CredentialFiles))
+	seenProtected := make(map[string]struct{}, len(protected)+len(credentialPaths.files))
 	for _, value := range protected {
 		seenProtected[value] = struct{}{}
 	}
-	for _, value := range options.Paths.CredentialFiles {
+	for _, value := range credentialPaths.files {
 		if value == "" {
 			continue
 		}
@@ -503,6 +514,32 @@ func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, n
 		body = strings.ReplaceAll(body, "\n", newline)
 	}
 	return body
+}
+
+// credentialPathsDigest reproduces the frozen v1 journal field for migration
+// fixtures. Production v2 integrations neither discover nor persist credential
+// paths; the migration reader validates this legacy value by format only.
+func credentialPathsDigest(files, directories []string) string {
+	normalized := make([]string, 0, len(files)+len(directories))
+	seen := map[string]struct{}{}
+	appendNormalized := func(kind string, candidates []string) {
+		for _, candidate := range candidates {
+			clean := filepath.Clean(candidate)
+			if runtime.GOOS == "windows" {
+				clean = strings.ToLower(clean)
+			}
+			clean = kind + "\x00" + clean
+			if _, exists := seen[clean]; !exists {
+				seen[clean] = struct{}{}
+				normalized = append(normalized, clean)
+			}
+		}
+	}
+	appendNormalized("file", files)
+	appendNormalized("directory", directories)
+	sort.Strings(normalized)
+	encoded, _ := json.Marshal(normalized)
+	return digest(append([]byte("ward-credential-paths/v1\x00"), encoded...))
 }
 
 func fixtureOptions(t *testing.T) Options {

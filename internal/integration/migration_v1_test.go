@@ -708,11 +708,12 @@ func TestV1MigrationAcceptsHistoricalPOSIXPathsWithHashAndLiteralBackslash(t *te
 			t.Fatalf("historical POSIX path rejected: %q", candidate)
 		}
 	}
-	options.Paths.CredentialDirectories = []string{credentialRoot}
-	options.Paths.CredentialFiles = []string{credentialFile}
 	originalConfig := []byte("approval_policy = \"never\"\n")
 	originalHooks := []byte("{\n  \"description\": \"historical POSIX path characters\"\n}\n")
-	writeV1Installation(t, options, originalConfig, originalHooks)
+	writeV1InstallationWithCredentialPaths(t, options, originalConfig, originalHooks, legacyV1CredentialPaths{
+		files:       []string{credentialFile},
+		directories: []string{credentialRoot},
+	})
 
 	result, err := Install(options)
 	if err != nil || !result.Changed {

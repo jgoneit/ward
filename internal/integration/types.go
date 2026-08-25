@@ -25,19 +25,15 @@ var (
 // and StateDir are written into generated configuration, so all must be
 // absolute. Tests should always use temporary paths.
 type Paths struct {
-	HomeDir                   string
-	HooksFile                 string
-	ConfigFile                string
-	BinaryPath                string
-	UserPolicyPath            string
-	StateDir                  string
-	CredentialFiles           []string
-	CredentialDirectories     []string
-	CredentialPathsIncomplete bool
+	HomeDir        string
+	HooksFile      string
+	ConfigFile     string
+	BinaryPath     string
+	UserPolicyPath string
+	StateDir       string
 	// Topology flags are computed by the CLI for the project Doctor is
 	// diagnosing. They do not describe every ancestor below the user home.
-	CredentialTopologyIncomplete bool
-	StateTopologyIncomplete      bool
+	StateTopologyIncomplete bool
 	// ControlTopologyIncomplete is set by the caller when a project-writable
 	// ancestor can relocate Ward's dedicated config/hooks/binary anchors.
 	ControlTopologyIncomplete bool

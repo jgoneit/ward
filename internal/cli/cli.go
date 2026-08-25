@@ -443,15 +443,12 @@ func integrationOptions(migrate, dryRun bool) (integration.Options, error) {
 	}
 	return integration.Options{
 		Paths: integration.Paths{
-			HomeDir:                   userPaths.HomeDir,
-			HooksFile:                 userPaths.HooksFile,
-			ConfigFile:                userPaths.ConfigFile,
-			BinaryPath:                binary,
-			UserPolicyPath:            userPaths.PolicyFile,
-			StateDir:                  stateDir,
-			CredentialFiles:           append([]string(nil), userPaths.CredentialFiles...),
-			CredentialDirectories:     append([]string(nil), userPaths.CredentialDirectories...),
-			CredentialPathsIncomplete: userPaths.CredentialPathsIncomplete,
+			HomeDir:        userPaths.HomeDir,
+			HooksFile:      userPaths.HooksFile,
+			ConfigFile:     userPaths.ConfigFile,
+			BinaryPath:     binary,
+			UserPolicyPath: userPaths.PolicyFile,
+			StateDir:       stateDir,
 		},
 		ProfileName:        integration.DefaultProfileName,
 		MigratePermissions: migrate,
