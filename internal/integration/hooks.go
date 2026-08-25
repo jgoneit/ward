@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	hookTimeoutSeconds  = 2
-	sessionStartMatcher = `^(?:startup|resume|clear)$`
-	legacyAllMatcher    = "*"
+	hookTimeoutSeconds           = 2
+	sessionStartMatcher          = `^(?:startup|resume|clear)$`
+	legacyAllMatcher             = "*"
+	legacyEventPermissionRequest = "PermissionRequest"
+	legacyEventPostToolUse       = "PostToolUse"
 )
 
 type hookSpec struct {
@@ -39,8 +41,8 @@ type legacyHookSpec struct {
 // removal-only: v2 never installs PermissionRequest or PostToolUse.
 var legacyWardHookSpecs = []legacyHookSpec{
 	{Event: codexadapter.EventPreToolUse, Subcommand: "codex-pre-tool-use", StatusMessage: "Ward: evaluating tool request"},
-	{Event: codexadapter.EventPermissionRequest, Subcommand: "codex-permission-request", StatusMessage: "Ward: evaluating permission request"},
-	{Event: codexadapter.EventPostToolUse, Subcommand: "codex-post-tool-use", StatusMessage: "Ward: recording tool result"},
+	{Event: legacyEventPermissionRequest, Subcommand: "codex-permission-request", StatusMessage: "Ward: evaluating permission request"},
+	{Event: legacyEventPostToolUse, Subcommand: "codex-post-tool-use", StatusMessage: "Ward: recording tool result"},
 }
 
 func mergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
@@ -353,7 +355,7 @@ func looksLikeWardHookCommand(command string) bool {
 }
 
 func managedHookEvents() []string {
-	return []string{codexadapter.EventSessionStart, codexadapter.EventPreToolUse, codexadapter.EventPermissionRequest, codexadapter.EventPostToolUse}
+	return []string{codexadapter.EventSessionStart, codexadapter.EventPreToolUse, legacyEventPermissionRequest, legacyEventPostToolUse}
 }
 
 func decodeHookRoot(original []byte) (map[string]json.RawMessage, map[string]json.RawMessage, error) {

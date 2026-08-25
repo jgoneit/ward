@@ -18,7 +18,7 @@ func TestUnknownHostedAndReadOnlyMCPToolsDefer(t *testing.T) {
 		"filesystem search": "mcp__filesystem__search_files",
 	} {
 		t.Run(name, func(t *testing.T) {
-			payload := officialFixture(EventPreToolUse)
+			payload := officialFixture()
 			payload["tool_name"] = tool
 			payload["tool_input"] = map[string]any{"path": ".env"}
 			raw, _ := jsonMarshal(payload)
@@ -35,7 +35,7 @@ func TestUnknownHostedAndReadOnlyMCPToolsDefer(t *testing.T) {
 
 func TestOfficialFilesystemDeleteOfGitMetadataDenies(t *testing.T) {
 	engine := adapterEvaluator(t, "/workspace")
-	payload := officialFixture(EventPreToolUse)
+	payload := officialFixture()
 	payload["tool_name"] = "mcp__filesystem__delete_file"
 	payload["tool_input"] = map[string]any{"path": "/workspace/.git/config"}
 	raw, _ := jsonMarshal(payload)
@@ -78,7 +78,7 @@ func TestStructuredDeleteUsesOnlyReviewedTargetRole(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			payload := officialFixture(EventPreToolUse)
+			payload := officialFixture()
 			payload["tool_name"] = "mcp__filesystem__delete_file"
 			payload["tool_input"] = test.toolInput
 			raw, _ := jsonMarshal(payload)

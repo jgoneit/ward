@@ -22,26 +22,13 @@ func TestOutputPreToolUseDenyUsesOnlyCanonicalDeny(t *testing.T) {
 	}
 }
 
-func TestOutputPermissionRequestDenyDoesNotApprove(t *testing.T) {
-	out, err := Output(EventPermissionRequest, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny})
+func TestOutputDeferIsExactlyNoStdout(t *testing.T) {
+	out, err := Output(EventPreToolUse, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDefer})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertJSONValue(t, out, []string{"hookSpecificOutput", "decision", "behavior"}, "deny")
-	if strings.Contains(string(out), "allow") || strings.Contains(string(out), "ask") {
-		t.Fatalf("permission output can bypass approval: %s", out)
-	}
-}
-
-func TestOutputDeferIsExactlyNoStdout(t *testing.T) {
-	for _, event := range []string{EventPreToolUse, EventPermissionRequest, EventPostToolUse} {
-		out, err := Output(event, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDefer})
-		if err != nil {
-			t.Fatalf("Output(%s) error = %v", event, err)
-		}
-		if len(out) != 0 {
-			t.Fatalf("Output(%s) = %q, want no stdout", event, out)
-		}
+	if len(out) != 0 {
+		t.Fatalf("Output() = %q, want no stdout", out)
 	}
 }
 
@@ -53,25 +40,19 @@ func TestOutputEvaluatorErrorIsExactlyNoStdout(t *testing.T) {
 		Reason:    "SECRET VALUE",
 		ErrorCode: "details",
 	}
-	for _, event := range []string{EventPreToolUse, EventPermissionRequest} {
-		out, err := Output(event, decision)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Fatalf("error output = %q, want no stdout", out)
-		}
+	out, err := Output(EventPreToolUse, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("error output = %q, want no stdout", out)
 	}
 }
 
-func TestOutputPostToolUseNeverBlocks(t *testing.T) {
-	for _, outcome := range []contract.Outcome{contract.OutcomeDeny, contract.OutcomeDefer, contract.OutcomeError} {
-		out, err := Output(EventPostToolUse, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: outcome})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Fatalf("post output for %s = %s, want empty", outcome, out)
+func TestOutputRejectsUnsupportedEvent(t *testing.T) {
+	for _, event := range []string{"PermissionRequest", "PostToolUse"} {
+		if _, err := Output(event, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDefer}); err == nil {
+			t.Fatalf("Output() accepted unsupported event %q", event)
 		}
 	}
 }
@@ -112,15 +93,6 @@ func TestOutputDenyIncludesValidatedRuleRecovery(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "WARD_DESTRUCTIVE_GIT") || !strings.Contains(string(out), recovery) {
 		t.Fatalf("validated recovery missing: %s", out)
-	}
-}
-
-func TestStaticDenyCompatibilityPathIsNoStdout(t *testing.T) {
-	for _, event := range []string{EventPreToolUse, EventPermissionRequest, EventPostToolUse} {
-		out, err := StaticDeny(event)
-		if err != nil || len(out) != 0 {
-			t.Fatalf("StaticDeny(%s) = %q, %v", event, out, err)
-		}
 	}
 }
 

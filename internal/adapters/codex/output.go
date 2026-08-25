@@ -25,11 +25,7 @@ var (
 // slice means the hook must write nothing. Ward intentionally never emits
 // Codex allow, ask, updatedInput, or approval-bypass output.
 func Output(event string, decision contract.Decision) ([]byte, error) {
-	if event == EventPostToolUse {
-		// A post hook cannot undo side effects. Ward treats it as audit-only.
-		return nil, nil
-	}
-	if event != EventPreToolUse && event != EventPermissionRequest {
+	if event != EventPreToolUse {
 		return nil, fmt.Errorf("unsupported Codex hook event %q", event)
 	}
 	if decision.Schema != contract.DecisionSchemaV1 {
@@ -40,21 +36,12 @@ func Output(event string, decision contract.Decision) ([]byte, error) {
 	case contract.OutcomeDefer:
 		return nil, nil
 	case contract.OutcomeDeny:
-		return marshalDeny(event, policyMessage(decision.RuleID, decision.Recovery))
+		return marshalDeny(policyMessage(decision.RuleID, decision.Recovery))
 	case contract.OutcomeError:
 		return nil, nil
 	default:
 		return nil, nil
 	}
-}
-
-// StaticDeny is retained for CLI source compatibility. Runtime adapter errors
-// must not invent a permission decision, so it now produces exactly no stdout.
-func StaticDeny(event string) ([]byte, error) {
-	if event == EventPostToolUse || event == EventPreToolUse || event == EventPermissionRequest {
-		return nil, nil
-	}
-	return nil, fmt.Errorf("unsupported Codex hook event %q", event)
 }
 
 // SessionStartHealthOutput emits no bytes for a healthy installation. For an
@@ -115,31 +102,14 @@ func staticRecovery(ruleID, candidate string) string {
 	return "Use a narrower recoverable operation."
 }
 
-func marshalDeny(event, message string) ([]byte, error) {
-	var value any
-	switch event {
-	case EventPreToolUse:
-		value = preToolUseOutput{
-			HookSpecificOutput: preToolUseSpecific{
-				HookEventName:            EventPreToolUse,
-				PermissionDecision:       "deny",
-				PermissionDecisionReason: message,
-			},
-		}
-	case EventPermissionRequest:
-		value = permissionRequestOutput{
-			HookSpecificOutput: permissionRequestSpecific{
-				HookEventName: EventPermissionRequest,
-				Decision: permissionRequestDecision{
-					Behavior: "deny",
-					Message:  message,
-				},
-			},
-		}
-	default:
-		return nil, fmt.Errorf("unsupported Codex hook event %q", event)
-	}
-	return json.Marshal(value)
+func marshalDeny(message string) ([]byte, error) {
+	return json.Marshal(preToolUseOutput{
+		HookSpecificOutput: preToolUseSpecific{
+			HookEventName:            EventPreToolUse,
+			PermissionDecision:       "deny",
+			PermissionDecisionReason: message,
+		},
+	})
 }
 
 type preToolUseOutput struct {
@@ -150,18 +120,4 @@ type preToolUseSpecific struct {
 	HookEventName            string `json:"hookEventName"`
 	PermissionDecision       string `json:"permissionDecision"`
 	PermissionDecisionReason string `json:"permissionDecisionReason"`
-}
-
-type permissionRequestOutput struct {
-	HookSpecificOutput permissionRequestSpecific `json:"hookSpecificOutput"`
-}
-
-type permissionRequestSpecific struct {
-	HookEventName string                    `json:"hookEventName"`
-	Decision      permissionRequestDecision `json:"decision"`
-}
-
-type permissionRequestDecision struct {
-	Behavior string `json:"behavior"`
-	Message  string `json:"message"`
 }
