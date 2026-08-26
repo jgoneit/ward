@@ -47,7 +47,7 @@ if (Test-Path -LiteralPath $binary) {
         else {
             $hooksText = Get-Content -Raw -LiteralPath $hooksFile
             $escapedBinary = $binary.Replace('\', '\\')
-            $wardRefs = $hooksText.Contains($binary) -or $hooksText.Contains($escapedBinary) -or $hooksText -match 'hook codex-(session-start|pre-tool-use)'
+            $wardRefs = $hooksText.Contains($binary) -or $hooksText.Contains($escapedBinary) -or $hooksText -match 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)'
         }
     }
     if (Test-Path -LiteralPath $configFile) {

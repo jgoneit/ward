@@ -56,7 +56,7 @@ else
 	if [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; then
 		ward_refs=1
 	elif [ -f "$hooks_file" ]; then
-		if LC_ALL=C grep -Fq "$binary" "$hooks_file" || LC_ALL=C grep -Eq 'hook codex-(session-start|pre-tool-use)' "$hooks_file"; then
+		if LC_ALL=C grep -Fq "$binary" "$hooks_file" || LC_ALL=C grep -Eq 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)' "$hooks_file"; then
 			ward_refs=1
 		fi
 	fi

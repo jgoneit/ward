@@ -58,7 +58,22 @@ try {
     if (Test-Path -LiteralPath $testJournal) { throw 'Ward binary-only uninstall test: integration journal was created' }
     if (Test-Path -LiteralPath $testStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
 
-    Write-Output 'PASS: Windows binary-only uninstall removed only the Ward binary'
+    $legacyHooksBytes = ([System.Text.UTF8Encoding]::new($false)).GetBytes('{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"ward.exe hook codex-post-tool-use","timeout":10}]}]}}')
+    [System.IO.File]::WriteAllBytes($testHooks, $legacyHooksBytes)
+    $legacyOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
+    $legacyExitCode = $LASTEXITCODE
+    if ($legacyExitCode -eq 0) {
+        throw 'Ward binary-only uninstall test: missing binary ignored a legacy Ward hook'
+    }
+    $legacyHooksAfter = [System.IO.File]::ReadAllBytes($testHooks)
+    if ([Convert]::ToBase64String($legacyHooksBytes) -cne [Convert]::ToBase64String($legacyHooksAfter)) {
+        throw 'Ward binary-only uninstall test: legacy hook bytes changed'
+    }
+    if (($legacyOutput -join [Environment]::NewLine) -notmatch 'Ward hook or config references remain') {
+        throw "Ward binary-only uninstall test: legacy refusal was not reported: $($legacyOutput -join [Environment]::NewLine)"
+    }
+
+    Write-Output 'PASS: Windows binary-only uninstall preserved config and detected legacy hooks'
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) {
