@@ -1,6 +1,6 @@
 {
   "name": "ward",
-  "version": "0.1.0-dev.0+codex.20260825135512",
+  "version": "0.1.0-dev.0+codex.20260826144318",
   "description": "Recover from Ward denials and inspect its ambient Codex safety kernel.",
   "author": {
     "name": "jgoneit"
@@ -13,6 +13,6 @@
     "developerName": "jgoneit",
     "category": "Developer Tools",
     "capabilities": [],
-    "defaultPrompt": "Recover safely from a Ward denial or explain a Ward session-health warning. Stay silent for ordinary deferred requests, and run Doctor or audit checks only through an already-authorized Host path."
+    "defaultPrompt": "Recover safely from a Ward denial or explain a Ward session-health warning. Stay silent for ordinary deferred requests, and run Doctor only through an already-authorized Host path."
   }
 }

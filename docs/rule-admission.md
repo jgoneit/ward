@@ -10,6 +10,5 @@ A new default deny must satisfy every condition:
 5. The candidate first remains conformance-only during real Task burn-in.
 6. Burn-in demonstrates defensive value with zero unresolved false deny.
 
-Otherwise it stays `defer`. Ambient runtime audit is intentionally not an
-audit-only rule engine: it records only actual deny and attributable error.
-Harness Legacy cases are an attack corpus, not inherited policy.
+Otherwise it stays `defer`. Ward does not provide a record-only rule mode and
+does not persist Hook outcomes.

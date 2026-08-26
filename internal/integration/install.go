@@ -3,7 +3,6 @@ package integration
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,13 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jgoneit/ward/internal/audit"
+	"github.com/jgoneit/ward/internal/securefs"
 )
 
-const (
-	journalSchemaV1 = "ward-integration-journal/v1"
-	journalSchemaV2 = "ward-integration-journal/v2"
-)
+const journalSchemaV3 = "ward-integration-journal/v3"
 
 // writeAtomically is a package seam for deterministic transaction-failure
 // tests. Production code always uses atomicWrite. Metadata is captured before
@@ -36,13 +32,10 @@ type integrationJournal struct {
 	ConfigEdits                 configEdits `json:"config_edits"`
 	HooksDigest                 string      `json:"hooks_digest"`
 	ConfigDigest                string      `json:"config_digest"`
-	// CredentialPathsDigest is retained only to decode and uninstall v1.
-	CredentialPathsDigest string `json:"credential_paths_digest,omitempty"`
 }
 
-// Install merges Ward into explicitly supplied user-scope fixture paths. A v1
-// journal is upgraded in-place through an exact uninstall/reinstall transform;
-// any failed write rolls back to the complete pre-call snapshot.
+// Install merges Ward into explicitly supplied user-scope paths. Existing
+// development-version journals are intentionally unsupported.
 func Install(options Options) (Result, error) {
 	result := baseResult(options)
 	if err := validateInstallEnvironment(options); err != nil {
@@ -58,13 +51,10 @@ func Install(options Options) (Result, error) {
 		if err != nil {
 			return result, err
 		}
-		if journal.BinaryPath != filepath.Clean(options.Paths.BinaryPath) || journal.ProfileName != options.profileName() {
+		if journal.BinaryPath != filepath.Clean(options.Paths.BinaryPath) || journal.ProfileName != DefaultProfileName {
 			return result, fmt.Errorf("%w: existing journal belongs to a different Ward integration", ErrConflict)
 		}
-		if journal.Schema == journalSchemaV1 {
-			return migrateV1(options, journal)
-		}
-		report := Doctor(Options{Paths: options.Paths, ProfileName: options.ProfileName})
+		report := Doctor(Options{Paths: options.Paths})
 		if !report.Healthy {
 			return result, fmt.Errorf("%w: existing Ward installation is unhealthy", ErrConflict)
 		}
@@ -90,7 +80,7 @@ func Install(options Options) (Result, error) {
 	if !hooksChanged || !configChanged {
 		return result, fmt.Errorf("%w: orphaned Ward integration markers", ErrConflict)
 	}
-	journalAfter, err := encodeJournal(newV2Journal(options, edits, hooksAfter, configAfter, !hooksExists, hooksObjectAbsent(hooksBefore), !configExists))
+	journalAfter, err := encodeJournal(newV3Journal(options, edits, hooksAfter, configAfter, !hooksExists, hooksObjectAbsent(hooksBefore), !configExists))
 	if err != nil {
 		return result, err
 	}
@@ -112,103 +102,7 @@ func Install(options Options) (Result, error) {
 	return result, nil
 }
 
-func migrateV1(options Options, journal integrationJournal) (Result, error) {
-	result := baseResult(options)
-	hooksBefore, hooksExists, err := readOptional(options.Paths.HooksFile)
-	if err != nil {
-		return result, err
-	}
-	configBefore, configExists, err := readOptional(options.Paths.ConfigFile)
-	if err != nil {
-		return result, err
-	}
-	if !hooksExists || !configExists {
-		return result, fmt.Errorf("%w: v1 integration file is missing", ErrConflict)
-	}
-	baseHooks, baseConfig, err := validateAndRemoveV1Integration(options.Paths, journal, hooksBefore, configBefore)
-	if err != nil {
-		return result, err
-	}
-	migrationOptions := options
-	if len(journal.ConfigEdits.SandboxOriginal) > 0 {
-		migrationOptions.MigratePermissions = true
-	}
-	hooksAfter, hooksChanged, err := mergeHooks(baseHooks, journal.BinaryPath)
-	if err != nil || !hooksChanged {
-		if err == nil {
-			err = fmt.Errorf("%w: v2 hooks were not produced", ErrConflict)
-		}
-		return result, err
-	}
-	configAfter, edits, configChanged, err := installConfigForV1Migration(baseConfig, migrationOptions, journal.ConfigEdits)
-	if err != nil || !configChanged {
-		if err == nil {
-			err = fmt.Errorf("%w: v2 config was not produced", ErrConflict)
-		}
-		return result, err
-	}
-	updated := newV2Journal(options, edits, hooksAfter, configAfter, journal.HooksOriginallyAbsent, journal.HooksObjectOriginallyAbsent, journal.ConfigOriginallyAbsent)
-	journalAfter, err := encodeJournal(updated)
-	if err != nil {
-		return result, err
-	}
-	result.HooksChanged, result.ConfigChanged, result.JournalChanged, result.Changed = true, true, true, true
-	if options.DryRun {
-		return result, nil
-	}
-	mutations := []fileMutation{
-		{Path: options.Paths.journalFile(), Data: journalAfter, Present: true, Mode: existingMode(options.Paths.journalFile(), 0o600), Label: "Ward integration journal"},
-		{Path: options.Paths.ConfigFile, Data: configAfter, Present: true, Mode: existingMode(options.Paths.ConfigFile, 0o600), Label: "Codex config"},
-		{Path: options.Paths.HooksFile, Data: hooksAfter, Present: true, Mode: existingMode(options.Paths.HooksFile, 0o600), Label: "Codex hooks"},
-	}
-	if err := applyMutations(mutations, options.Paths.journalFile()); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-// validateAndRemoveV1Integration is the common, mutation-free ownership gate
-// for both migration and direct uninstall. A v1 journal bound the complete
-// hooks/config files, so no semantic fallback is safe after either file or the
-// journal has changed.
-func validateAndRemoveV1Integration(paths Paths, journal integrationJournal, hooksBefore, configBefore []byte) ([]byte, []byte, error) {
-	if digest(hooksBefore) != journal.HooksDigest || digest(configBefore) != journal.ConfigDigest {
-		return nil, nil, fmt.Errorf("%w: v1 integration bytes do not match the journal", ErrConflict)
-	}
-	baseHooks, removedHooks, err := unmergeLegacyHooksExact(hooksBefore, journal.BinaryPath)
-	if err != nil || !removedHooks {
-		if err == nil {
-			err = fmt.Errorf("%w: v1 Ward hooks are missing", ErrConflict)
-		}
-		return nil, nil, err
-	}
-	if journal.HooksOriginallyAbsent && !journal.HooksObjectOriginallyAbsent {
-		return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
-	}
-	if journal.HooksObjectOriginallyAbsent {
-		_, baseHookMap, err := decodeHookRoot(baseHooks)
-		if err != nil || len(baseHookMap) != 0 {
-			return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
-		}
-	}
-	if journal.HooksOriginallyAbsent && !hooksJSONIsEmpty(baseHooks) {
-		return nil, nil, fmt.Errorf("%w: v1 hook history is inconsistent", ErrConflict)
-	}
-
-	baseConfig, removedConfig, err := uninstallV1ConfigExact(configBefore, journal.ConfigEdits, journal.ProfileName, paths)
-	if err != nil || !removedConfig {
-		if err == nil {
-			err = fmt.Errorf("%w: v1 Ward config is missing", ErrConflict)
-		}
-		return nil, nil, err
-	}
-	if journal.ConfigOriginallyAbsent && len(baseConfig) != 0 {
-		return nil, nil, fmt.Errorf("%w: v1 config history is inconsistent", ErrConflict)
-	}
-	return baseHooks, baseConfig, nil
-}
-
-// Uninstall removes only exact Ward-owned v1 or v2 bytes and restores the
+// Uninstall removes only exact Ward-owned v3 bytes and restores the
 // original permission authority byte-for-byte.
 func Uninstall(options Options) (Result, error) {
 	result := baseResult(options)
@@ -241,7 +135,7 @@ func Uninstall(options Options) (Result, error) {
 		if inspectErr != nil {
 			return result, fmt.Errorf("%w: hooks could not be classified without the ownership journal", ErrConflict)
 		}
-		wardConfig, inspectErr := hasWardConfigReferences(configRaw, options.profileName(), options.Paths.BinaryPath)
+		wardConfig, inspectErr := hasWardConfigReferences(configRaw, DefaultProfileName, options.Paths.BinaryPath)
 		if inspectErr != nil {
 			return result, fmt.Errorf("%w: config could not be classified without the ownership journal", ErrConflict)
 		}
@@ -257,7 +151,7 @@ func Uninstall(options Options) (Result, error) {
 	if err != nil {
 		return result, err
 	}
-	if journal.ProfileName != options.profileName() || filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
+	if journal.ProfileName != DefaultProfileName || filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
 		return result, fmt.Errorf("%w: integration identity differs from journal", ErrConflict)
 	}
 	hooksBefore, hooksExists, err := readOptional(options.Paths.HooksFile)
@@ -271,16 +165,11 @@ func Uninstall(options Options) (Result, error) {
 	if !hooksExists || !configExists {
 		return result, fmt.Errorf("%w: installed Codex integration file is missing", ErrConflict)
 	}
-	var hooksAfter, configAfter []byte
-	var hooksChanged, configChanged bool
-	if journal.Schema == journalSchemaV1 {
-		hooksAfter, configAfter, err = validateAndRemoveV1Integration(options.Paths, journal, hooksBefore, configBefore)
-		hooksChanged, configChanged = err == nil, err == nil
-	} else {
-		hooksAfter, hooksChanged, err = unmergeHooks(hooksBefore, journal.BinaryPath)
-		if err == nil {
-			configAfter, configChanged, err = uninstallConfig(configBefore, journal.ConfigEdits)
-		}
+	hooksAfter, hooksChanged, err := unmergeHooks(hooksBefore, journal.BinaryPath)
+	var configAfter []byte
+	var configChanged bool
+	if err == nil {
+		configAfter, configChanged, err = uninstallConfig(configBefore, journal.ConfigEdits)
 	}
 	if err != nil {
 		return result, err
@@ -319,17 +208,12 @@ func validateInstallEnvironment(options Options) error {
 	if err := validateStateDir(options.Paths.StateDir); err != nil {
 		return err
 	}
-	if _, exists, err := readOptional(options.Paths.UserPolicyPath); err != nil {
-		return err
-	} else if exists {
-		return fmt.Errorf("%w: additive user policy is incompatible with the ambient kernel", ErrConflict)
-	}
 	return nil
 }
 
-func newV2Journal(options Options, edits configEdits, hooks, config []byte, hooksAbsent, hooksObjectWasAbsent, configAbsent bool) integrationJournal {
+func newV3Journal(options Options, edits configEdits, hooks, config []byte, hooksAbsent, hooksObjectWasAbsent, configAbsent bool) integrationJournal {
 	return integrationJournal{
-		Schema: journalSchemaV2, BinaryPath: filepath.Clean(options.Paths.BinaryPath), ProfileName: options.profileName(),
+		Schema: journalSchemaV3, BinaryPath: filepath.Clean(options.Paths.BinaryPath), ProfileName: DefaultProfileName,
 		HooksOriginallyAbsent: hooksAbsent, HooksObjectOriginallyAbsent: hooksObjectWasAbsent, ConfigOriginallyAbsent: configAbsent,
 		ConfigEdits: edits, HooksDigest: digest(hooks), ConfigDigest: digest(config),
 	}
@@ -347,7 +231,7 @@ func prepareStateDirectory(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return fmt.Errorf("create Ward state directory: %w", err)
 	}
-	if err := audit.SecurePrivateDirectory(path); err != nil {
+	if err := securefs.SecurePrivateDirectory(path); err != nil {
 		return fmt.Errorf("secure Ward state directory: %w", err)
 	}
 	return nil
@@ -386,7 +270,7 @@ func applyMutations(mutations []fileMutation, journalPath string) error {
 		mutationErr := applyMutation(mutation, snapshots[index].metadata)
 		mutationApplied := mutationErr == nil
 		if mutationApplied && mutation.Path == journalPath && mutation.Present {
-			mutationErr = audit.SecurePrivateFile(journalPath)
+			mutationErr = securefs.SecurePrivateFile(journalPath)
 		}
 		if mutationErr != nil {
 			primary := fmt.Errorf("write %s: %w", mutation.Label, mutationErr)
@@ -397,7 +281,7 @@ func applyMutations(mutations []fileMutation, journalPath string) error {
 				rollbackStart = index
 			}
 			for rollback := rollbackStart; rollback >= 0; rollback-- {
-				// Once any data-file rollback fails, retain the v2/v1 journal as
+				// Once any data-file rollback fails, retain the v3 journal as
 				// recovery evidence instead of erasing the only transaction marker.
 				if rollbackFailed && mutations[rollback].Path == journalPath {
 					continue
@@ -433,7 +317,7 @@ func baseResult(options Options) Result {
 func validateOptions(options Options) error {
 	paths := []struct{ name, path string }{
 		{"home directory", options.Paths.HomeDir}, {"hooks file", options.Paths.HooksFile}, {"config file", options.Paths.ConfigFile},
-		{"Ward binary", options.Paths.BinaryPath}, {"user policy", options.Paths.UserPolicyPath}, {"state directory", options.Paths.StateDir},
+		{"Ward binary", options.Paths.BinaryPath}, {"state directory", options.Paths.StateDir},
 	}
 	for _, item := range paths {
 		if item.path == "" || !filepath.IsAbs(item.path) || strings.ContainsAny(item.path, "\x00\r\n") || strings.ContainsAny(item.path, `*?[]`) {
@@ -451,10 +335,10 @@ func validateOptions(options Options) error {
 	if filepath.Dir(filepath.Clean(options.Paths.HooksFile)) != codexDir {
 		return fmt.Errorf("%w: hooks and config must share the CODEX_HOME control root", ErrUnsafePath)
 	}
-	if !pathWithin(codexDir, options.Paths.BinaryPath) || !pathWithin(codexDir, options.Paths.UserPolicyPath) {
-		return fmt.Errorf("%w: Ward binary and policy must be below CODEX_HOME", ErrUnsafePath)
+	if !pathWithin(codexDir, options.Paths.BinaryPath) {
+		return fmt.Errorf("%w: Ward binary must be below CODEX_HOME", ErrUnsafePath)
 	}
-	managed := []string{options.Paths.HooksFile, options.Paths.ConfigFile, options.Paths.BinaryPath, options.Paths.UserPolicyPath, options.Paths.journalFile()}
+	managed := []string{options.Paths.HooksFile, options.Paths.ConfigFile, options.Paths.BinaryPath, options.Paths.journalFile()}
 	seen := map[string]struct{}{}
 	stateDir := filepath.Clean(options.Paths.StateDir)
 	for _, candidate := range managed {
@@ -471,9 +355,6 @@ func validateOptions(options Options) error {
 		if !filepath.IsAbs(directory) || filepath.Dir(directory) == directory || strings.ContainsAny(directory, "\x00\r\n*?[]") {
 			return fmt.Errorf("%w: invalid read-only boundary directory", ErrUnsafePath)
 		}
-	}
-	if !validBareKey(options.profileName()) {
-		return fmt.Errorf("%w: invalid permission profile name", ErrConflict)
 	}
 	return nil
 }
@@ -503,7 +384,7 @@ func validateStateDir(path string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("%w: state directory must be a real directory", ErrUnsafePath)
 	}
-	if err := audit.InspectPrivateDirectory(path); err != nil {
+	if err := securefs.InspectPrivateDirectory(path); err != nil {
 		return fmt.Errorf("%w: state directory permissions are not private", ErrUnsafePath)
 	}
 	return nil
@@ -514,106 +395,24 @@ func decodeJournal(raw []byte) (integrationJournal, error) {
 	if err := validateUniqueJSON(raw); err != nil {
 		return journal, fmt.Errorf("%w: invalid integration journal: %v", ErrConflict, err)
 	}
-	if err := json.Unmarshal(raw, &journal); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&journal); err != nil {
 		return journal, fmt.Errorf("%w: invalid integration journal: %v", ErrConflict, err)
 	}
-	if journal.Schema == journalSchemaV1 {
-		if err := validateV1JournalShape(raw); err != nil {
-			return journal, err
-		}
-	}
-	if (journal.Schema != journalSchemaV1 && journal.Schema != journalSchemaV2) || journal.BinaryPath == "" || journal.ProfileName == "" || !validDigest(journal.HooksDigest) || !validDigest(journal.ConfigDigest) {
+	if journal.Schema != journalSchemaV3 || journal.BinaryPath == "" || journal.ProfileName != DefaultProfileName || !validDigest(journal.HooksDigest) || !validDigest(journal.ConfigDigest) || len(journal.ConfigEdits.ProfileAppend) == 0 || journal.ConfigEdits.ParentProfile == "" {
 		return journal, fmt.Errorf("%w: unsupported integration journal", ErrConflict)
 	}
-	if journal.Schema == journalSchemaV1 && !validDigest(journal.CredentialPathsDigest) {
+	edits := journal.ConfigEdits
+	selectorBlock := len(edits.SelectorBlock) > 0
+	selectorReplacement := len(edits.SelectorOriginal) > 0 && len(edits.SelectorReplacement) > 0
+	if selectorBlock == selectorReplacement ||
+		(len(edits.SelectorOriginal) == 0) != (len(edits.SelectorReplacement) == 0) ||
+		(len(edits.SandboxOriginal) == 0) != (len(edits.SandboxReplacement) == 0) ||
+		journal.HooksOriginallyAbsent && !journal.HooksObjectOriginallyAbsent {
 		return journal, fmt.Errorf("%w: unsupported integration journal", ErrConflict)
 	}
 	return journal, nil
-}
-
-func validateV1JournalShape(raw []byte) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-	}
-	required := []string{
-		"schema", "binary_path", "profile_name",
-		"hooks_originally_absent", "hooks_object_originally_absent", "config_originally_absent",
-		"config_edits", "hooks_digest", "config_digest", "credential_paths_digest",
-	}
-	if !hasExactJSONFields(fields, required, nil) {
-		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-	}
-	for _, name := range []string{"schema", "binary_path", "profile_name", "hooks_digest", "config_digest", "credential_paths_digest"} {
-		if _, ok := decodeJSONString(fields[name]); !ok {
-			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-		}
-	}
-	for _, name := range []string{"hooks_originally_absent", "hooks_object_originally_absent", "config_originally_absent"} {
-		value := string(bytes.TrimSpace(fields[name]))
-		if value != "true" && value != "false" {
-			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-		}
-	}
-	var edits map[string]json.RawMessage
-	if err := json.Unmarshal(fields["config_edits"], &edits); err != nil || edits == nil {
-		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-	}
-	if !hasExactJSONFields(edits, []string{"profile_append"}, []string{"sandbox_original", "sandbox_replacement", "selector_block"}) {
-		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-	}
-	if !nonemptyBase64JSONString(edits["profile_append"]) {
-		return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-	}
-	for _, name := range []string{"sandbox_original", "sandbox_replacement", "selector_block"} {
-		if value, exists := edits[name]; exists && !nonemptyBase64JSONString(value) {
-			return fmt.Errorf("%w: unsupported integration journal", ErrConflict)
-		}
-	}
-	return nil
-}
-
-func decodeJSONString(raw json.RawMessage) (string, bool) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '"' {
-		return "", false
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", false
-	}
-	return value, true
-}
-
-func nonemptyBase64JSONString(raw json.RawMessage) bool {
-	value, ok := decodeJSONString(raw)
-	if !ok || value == "" {
-		return false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(value)
-	return err == nil && len(decoded) > 0 && base64.StdEncoding.EncodeToString(decoded) == value
-}
-
-func hasExactJSONFields(fields map[string]json.RawMessage, required, optional []string) bool {
-	allowed := make(map[string]struct{}, len(required)+len(optional))
-	for _, name := range required {
-		allowed[name] = struct{}{}
-		if _, exists := fields[name]; !exists {
-			return false
-		}
-	}
-	for _, name := range optional {
-		allowed[name] = struct{}{}
-	}
-	if len(fields) > len(allowed) {
-		return false
-	}
-	for name := range fields {
-		if _, exists := allowed[name]; !exists {
-			return false
-		}
-	}
-	return true
 }
 
 func validDigest(value string) bool {
@@ -682,10 +481,6 @@ func restoreOptional(path string, snapshot fileSnapshot) error {
 		return nil
 	}
 	return writeAtomically(path, snapshot.data, snapshot.mode, snapshot.metadata)
-}
-
-func transactionRollbackError(primaryLabel string, primary error, rollbackLabel string, rollback error, journalPath string) error {
-	return errors.Join(fmt.Errorf("%s: %w", primaryLabel, primary), fmt.Errorf("%s: %w", rollbackLabel, rollback), fmt.Errorf("Ward integration journal preserved at %s", journalPath))
 }
 
 func existingMode(path string, fallback fs.FileMode) fs.FileMode {

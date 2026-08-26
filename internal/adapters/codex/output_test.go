@@ -9,7 +9,7 @@ import (
 )
 
 func TestOutputPreToolUseDenyUsesOnlyCanonicalDeny(t *testing.T) {
-	out, err := Output(EventPreToolUse, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny, RuleID: "delete.root"})
+	out, err := Output(contract.Decision{Outcome: contract.OutcomeDeny, RuleID: "delete.root"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestOutputPreToolUseDenyUsesOnlyCanonicalDeny(t *testing.T) {
 }
 
 func TestOutputDeferIsExactlyNoStdout(t *testing.T) {
-	out, err := Output(EventPreToolUse, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDefer})
+	out, err := Output(contract.Decision{Outcome: contract.OutcomeDefer})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,13 +34,12 @@ func TestOutputDeferIsExactlyNoStdout(t *testing.T) {
 
 func TestOutputEvaluatorErrorIsExactlyNoStdout(t *testing.T) {
 	decision := contract.Decision{
-		Schema:    contract.DecisionSchemaV1,
 		Outcome:   contract.OutcomeError,
 		RuleID:    "attacker-controlled",
 		Reason:    "SECRET VALUE",
 		ErrorCode: "details",
 	}
-	out, err := Output(EventPreToolUse, decision)
+	out, err := Output(decision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,30 +48,12 @@ func TestOutputEvaluatorErrorIsExactlyNoStdout(t *testing.T) {
 	}
 }
 
-func TestOutputRejectsUnsupportedEvent(t *testing.T) {
-	for _, event := range []string{"PermissionRequest", "PostToolUse"} {
-		if _, err := Output(event, contract.Decision{Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDefer}); err == nil {
-			t.Fatalf("Output() accepted unsupported event %q", event)
-		}
-	}
-}
-
-func TestOutputUnknownDecisionSchemaMakesNoPermissionDecision(t *testing.T) {
-	out, err := Output(EventPreToolUse, contract.Decision{Schema: "future", Outcome: contract.OutcomeDefer})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != 0 {
-		t.Fatalf("unknown schema output = %q, want no stdout", out)
-	}
-}
-
 func TestOutputDenyUsesOnlyCatalogRecovery(t *testing.T) {
 	decision := contract.Decision{
-		Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny,
-		RuleID: "WARD_DESTRUCTIVE_FILESYSTEM", Recovery: "ATTACKER CONTROLLED",
+		Outcome: contract.OutcomeDeny,
+		RuleID:  "WARD_DESTRUCTIVE_FILESYSTEM", Recovery: "ATTACKER CONTROLLED",
 	}
-	out, err := Output(EventPreToolUse, decision)
+	out, err := Output(decision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,9 +65,9 @@ func TestOutputDenyUsesOnlyCatalogRecovery(t *testing.T) {
 
 func TestOutputDenyIncludesValidatedRuleRecovery(t *testing.T) {
 	recovery := "Use a non-destructive Git operation or preserve a recoverable ref first."
-	out, err := Output(EventPreToolUse, contract.Decision{
-		Schema: contract.DecisionSchemaV1, Outcome: contract.OutcomeDeny,
-		RuleID: "WARD_DESTRUCTIVE_GIT", Recovery: recovery,
+	out, err := Output(contract.Decision{
+		Outcome: contract.OutcomeDeny,
+		RuleID:  "WARD_DESTRUCTIVE_GIT", Recovery: recovery,
 	})
 	if err != nil {
 		t.Fatal(err)

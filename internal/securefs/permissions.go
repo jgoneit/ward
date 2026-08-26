@@ -1,4 +1,6 @@
-package audit
+// Package securefs verifies and applies private local filesystem permissions
+// for Ward-owned state without owning any higher-level state format.
+package securefs
 
 import (
 	"errors"
@@ -11,7 +13,17 @@ import (
 // it. On POSIX it requires mode 0700; on Windows it requires Ward's protected
 // current-user plus LocalSystem DACL.
 func InspectPrivateDirectory(path string) error {
-	return inspectPrivateDirectory(path)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("private path does not exist: %s", filepath.Base(path))
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("private path must be a real directory")
+	}
+	return inspectPrivateDirectoryPermissions(path)
 }
 
 // InspectPrivateFile verifies a regular file without creating or repairing
@@ -20,13 +32,13 @@ func InspectPrivateDirectory(path string) error {
 func InspectPrivateFile(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: %s", ErrNotInitialized, filepath.Base(path))
+		return fmt.Errorf("private path does not exist: %s", filepath.Base(path))
 	}
 	if err != nil {
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return errors.New("state path must be a regular file")
+		return errors.New("private path must be a regular file")
 	}
 	return inspectPrivateFilePermissions(path)
 }
@@ -40,7 +52,7 @@ func SecurePrivateDirectory(path string) error {
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return errors.New("state path must be a real directory")
+		return errors.New("private path must be a real directory")
 	}
 	return securePrivateDirectory(path)
 }
@@ -54,7 +66,7 @@ func SecurePrivateFile(path string) error {
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return errors.New("state path must be a regular file")
+		return errors.New("private path must be a regular file")
 	}
 	return securePrivateFile(path)
 }

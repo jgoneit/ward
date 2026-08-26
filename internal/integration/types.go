@@ -10,27 +10,25 @@ import (
 )
 
 const (
-	DefaultProfileName = "ward-baseline"
+	DefaultProfileName = "ward"
 	journalFileName    = "integration-journal.json"
 )
 
 var (
-	ErrConflict          = errors.New("Ward integration conflicts with existing configuration")
-	ErrMigrationRequired = errors.New("legacy sandbox_mode requires explicit permission migration")
-	ErrUnsafePath        = errors.New("Ward integration path must be absolute")
-	ErrNotInstalled      = errors.New("Ward integration is not installed")
+	ErrConflict           = errors.New("Ward integration conflicts with existing configuration")
+	ErrUnsupportedSandbox = errors.New("sandbox_mode configuration is unsupported")
+	ErrUnsafePath         = errors.New("Ward integration path must be absolute")
 )
 
-// Paths defines one user-scoped Codex integration. BinaryPath, UserPolicyPath,
-// and StateDir are written into generated configuration, so all must be
-// absolute. Tests should always use temporary paths.
+// Paths defines one user-scoped Codex integration. BinaryPath and StateDir are
+// written into generated configuration, so all paths must be absolute. Tests
+// should always use temporary paths.
 type Paths struct {
-	HomeDir        string
-	HooksFile      string
-	ConfigFile     string
-	BinaryPath     string
-	UserPolicyPath string
-	StateDir       string
+	HomeDir    string
+	HooksFile  string
+	ConfigFile string
+	BinaryPath string
+	StateDir   string
 	// Topology flags are computed by the CLI for the project Doctor is
 	// diagnosing. They do not describe every ancestor below the user home.
 	StateTopologyIncomplete bool
@@ -49,17 +47,8 @@ func (p Paths) journalFile() string {
 
 // Options controls install and uninstall behavior.
 type Options struct {
-	Paths              Paths
-	ProfileName        string
-	MigratePermissions bool
-	DryRun             bool
-}
-
-func (o Options) profileName() string {
-	if o.ProfileName == "" {
-		return DefaultProfileName
-	}
-	return o.ProfileName
+	Paths  Paths
+	DryRun bool
 }
 
 // Result reports intended or completed changes. In dry-run mode no path is

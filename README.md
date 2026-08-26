@@ -2,47 +2,41 @@
 
 Ward is an ambient, veto-only Codex safety kernel. It blocks a small set of
 high-confidence destructive actions, installs a bounded native boundary for
-high-confidence workspace secret names, and otherwise leaves the user's Host
-permissions alone.
+reviewed workspace secret names, and otherwise leaves the Host's permission
+flow alone.
 
 Ward is under v0.1 development. It is not an unbypassable sandbox and has not
 passed its release burn-in.
 
 ## Product contract
 
-Ward has no user-selected runtime modes. One user-global Core installation
-provides three fixed layers:
+A user-global Core installation has two fixed responsibilities:
 
-1. a minimal destructive-action evaluator;
-2. a native permission profile for a reviewed secret-name set;
-3. bounded HMAC audit attempts for `deny` and attributable `error` events only.
+1. veto supported high-confidence destructive actions before Host permission
+   handling;
+2. install a native permission profile for a reviewed secret-name set and Ward
+   control state.
 
 ```text
 tool request
     |
     v
   Ward
-    |-- high-confidence destruction --> deny + bounded redacted audit attempt
+    |-- high-confidence destruction --> deny; no persistent Hook write
     |-- evaluator error -------------> no Ward decision; Host decides
-    \`-- everything else ------------> no output, no audit write; Host decides
+    \`-- everything else ------------> no output; Host decides
 ```
 
 `defer` is not an allow. Ward never emits `allow`, `ask`, input replacement, or
-an additional approval step.
-
-A healthy initialized audit store appends exactly one event for each
-attributable deny/error. Audit unavailability never changes the decision, so a
-failed or timed-out exceptional append may be absent as documented below.
-
-The ordinary path makes no model call. A matched shell request starts the local
-Go hook process, but a defer produces zero model-visible bytes and performs no
-audit I/O.
+an additional approval step. Deny, defer, and evaluator error create no
+persistent Ward record. The ordinary path makes no model call, produces no
+model-visible bytes, and performs no persistent Hook write.
 
 ## What v0.1 denies
 
 - recursive deletion of `/`, the actual user home, the request CWD, the nearest
   Git root, or an ancestor containing one of those boundaries;
-- deletion or relocation of `.git` or Ward control, state, and key paths;
+- deletion or relocation of `.git` or Ward control and integration-state paths;
 - `git reset --hard`, forced directory clean, force/mirror/forced-refspec push;
 - literal `DROP DATABASE` and `DROP SCHEMA ... CASCADE`;
 - non-dry-run `terraform destroy`, `terraform apply -destroy`,
@@ -51,9 +45,8 @@ audit I/O.
 Ordinary file and directory deletion, build/cache cleanup, normal patch
 deletion, `--force-with-lease`, migrations, table or row changes,
 infrastructure planning, interactive shells, secret-reading commands, dynamic
-expressions, and unknown tools defer to the Host.
-
-Ambiguity is never promoted to a deny.
+expressions, and unknown tools defer to the Host. Ambiguity is never promoted
+to a deny.
 
 ## Codex integration
 
@@ -61,66 +54,56 @@ Ward installs exactly two user-global command hooks:
 
 | Event | Behavior |
 | --- | --- |
-| `SessionStart` | Run a Host-side health check on startup/resume/clear (never automatic compaction). Healthy is silent; unhealthy emits only bounded check IDs. |
-| `PreToolUse` | Evaluate only reviewed shell, patch, delete, and move tool names before the Host permission flow. |
+| `SessionStart` | Check installation health on startup, resume, and clear. Healthy is silent; unhealthy emits only bounded check IDs. |
+| `PreToolUse` | Classify only reviewed shell, patch, delete, and move tool names before the Host permission flow. |
 
-The Pre matcher is generated from one canonical tool-name list and never uses
-`*`. Its timeout is two seconds. Ward does not install PermissionRequest or
-PostToolUse hooks and does not emit normal-path status or model context.
-SessionStart uses the bounded structural Doctor subset; the Codex version and
-native sandbox probes remain explicit trusted-terminal checks rather than
-per-session work.
+The Pre matcher comes from one canonical tool-name list and never uses `*`. Its
+timeout is two seconds. Ward does not install PermissionRequest or PostToolUse
+hooks and does not emit normal-path status or context.
 
-Current Codex command hooks cannot start a separate Agent. A Ward denial is
-therefore handled by the current Agent, which should choose a scoped,
-recoverable alternative without asking the user when no new authority is
-needed. The Plugin and Skill provide that recovery and explicit management UX;
-they are not enforcement boundaries.
+Current Codex command hooks cannot start a separate Agent. The current Agent
+handles a Ward denial by choosing a scoped, recoverable alternative without
+asking the user when no new authority is needed. The Plugin and Skill provide
+that recovery and explicit management UX; they are not enforcement boundaries.
 
-Hooks remain guardrails. A newly written user Hook is not active until Codex
-trusts that exact definition; Ward cannot read or approve that Host decision.
-Doctor therefore reports Hook trust as unverified, and installation reports
+A newly written user Hook is not active until Codex trusts that exact
+definition. Ward cannot read or approve the Host's trust decision. Doctor
+therefore reports Hook trust as unverified, and installation reports
 "configured" rather than claiming activation. Hosted, specialized, disabled,
-untrusted, managed-hooks-only, or timed-out paths may bypass them. See [Codex Hooks](https://learn.chatgpt.com/docs/hooks)
-and [Codex Permissions](https://learn.chatgpt.com/docs/permissions).
+untrusted, managed-hooks-only, or timed-out paths may bypass the Hook.
+
+See [Codex Hooks](https://learn.chatgpt.com/docs/hooks) and
+[Codex Permissions](https://learn.chatgpt.com/docs/permissions).
 
 ## Native secret boundary
 
-The `ward-baseline` profile protects a deliberately small workspace-relative
-set:
+The `ward` permission profile protects a deliberately small
+workspace-relative set:
 
 - `.env` and reviewed local/development/test/production/staging/secret suffixes;
 - `*.key.json` and exact key, credentials, and service-account JSON basenames;
 - exact `secrets` and `credentials` YAML basenames;
 - canonical SSH/private-key basenames and reviewed private-key PEM basenames;
 - `*.p12` and `*.pfx`;
-- Ward control and audit state.
+- Ward control and private integration state.
 
-Public templates (`.env.example`, `.env.sample`, `.env.template`,
-`.env.dist`), arbitrary custom `.env.*` suffixes, generic PEM/YAML/key names,
-and HOME credential stores for SSH, GitHub, Docker, Kubernetes, clouds, and
-package managers remain usable when the active workspace is a normal project
-subdirectory. Opening HOME itself as the workspace is unsupported in v0.1:
-workspace-relative recursive rules can then overlap those Host stores, so
-Doctor and SessionStart report `permissions.home_workspace_topology`. Ward does
-not claim the excluded paths or this topology are protected without workflow
-impact.
+Public templates (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`),
+arbitrary custom `.env.*` suffixes, generic PEM/YAML/key names, and HOME
+credential stores remain usable when the active workspace is a normal project
+subdirectory. Opening HOME itself as the workspace is unsupported in v0.1
+because workspace-relative recursive rules can overlap those Host stores.
+Doctor and SessionStart report `permissions.home_workspace_topology` instead of
+claiming coverage.
 
 On Linux/WSL/native Windows, Codex pre-expands recursive deny globs. Ward sets
 `glob_scan_max_depth = 16`; reviewed names at greater depth are outside the v0.1
 native claim. The platform E2E corpus exercises a depth-10 secret and a custom
 dotenv counterexample.
 
-The installer preserves `approval_policy`. A named existing permission profile
-is inherited only when it directly extends `:workspace` or `:read-only` and
-contains no filesystem authority. Its string `description` metadata and the
-currently documented Codex network subtree are inherited unchanged; unknown
-authority fields stop installation instead of being guessed. With no active
-profile Ward uses `:workspace`. Legacy
-`sandbox_mode` requires explicit `--migrate-permissions`, because it cannot be
-composed with permission profiles. Danger-full migration preserves previously
-available command networking while intentionally narrowing filesystem access.
-Unrepresentable permission or network semantics are a conflict, not a guess.
+The installer preserves `approval_policy`. It accepts only the current Codex
+permission-profile configuration, inherits a safe modern parent, and stops on
+unsupported authority instead of guessing or rewriting it. With no active
+profile the parent is `:workspace`.
 
 Ward protects dedicated control/state anchors and reports a SessionStart health
 warning when the active project topology can relocate them. Opening the user
@@ -132,14 +115,12 @@ boundary rather than a reason to freeze the entire home directory.
 Requirements: Go 1.25 or newer.
 
 The v0.1 installer supports an absolute `CODEX_HOME` that is a direct child of
-the actual user HOME (the default `~/.codex` topology). Other enterprise or
-nested layouts stop as an unsafe/unsupported topology rather than being
-rewritten or silently accepted.
+the actual user HOME, including the default `~/.codex`. Other enterprise or
+nested layouts stop as unsupported instead of being rewritten.
 
-This source flow is fresh-install-only. It stops before creating a directory or
-building when the stable Ward binary already exists, because replacing that
-path would immediately change any trusted Hook that references it. Update an
-existing installation with the tagged transactional installer instead:
+This source flow is fresh-install-only. It stops before building when the
+managed Ward binary already exists. Update an existing installation with the
+tagged transactional installer:
 
 ```sh
 ./install.sh --version vX.Y.Z
@@ -148,6 +129,8 @@ existing installation with the tagged transactional installer instead:
 ```powershell
 .\install.ps1 -Version vX.Y.Z
 ```
+
+For a fresh POSIX source install:
 
 ```sh
 set -eu
@@ -220,11 +203,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Ward integration dry run failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Ward integration install failed.' }
 ```
 
-If the dry run reports legacy sandbox settings, repeat it and the installation
-with `--migrate-permissions` only after reviewing the permission change.
-
 Remove the user-global integration and source-installed binary with the
-repository-owned uninstaller. Audit state and its key are preserved.
+repository-owned uninstaller:
 
 ```sh
 ./uninstall.sh
@@ -234,88 +214,45 @@ repository-owned uninstaller. Audit state and its key are preserved.
 .\uninstall.ps1
 ```
 
-Tagged releases use the checksum-verifying `install.sh` or `install.ps1`.
-Those installers activate compatible Core configuration automatically. When
-legacy migration is required they leave the verified binary installed and
-print exact dry-run and activation commands instead of changing permissions.
-
-The first exact Hook definition requires Host trust unless the Host supplies a
-managed trusted definition. Ward cannot verify that trust from `hooks.json`.
-Ward keeps a
-stable binary path and Hook definition so binary updates do not intentionally
-create repeated Ward approval work.
+Tagged releases use checksum-verifying installers. The first exact Hook
+definition still requires Host trust unless the Host supplies a managed trusted
+definition. Ward keeps a fixed binary path and Hook definition so binary
+updates do not intentionally create repeated trust work.
 
 ## CLI
 
 ```text
 ward --version
-ward evaluate --input - --json
 
 ward hook codex-pre-tool-use
 ward hook codex-session-start
 
-ward codex install --scope user [--migrate-permissions] [--dry-run]
+ward codex install --scope user [--dry-run]
 ward codex uninstall --scope user [--dry-run]
 ward doctor [--project PATH] [--json]
-
-ward audit show [--project PATH] [--since DURATION] [--json]
-ward audit verify [--project PATH] [--json]
-ward audit stats [--project PATH] [--since DURATION] [--json]
-ward audit repair [--project PATH] [--dry-run] [--json]
 ```
 
-Legacy hook subcommands and `--profile baseline` are accepted only as hidden
-transition inputs and are never installed or advertised.
+Doctor JSON follows the retained
+[`ward-doctor/v1`](contracts/ward-doctor-v1.schema.json) contract. The safe
+PreToolUse process budget is p95 50 ms on POSIX and 100 ms on Windows, below
+the two-second Hook timeout.
 
-Machine contracts remain `ward-request/v1`, `ward-decision/v1`,
-`ward-audit-event/v1`, and `ward-doctor/v1`.
-
-| Exit | Meaning |
-| --- | --- |
-| `0` | Command completed; a valid decision may still be deny or defer. |
-| `1` | Runtime or operating-system failure. |
-| `2` | Invalid CLI usage. |
-| `3` | Malformed or unavailable machine input for direct CLI commands such as `ward evaluate`. |
-| `4` | Reserved policy compatibility failure. |
-| `5` | Audit storage, integrity, or repair failure. |
-| `6` | Codex integration or Doctor health failure. |
-
-Malformed event payloads delivered to recognized Hook commands are handled by
-the adapter instead of exit `3`. Malformed `PreToolUse` input is silent, records
-no audit event, returns the request to the Host permission flow, and exits `0`.
-Malformed `SessionStart` input emits one bounded, redacted warning and exits `0`
-unless writing that warning itself fails with runtime exit `1`. The hidden
-legacy PermissionRequest and PostToolUse commands are silent exit-`0` no-ops.
-Hook name or argument errors remain CLI usage exit `2`. These Hook semantics do
-not turn malformed input into a Ward permission decision.
-
-## Audit semantics
-
-New runtime records are only attributable Pre `deny` and `error` attempts.
-They are not proof that a tool executed. A defer does not open or mutate the
-audit store.
-
-`ward-audit-event/v1` remains a historical superset so older defer,
-PermissionRequest, and Post records continue to verify and display. Ward never
-rewrites those chains. Stored data excludes raw commands, patches, paths,
-environment, output, transcripts, and secrets.
-
-`ward audit repair` can only advance a stale signed head over an already
-authenticated forward tail. Public pruning is excluded from v0.1; sparse event
-volume and retention status are monitored before a crash-safe generation
-format is justified.
+Malformed input delivered to `codex-pre-tool-use` is silent, makes no Ward
+permission decision, and exits `0`. Malformed SessionStart input emits one
+bounded redacted warning and exits `0` unless writing the warning fails. Hook
+name or argument errors remain CLI usage errors.
 
 ## Rollout
 
 Harness Toolkit may pin a reviewed development commit only as an
 **Experimental** source module at `modules/security/ward`. That pin neither
-installs Ward nor proves any release gate.
+installs Ward nor proves a release gate.
 
-`v0.1.0-rc.1` remains blocked until actual trusted Codex Hook dispatch plus
-macOS, Linux/WSL, and native Windows permission-profile E2E
-pass and twenty real Tasks complete with zero Ward-added prompts, zero
-destructive or protected-secret escapes, zero unresolved normal-workflow false
-deny, zero defer audit mutations, and zero need to disable Ward.
+`v0.1.0-rc.1` remains blocked until trusted Codex Hook dispatch plus macOS,
+Linux/WSL, and native Windows permission-profile E2E pass and twenty real Tasks
+complete with zero Ward-added prompts, zero destructive or protected-secret
+escapes, zero unresolved normal-workflow false deny, zero persistent Hook
+writes, and zero need to disable Ward.
 
 See [CHARTER.md](CHARTER.md), [SECURITY.md](SECURITY.md),
 [docs/codex-integration.md](docs/codex-integration.md), and

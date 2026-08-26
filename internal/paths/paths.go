@@ -18,10 +18,8 @@ type Environment struct {
 
 type UserPaths struct {
 	HomeDir    string
-	CodexDir   string
 	ConfigFile string
 	HooksFile  string
-	PolicyFile string
 }
 
 func ResolveUser() (UserPaths, error) {
@@ -53,9 +51,7 @@ func Resolve(environment Environment) (UserPaths, error) {
 	codexDir = filepath.Clean(codexDir)
 	return UserPaths{
 		HomeDir:    filepath.Clean(home),
-		CodexDir:   codexDir,
 		ConfigFile: filepath.Join(codexDir, "config.toml"),
 		HooksFile:  filepath.Join(codexDir, "hooks.json"),
-		PolicyFile: filepath.Join(codexDir, "ward", "policy.toml"),
 	}, nil
 }

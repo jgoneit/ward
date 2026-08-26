@@ -2,17 +2,15 @@ package integration
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/jgoneit/ward/internal/audit"
+	"github.com/jgoneit/ward/internal/securefs"
 )
 
 func TestInstallDryRunDoesNotCreateAnything(t *testing.T) {
@@ -20,289 +18,188 @@ func TestInstallDryRunDoesNotCreateAnything(t *testing.T) {
 	writeExecutable(t, options.Paths.BinaryPath)
 	options.DryRun = true
 	result, err := Install(options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Changed || !result.HooksChanged || !result.ConfigChanged || !result.JournalChanged {
-		t.Fatalf("result=%#v", result)
+	if err != nil || !result.Changed || !result.DryRun {
+		t.Fatalf("Install()=%#v, %v", result, err)
 	}
 	for _, path := range []string{options.Paths.HooksFile, options.Paths.ConfigFile, options.Paths.StateDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("dry-run created %s", path)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("dry-run created %s: %v", path, err)
 		}
 	}
 }
 
-func TestRepeatedUninstallIsNoOpWhenHostFilesWereOriginallyAbsent(t *testing.T) {
+func TestInstallDoctorUninstallRoundTrip(t *testing.T) {
 	options := fixtureOptions(t)
 	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
+	originalConfig := []byte("default_permissions   =   \":workspace\" # exact\napproval_policy   = \"never\" # exact\n\n[hooks.state.\"other\"]\ntrusted_hash = \"sha256:unrelated\"\nenabled = true\n")
+	originalHooks := []byte(`{"description":"user hook root","hooks":{"PreToolUse":[{"matcher":"^Read$","hooks":[{"type":"command","command":"/bin/custom","timeout":3}]}]}}`)
+	writeFixtureFile(t, options.Paths.ConfigFile, originalConfig)
+	writeFixtureFile(t, options.Paths.HooksFile, originalHooks)
+
+	result, err := Install(options)
+	if err != nil || !result.Changed {
+		t.Fatalf("Install()=%#v, %v", result, err)
+	}
+	journalRaw, err := os.ReadFile(options.Paths.journalFile())
+	if err != nil || !bytes.Contains(journalRaw, []byte("ward-integration-journal/v3")) ||
+		bytes.Contains(journalRaw, []byte("credential_paths_digest")) {
+		t.Fatalf("journal=%s err=%v", journalRaw, err)
+	}
+	if report := Doctor(options); !report.Healthy ||
+		!hasCheck(report, "journal.version", CheckPass) ||
+		!hasCheck(report, "hooks.PreToolUse", CheckPass) ||
+		!hasCheck(report, "permissions.profile", CheckPass) ||
+		!hasCheck(report, "hooks.inline", CheckWarn) ||
+		hasCheck(report, "hooks.inline_ward", CheckFail) {
+		t.Fatalf("Doctor()=%#v", report)
+	}
+
+	result, err = Uninstall(options)
+	if err != nil || !result.Changed {
+		t.Fatalf("Uninstall()=%#v, %v", result, err)
+	}
+	config, err := os.ReadFile(options.Paths.ConfigFile)
+	if err != nil || !bytes.Equal(config, originalConfig) {
+		t.Fatalf("config restore=%q err=%v", config, err)
+	}
+	hooks, err := os.ReadFile(options.Paths.HooksFile)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Uninstall(options); err != nil {
+	assertJSONEqual(t, hooks, originalHooks)
+	if _, err := os.Stat(options.Paths.journalFile()); !os.IsNotExist(err) {
+		t.Fatalf("journal remained: %v", err)
+	}
+	if result, err := Uninstall(options); err != nil || result.Changed {
+		t.Fatalf("repeated Uninstall()=%#v, %v", result, err)
+	}
+}
+
+func TestUninstallRestoresRollbackOnlySandboxBytesFromV3Journal(t *testing.T) {
+	options := fixtureOptions(t)
+	writeExecutable(t, options.Paths.BinaryPath)
+	original := []byte("approval_policy   = \"never\" # exact\nsandbox_mode = \"danger-full-access\"\n")
+	sandboxOriginal := []byte("sandbox_mode = \"danger-full-access\"\n")
+	sandboxReplacement := []byte(sandboxMarker + "\n")
+	selector := permissionSelectorBlock("\n", DefaultProfileName)
+	working := bytes.Replace(original, sandboxOriginal, sandboxReplacement, 1)
+	working = append(append([]byte(nil), selector...), working...)
+	profile := append([]byte("\n"), permissionProfileBlock("\n", DefaultProfileName, ":workspace", options.Paths)...)
+	installedConfig := append(working, profile...)
+	edits := configEdits{
+		SandboxOriginal:    sandboxOriginal,
+		SandboxReplacement: sandboxReplacement,
+		SelectorBlock:      selector,
+		ProfileAppend:      profile,
+		ParentProfile:      ":workspace",
+	}
+	installedHooks, changed, err := mergeHooks(nil, options.Paths.BinaryPath)
+	if err != nil || !changed {
+		t.Fatalf("mergeHooks() changed=%v err=%v", changed, err)
+	}
+	journalRaw, err := encodeJournal(newV3Journal(options, edits, installedHooks, installedConfig, true, true, false))
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{options.Paths.ConfigFile, options.Paths.HooksFile, options.Paths.journalFile()} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("first uninstall retained %s: %v", path, err)
-		}
+	writeFixtureFile(t, options.Paths.ConfigFile, installedConfig)
+	writeFixtureFile(t, options.Paths.HooksFile, installedHooks)
+	writePrivateJournalFixture(t, options.Paths, journalRaw)
+
+	if _, err := Uninstall(Options{Paths: options.Paths}); err != nil {
+		t.Fatal(err)
 	}
-	result, err := Uninstall(options)
-	if err != nil || result.Changed {
-		t.Fatalf("second Uninstall()=%#v, %v", result, err)
+	restored, err := os.ReadFile(options.Paths.ConfigFile)
+	if err != nil || !bytes.Equal(restored, original) {
+		t.Fatalf("sandbox bytes were not restored: %q err=%v", restored, err)
+	}
+}
+
+func TestInstallRejectsUnsupportedDevelopmentJournal(t *testing.T) {
+	options := fixtureOptions(t)
+	writeExecutable(t, options.Paths.BinaryPath)
+	writePrivateJournalFixture(t, options.Paths, []byte(`{
+  "schema":"ward-integration-journal/v2",
+  "binary_path":"/tmp/ward",
+  "profile_name":"ward"
+}`))
+	before, _ := os.ReadFile(options.Paths.journalFile())
+	if _, err := Install(options); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Install() error=%v, want conflict", err)
+	}
+	after, _ := os.ReadFile(options.Paths.journalFile())
+	if !bytes.Equal(before, after) {
+		t.Fatal("unsupported journal was rewritten")
+	}
+}
+
+func TestInstallRejectsObsoleteWardHookWithoutMutation(t *testing.T) {
+	options := fixtureOptions(t)
+	writeExecutable(t, options.Paths.BinaryPath)
+	originalConfig := []byte("default_permissions = \":workspace\"\napproval_policy = \"never\"\n")
+	originalHooks := []byte(`{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/tmp/ward hook codex-post-tool-use","timeout":10}]}]}}`)
+	writeFixtureFile(t, options.Paths.ConfigFile, originalConfig)
+	writeFixtureFile(t, options.Paths.HooksFile, originalHooks)
+
+	if _, err := Install(options); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Install() error=%v, want conflict", err)
+	}
+	configAfter, configErr := os.ReadFile(options.Paths.ConfigFile)
+	hooksAfter, hooksErr := os.ReadFile(options.Paths.HooksFile)
+	if configErr != nil || hooksErr != nil || !bytes.Equal(configAfter, originalConfig) || !bytes.Equal(hooksAfter, originalHooks) {
+		t.Fatalf("conflicting install changed host bytes: config=%q hooks=%q configErr=%v hooksErr=%v", configAfter, hooksAfter, configErr, hooksErr)
+	}
+	if _, err := os.Stat(options.Paths.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("conflicting install created state: %v", err)
 	}
 }
 
 func TestUninstallRejectsMissingJournalWhenWardBytesRemain(t *testing.T) {
 	options := fixtureOptions(t)
 	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
+	merged, changed, err := mergeHooks(nil, options.Paths.BinaryPath)
+	if err != nil || !changed {
 		t.Fatal(err)
 	}
-	if err := os.Remove(options.Paths.journalFile()); err != nil {
+	writeFixtureFile(t, options.Paths.HooksFile, merged)
+	config, _, changed, err := installConfig(nil, options)
+	if err != nil || !changed {
 		t.Fatal(err)
-	}
-	if result, err := Uninstall(options); !errors.Is(err, ErrConflict) || result.Changed {
-		t.Fatalf("Uninstall()=%#v, %v; want unchanged conflict", result, err)
-	}
-	for _, path := range []string{options.Paths.ConfigFile, options.Paths.HooksFile} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("conflicting uninstall removed %s: %v", path, err)
-		}
-	}
-}
-
-func TestUninstallRejectsMissingJournalWhenOnlyStructuralWardProfileRemains(t *testing.T) {
-	options := fixtureOptions(t)
-	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(options.Paths.journalFile()); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(options.Paths.HooksFile); err != nil {
-		t.Fatal(err)
-	}
-	config, err := os.ReadFile(options.Paths.ConfigFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, marker := range []string{selectorBegin, selectorEnd, profileBegin, profileEnd} {
-		config = bytes.ReplaceAll(config, []byte(marker), nil)
 	}
 	writeFixtureFile(t, options.Paths.ConfigFile, config)
 
-	if result, err := Uninstall(options); !errors.Is(err, ErrConflict) || result.Changed {
-		t.Fatalf("Uninstall()=%#v, %v; want unchanged structural-profile conflict", result, err)
+	if _, err := Uninstall(options); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Uninstall() error=%v, want conflict", err)
 	}
 }
 
-func TestInstallDoctorUninstallRoundTripPreservesHostAuthority(t *testing.T) {
+func TestInstallWriteFailureRollsBackExactHostBytes(t *testing.T) {
 	options := fixtureOptions(t)
-	if err := os.MkdirAll(filepath.Dir(options.Paths.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	originalConfig := []byte("default_permissions   =   \"team-profile\" # exact\napproval_policy   = \"never\" # exact\n\n[permissions.team-profile]\nextends = \":workspace\"\n[permissions.team-profile.network]\nenabled = true\n")
-	originalHooks := []byte(`{"description":"mine","hooks":{"PreToolUse":[{"matcher":"^Read$","hooks":[{"type":"command","command":"/bin/true","timeout":1}]}]}}`)
+	writeExecutable(t, options.Paths.BinaryPath)
+	originalConfig := []byte("default_permissions = \":workspace\"\napproval_policy = \"never\"\n")
+	originalHooks := []byte(`{"description":"rollback fixture"}`)
 	writeFixtureFile(t, options.Paths.ConfigFile, originalConfig)
 	writeFixtureFile(t, options.Paths.HooksFile, originalHooks)
-	writeExecutable(t, options.Paths.BinaryPath)
 
-	result, err := Install(options)
-	if err != nil || !result.Changed {
-		t.Fatalf("Install()=%#v, %v", result, err)
-	}
-	report := Doctor(options)
-	if !report.Healthy || !hasCheck(report, "hooks.SessionStart", CheckPass) || !hasCheck(report, "hooks.PreToolUse", CheckPass) || !hasCheck(report, "permissions.native_minimal_probe", CheckPass) {
-		t.Fatalf("Doctor()=%#v", report)
-	}
-	if second, err := Install(options); err != nil || second.Changed {
-		t.Fatalf("second Install()=%#v, %v", second, err)
-	}
-	if _, err := Uninstall(options); err != nil {
-		t.Fatal(err)
-	}
-	gotConfig, _ := os.ReadFile(options.Paths.ConfigFile)
-	gotHooks, _ := os.ReadFile(options.Paths.HooksFile)
-	if !bytes.Equal(gotConfig, originalConfig) {
-		t.Fatalf("config not exact\ngot=%q\nwant=%q", gotConfig, originalConfig)
-	}
-	assertJSONEqual(t, gotHooks, originalHooks)
-	if _, err := os.Stat(options.Paths.journalFile()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("journal remains: %v", err)
-	}
-	second, err := Uninstall(options)
-	if err != nil || second.Changed {
-		t.Fatalf("second Uninstall()=%#v, %v", second, err)
-	}
-}
-
-func TestDoctorFailsWhenNamedParentGainsFilesystemAuthority(t *testing.T) {
-	options := fixtureOptions(t)
-	if err := os.MkdirAll(filepath.Dir(options.Paths.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	original := []byte("default_permissions = \"team-profile\"\n[permissions.team-profile]\nextends = \":workspace\"\n[permissions.team-profile.network]\nenabled = true\n")
-	writeFixtureFile(t, options.Paths.ConfigFile, original)
-	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(options.Paths.ConfigFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw = append(raw, []byte("\n[permissions.team-profile.filesystem]\n\"/workspace/.env\" = \"write\"\n")...)
-	writeFixtureFile(t, options.Paths.ConfigFile, raw)
-	report := Doctor(options)
-	if report.Healthy || !hasCheck(report, "permissions.parent", CheckFail) {
-		t.Fatalf("Doctor()=%#v", report)
-	}
-}
-
-func TestInstallRejectsAnyAdditiveUserPolicy(t *testing.T) {
-	for _, content := range [][]byte{nil, []byte("schema = \"ward.policy.v1\"\n")} {
-		options := fixtureOptions(t)
-		writeExecutable(t, options.Paths.BinaryPath)
-		writeFixtureFile(t, options.Paths.UserPolicyPath, content)
-		if _, err := Install(options); !errors.Is(err, ErrConflict) {
-			t.Fatalf("Install() error=%v, want additive policy conflict", err)
-		}
-	}
-}
-
-func TestInstallMigratesExactV1JournalAtomically(t *testing.T) {
-	options := fixtureOptions(t)
-	originalConfig := []byte("approval_policy   = \"on-request\" # exact\nsandbox_mode = \"workspace-write\"\n")
-	originalHooks := []byte(`{
-  "description": "legacy user bytes",
-  "hooks": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "/bin/true",
-            "timeout": 1,
-            "type": "command"
-          }
-        ],
-        "matcher": "^Read$"
-      }
-    ]
-  }
-}
-`)
-	writeV1Installation(t, options, originalConfig, originalHooks)
-
-	result, err := Install(options)
-	if err != nil || !result.Changed {
-		t.Fatalf("Install(v1)=%#v, %v", result, err)
-	}
-	journalRaw, _ := os.ReadFile(options.Paths.journalFile())
-	journal, err := decodeJournal(journalRaw)
-	if err != nil || journal.Schema != journalSchemaV2 {
-		t.Fatalf("journal=%#v err=%v", journal, err)
-	}
-	hooks, _ := os.ReadFile(options.Paths.HooksFile)
-	assertAmbientHookShape(t, hooks, options.Paths.BinaryPath)
-	if strings.Contains(string(hooks), "codex-permission-request") || strings.Contains(string(hooks), "codex-post-tool-use") {
-		t.Fatalf("legacy hooks survived: %s", hooks)
-	}
-	if report := Doctor(options); !report.Healthy {
-		t.Fatalf("Doctor() unhealthy after migration: %#v", report)
-	}
-	if _, err := Uninstall(options); err != nil {
-		t.Fatal(err)
-	}
-	configAfter, _ := os.ReadFile(options.Paths.ConfigFile)
-	hooksAfter, _ := os.ReadFile(options.Paths.HooksFile)
-	if !bytes.Equal(configAfter, originalConfig) {
-		t.Fatalf("v1 migration lost original config: %q", configAfter)
-	}
-	if !bytes.Equal(hooksAfter, originalHooks) {
-		t.Fatalf("v1 migration lost canonical original hooks bytes:\ngot=%q\nwant=%q", hooksAfter, originalHooks)
-	}
-	assertJSONEqual(t, hooksAfter, originalHooks)
-}
-
-func TestV1MigrationWriteFailureRestoresAllBytes(t *testing.T) {
-	options := fixtureOptions(t)
-	writeV1Installation(t, options, []byte("approval_policy = \"never\"\n"), []byte(`{"description":"legacy"}`))
-	before := snapshotFiles(t, options.Paths.HooksFile, options.Paths.ConfigFile, options.Paths.journalFile())
-	failure := errors.New("injected hooks failure")
+	injected := errors.New("injected hooks failure")
 	production := writeAtomically
 	writeAtomically = func(path string, data []byte, mode os.FileMode, metadata platformFileMetadata) error {
 		if path == options.Paths.HooksFile {
-			return failure
+			return injected
 		}
 		return production(path, data, mode, metadata)
 	}
 	t.Cleanup(func() { writeAtomically = production })
-	if _, err := Install(options); !errors.Is(err, failure) {
+
+	if _, err := Install(options); !errors.Is(err, injected) {
 		t.Fatalf("Install() error=%v", err)
 	}
-	after := snapshotFiles(t, options.Paths.HooksFile, options.Paths.ConfigFile, options.Paths.journalFile())
-	for path, want := range before {
-		if !bytes.Equal(after[path], want) {
-			t.Fatalf("rollback changed %s", path)
-		}
-	}
-}
-
-func TestInstallRollbackFailurePreservesJournal(t *testing.T) {
-	options := fixtureOptions(t)
-	writeExecutable(t, options.Paths.BinaryPath)
-	writeFixtureFile(t, options.Paths.ConfigFile, []byte("approval_policy = \"never\"\n"))
-	hookFailure := errors.New("hook write failure")
-	rollbackFailure := errors.New("config rollback failure")
-	production := writeAtomically
-	writeAtomically = func(path string, data []byte, mode os.FileMode, metadata platformFileMetadata) error {
-		switch {
-		case path == options.Paths.HooksFile:
-			return hookFailure
-		case path == options.Paths.ConfigFile && bytes.Equal(data, []byte("approval_policy = \"never\"\n")):
-			return rollbackFailure
-		default:
-			return production(path, data, mode, metadata)
-		}
-	}
-	t.Cleanup(func() { writeAtomically = production })
-	_, err := Install(options)
-	if !errors.Is(err, hookFailure) || !errors.Is(err, rollbackFailure) {
-		t.Fatalf("Install() error=%v", err)
-	}
-	if _, err := os.Stat(options.Paths.journalFile()); err != nil {
-		t.Fatalf("recovery journal missing: %v", err)
-	}
-}
-
-func TestDoctorFindsStaleLegacyHooksAndControlTopology(t *testing.T) {
-	options := fixtureOptions(t)
-	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
-		t.Fatal(err)
-	}
+	config, _ := os.ReadFile(options.Paths.ConfigFile)
 	hooks, _ := os.ReadFile(options.Paths.HooksFile)
-	hooks = legacyHooksFixture(t, options.Paths.BinaryPath, hooks)
-	writeFixtureFile(t, options.Paths.HooksFile, hooks)
-	options.Paths.ControlTopologyIncomplete = true
-	report := Doctor(options)
-	if report.Healthy || !hasCheck(report, "hooks.legacy_stale", CheckFail) || !hasCheck(report, "permissions.control_topology", CheckWarn) {
-		t.Fatalf("Doctor()=%#v", report)
+	if !bytes.Equal(config, originalConfig) || !bytes.Equal(hooks, originalHooks) {
+		t.Fatalf("rollback changed host bytes\nconfig=%q\nhooks=%q", config, hooks)
 	}
-}
-
-func TestDoctorFailsWhenAdditivePolicyAppearsAfterInstall(t *testing.T) {
-	options := fixtureOptions(t)
-	writeExecutable(t, options.Paths.BinaryPath)
-	if _, err := Install(options); err != nil {
-		t.Fatal(err)
-	}
-	writeFixtureFile(t, options.Paths.UserPolicyPath, []byte("schema = \"ward.policy.v1\"\n"))
-	report := Doctor(options)
-	if report.Healthy || !hasCheck(report, "policy.additive", CheckFail) {
-		t.Fatalf("Doctor()=%#v", report)
+	if _, err := os.Stat(options.Paths.journalFile()); !os.IsNotExist(err) {
+		t.Fatalf("journal remained after successful rollback: %v", err)
 	}
 }
 
@@ -320,25 +217,11 @@ func TestUninstallRejectsModifiedManagedHandler(t *testing.T) {
 	}
 }
 
-func TestInstallRejectsUnsafeControlAndStatePaths(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Run("symlink control", func(t *testing.T) {
-			options := fixtureOptions(t)
-			writeExecutable(t, options.Paths.BinaryPath)
-			target := filepath.Join(options.Paths.HomeDir, "target")
-			writeFixtureFile(t, target, []byte("fixture"))
-			if err := os.Symlink(target, options.Paths.ConfigFile); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Install(options); !errors.Is(err, ErrUnsafePath) {
-				t.Fatalf("Install() error=%v", err)
-			}
-		})
-	}
+func TestInstallRejectsUnsafePaths(t *testing.T) {
 	for name, mutate := range map[string]func(*Options){
 		"binary outside": func(o *Options) { o.Paths.BinaryPath = filepath.Join(o.Paths.HomeDir, "bin", "ward") },
 		"glob state":     func(o *Options) { o.Paths.StateDir += "[unsafe]" },
-		"path collision": func(o *Options) { o.Paths.UserPolicyPath = o.Paths.ConfigFile },
+		"path collision": func(o *Options) { o.Paths.HooksFile = o.Paths.ConfigFile },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := fixtureOptions(t)
@@ -349,207 +232,78 @@ func TestInstallRejectsUnsafeControlAndStatePaths(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestDecodeJournalRejectsDuplicateAuthorityFields(t *testing.T) {
-	_, err := decodeJournal([]byte(`{"schema":"ward-integration-journal/v2","binary_path":"/a","binary_path":"/b","profile_name":"ward-baseline"}`))
-	if !errors.Is(err, ErrConflict) {
-		t.Fatalf("decodeJournal() error=%v", err)
+	if runtime.GOOS != "windows" {
+		t.Run("symlink control", func(t *testing.T) {
+			options := fixtureOptions(t)
+			writeExecutable(t, options.Paths.BinaryPath)
+			target := filepath.Join(options.Paths.HomeDir, "target")
+			writeFixtureFile(t, target, []byte("fixture"))
+			if err := os.MkdirAll(filepath.Dir(options.Paths.ConfigFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, options.Paths.ConfigFile); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Install(options); !errors.Is(err, ErrUnsafePath) {
+				t.Fatalf("Install() error=%v", err)
+			}
+		})
 	}
 }
 
-type legacyV1CredentialPaths struct {
-	files       []string
-	directories []string
+func TestDecodeJournalRejectsDuplicateUnknownAndIncompleteFields(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"duplicate":  []byte(`{"schema":"ward-integration-journal/v3","binary_path":"/a","binary_path":"/b"}`),
+		"unknown":    []byte(`{"schema":"ward-integration-journal/v3","binary_path":"/a","profile_name":"ward","future":true}`),
+		"incomplete": []byte(`{"schema":"ward-integration-journal/v3","binary_path":"/a","profile_name":"ward"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeJournal(raw); !errors.Is(err, ErrConflict) {
+				t.Fatalf("decodeJournal() error=%v", err)
+			}
+		})
+	}
 }
 
-func writeV1Installation(t *testing.T, options Options, originalConfig, originalHooks []byte) {
-	t.Helper()
-	writeV1InstallationWithCredentialPaths(t, options, originalConfig, originalHooks, legacyV1CredentialPaths{})
-}
-
-func writeV1InstallationWithCredentialPaths(t *testing.T, options Options, originalConfig, originalHooks []byte, credentialPaths legacyV1CredentialPaths) {
-	t.Helper()
+func TestDryRunDoesNotChangeExistingMetadata(t *testing.T) {
+	options := fixtureOptions(t)
 	writeExecutable(t, options.Paths.BinaryPath)
-	newline := detectNewline(originalConfig)
-	selector := []byte(strings.Join([]string{legacySelectorBegin, `default_permissions = "ward-baseline"`, legacySelectorEnd, ""}, newline))
-	working := append([]byte(nil), originalConfig...)
-	edits := configEdits{}
-	networkEnabled := false
-	if assignments := findAssignments(working, "sandbox_mode"); len(assignments) == 1 {
-		if mode, ok := parseTOMLString(assignments[0].Value); ok {
-			networkEnabled = mode == "danger-full-access"
-		}
-		edits.SandboxOriginal = append([]byte(nil), assignments[0].Raw...)
-		edits.SandboxReplacement = []byte("# ward:migrated-sandbox-mode:v1" + assignments[0].Newline)
-		working = replaceRange(working, assignments[0].Start, assignments[0].End, edits.SandboxReplacement)
-	}
-	defaults := findAssignments(working, "default_permissions")
-	preselected := false
-	if len(defaults) == 1 && defaults[0].TopLevel {
-		selected, ok := parseTOMLString(defaults[0].Value)
-		preselected = ok && selected == options.profileName()
-	}
-	if !preselected {
-		edits.SelectorBlock = selector
-		working = append(append([]byte(nil), selector...), working...)
-	}
-	prefix := ""
-	if len(working) > 0 {
-		if bytes.HasSuffix(working, []byte(newline)) {
-			prefix = newline
-		} else {
-			prefix = newline + newline
-		}
-	}
-	profile := []byte(prefix + legacyV1FixtureProfileBody(t, newline, options, networkEnabled, credentialPaths))
-	edits.ProfileAppend = profile
-	working = append(working, profile...)
-	hooks := legacyHooksFixture(t, options.Paths.BinaryPath, originalHooks)
-	writeFixtureFile(t, options.Paths.ConfigFile, working)
-	writeFixtureFile(t, options.Paths.HooksFile, hooks)
-	if err := prepareStateDirectory(options.Paths.StateDir); err != nil {
-		t.Fatal(err)
-	}
-	journal := integrationJournal{
-		Schema: journalSchemaV1, BinaryPath: filepath.Clean(options.Paths.BinaryPath), ProfileName: options.profileName(),
-		HooksOriginallyAbsent:       originalHooks == nil,
-		HooksObjectOriginallyAbsent: hooksObjectAbsent(originalHooks),
-		ConfigOriginallyAbsent:      originalConfig == nil,
-		ConfigEdits:                 edits, HooksDigest: digest(hooks), ConfigDigest: digest(working),
-		CredentialPathsDigest: credentialPathsDigest(credentialPaths.files, credentialPaths.directories),
-	}
-	raw, err := encodeJournal(journal)
+	writeFixtureFile(t, options.Paths.ConfigFile, []byte("default_permissions = \":workspace\"\n"))
+	before, err := os.Stat(options.Paths.ConfigFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	journalPath := options.Paths.journalFile()
-	writeFixtureFile(t, journalPath, raw)
-	if err := audit.SecurePrivateFile(journalPath); err != nil {
+	options.DryRun = true
+	if _, err := Install(options); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// legacyV1FixtureProfileBody rebuilds the variable path slice around the
-// frozen generator-owned prefix/workspace rules. Keeping synthetic fixtures on
-// the real historical grammar prevents permissive validators from passing on
-// abbreviated test-only profiles.
-func legacyV1FixtureProfileBody(t *testing.T, newline string, options Options, networkEnabled bool, credentialPaths legacyV1CredentialPaths) string {
-	t.Helper()
-	frozen, err := os.ReadFile(filepath.Join("testdata", "frozen-v1", "config.toml"))
+	after, err := os.Stat(options.Paths.ConfigFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(frozen)
-	profileStart := strings.Index(text, legacyProfileBegin)
-	dynamicAnchor := legacyV1DynamicPrefixLastLine + "\n"
-	dynamicStart := strings.Index(text, dynamicAnchor)
-	workspaceHeader := `[permissions.ward-baseline.filesystem.":workspace_roots"]` + "\n"
-	workspaceStart := strings.Index(text, workspaceHeader)
-	if profileStart < 0 || dynamicStart < profileStart || workspaceStart < 0 {
-		t.Fatal("frozen v1 profile anchors are incomplete")
+	if !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() || before.Size() != after.Size() {
+		t.Fatal("dry-run changed config metadata")
 	}
-	workspaceEndAnchor := legacyV1WorkspaceLastLine + "\n"
-	workspaceRelativeEnd := strings.Index(text[workspaceStart:], workspaceEndAnchor)
-	if workspaceRelativeEnd < 0 {
-		t.Fatal("frozen v1 profile anchors are incomplete")
-	}
-	dynamicStart += len(dynamicAnchor)
-	workspaceEnd := workspaceStart + workspaceRelativeEnd + len(workspaceEndAnchor)
-	prefix := text[profileStart:dynamicStart]
-	workspace := text[workspaceStart:workspaceEnd]
-	if profile := options.profileName(); profile != DefaultProfileName {
-		prefix = strings.ReplaceAll(prefix, "permissions."+DefaultProfileName, "permissions."+profile)
-		workspace = strings.ReplaceAll(workspace, "permissions."+DefaultProfileName, "permissions."+profile)
-	}
-
-	boundaries := legacyV1KnownBoundaryDirectories(options.Paths)
-	seenBoundaries := make(map[string]struct{}, len(boundaries)+len(credentialPaths.directories))
-	for _, value := range boundaries {
-		seenBoundaries[value] = struct{}{}
-	}
-	for _, value := range credentialPaths.directories {
-		value = filepath.Clean(value)
-		if value == "." || value == "" {
-			continue
-		}
-		if _, exists := seenBoundaries[value]; exists {
-			continue
-		}
-		seenBoundaries[value] = struct{}{}
-		boundaries = append(boundaries, value)
-	}
-	sort.Strings(boundaries)
-
-	var dynamic strings.Builder
-	for _, value := range boundaries {
-		dynamic.WriteString(strconv.Quote(value) + ` = "read"` + "\n")
-	}
-	protected := legacyV1KnownProtectedPaths(options.Paths)
-	seenProtected := make(map[string]struct{}, len(protected)+len(credentialPaths.files))
-	for _, value := range protected {
-		seenProtected[value] = struct{}{}
-	}
-	for _, value := range credentialPaths.files {
-		if value == "" {
-			continue
-		}
-		if _, exists := seenProtected[value]; exists {
-			continue
-		}
-		seenProtected[value] = struct{}{}
-		protected = append(protected, value)
-	}
-	for _, value := range protected {
-		dynamic.WriteString(strconv.Quote(value) + ` = "deny"` + "\n")
-	}
-	dynamic.WriteString(strconv.Quote(options.Paths.BinaryPath) + ` = "read"` + "\n\n")
-
-	tail := legacyProfileEnd + "\n"
-	if networkEnabled {
-		tail = "\n[permissions." + options.profileName() + ".network]\nenabled = true\n" + legacyProfileEnd + "\n"
-	}
-	body := prefix + dynamic.String() + workspace + tail
-	if newline == "\r\n" {
-		body = strings.ReplaceAll(body, "\n", newline)
-	}
-	return body
-}
-
-// credentialPathsDigest reproduces the frozen v1 journal field for migration
-// fixtures. Production v2 integrations neither discover nor persist credential
-// paths; the migration reader validates this legacy value by format only.
-func credentialPathsDigest(files, directories []string) string {
-	normalized := make([]string, 0, len(files)+len(directories))
-	seen := map[string]struct{}{}
-	appendNormalized := func(kind string, candidates []string) {
-		for _, candidate := range candidates {
-			clean := filepath.Clean(candidate)
-			if runtime.GOOS == "windows" {
-				clean = strings.ToLower(clean)
-			}
-			clean = kind + "\x00" + clean
-			if _, exists := seen[clean]; !exists {
-				seen[clean] = struct{}{}
-				normalized = append(normalized, clean)
-			}
-		}
-	}
-	appendNormalized("file", files)
-	appendNormalized("directory", directories)
-	sort.Strings(normalized)
-	encoded, _ := json.Marshal(normalized)
-	return digest(append([]byte("ward-credential-paths/v1\x00"), encoded...))
 }
 
 func fixtureOptions(t *testing.T) Options {
 	t.Helper()
 	root := t.TempDir()
+	home := filepath.Join(root, "home")
 	return Options{Paths: Paths{
-		HomeDir: root, HooksFile: filepath.Join(root, "codex", "hooks.json"), ConfigFile: filepath.Join(root, "codex", "config.toml"),
-		BinaryPath: filepath.Join(root, "codex", "ward", "bin", "ward"), UserPolicyPath: filepath.Join(root, "codex", "ward", "policy.toml"),
-		StateDir: filepath.Join(root, "state", "ward", "v1"),
+		HomeDir:    home,
+		HooksFile:  filepath.Join(home, "codex", "hooks.json"),
+		ConfigFile: filepath.Join(home, "codex", "config.toml"),
+		BinaryPath: filepath.Join(home, "codex", "ward", "bin", executableName()),
+		StateDir:   filepath.Join(root, "state", "ward", "core"),
 	}}
+}
+
+func executableName() string {
+	if runtime.GOOS == "windows" {
+		return "ward.exe"
+	}
+	return "ward"
 }
 
 func writeExecutable(t *testing.T, path string) {
@@ -576,17 +330,15 @@ func writeFixtureFile(t *testing.T, path string, data []byte) {
 	}
 }
 
-func snapshotFiles(t *testing.T, paths ...string) map[string][]byte {
+func writePrivateJournalFixture(t *testing.T, paths Paths, data []byte) {
 	t.Helper()
-	result := map[string][]byte{}
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result[path] = raw
+	if err := prepareStateDirectory(paths.StateDir); err != nil {
+		t.Fatal(err)
 	}
-	return result
+	writeFixtureFile(t, paths.journalFile(), data)
+	if err := securefs.SecurePrivateFile(paths.journalFile()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hasCheck(report DoctorReport, id string, status CheckStatus) bool {
@@ -596,4 +348,34 @@ func hasCheck(report DoctorReport, id string, status CheckStatus) bool {
 		}
 	}
 	return false
+}
+
+func TestFixtureStatePathUsesCore(t *testing.T) {
+	options := fixtureOptions(t)
+	if !strings.HasSuffix(filepath.ToSlash(options.Paths.StateDir), "/ward/core") {
+		t.Fatalf("state=%s", options.Paths.StateDir)
+	}
+}
+
+func TestJournalFileTimestampChangesOnlyOnMutation(t *testing.T) {
+	options := fixtureOptions(t)
+	writeExecutable(t, options.Paths.BinaryPath)
+	if _, err := Install(options); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(options.Paths.journalFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if result, err := Install(options); err != nil || result.Changed {
+		t.Fatalf("idempotent Install()=%#v, %v", result, err)
+	}
+	after, err := os.Stat(options.Paths.journalFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("idempotent install rewrote journal")
+	}
 }

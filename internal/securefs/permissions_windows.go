@@ -1,9 +1,8 @@
 //go:build windows
 
-package audit
+package securefs
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -17,57 +16,17 @@ import (
 const windowsFileAllAccess = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff)
 
 func securePrivateDirectory(path string) error {
-	return securePrivateDirectoryContext(context.Background(), path)
-}
-func securePrivateDirectoryContext(ctx context.Context, path string) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	err := setPrivateWindowsACL(path, true)
-	if err != nil {
-		return err
-	}
-	return contextError(ctx)
+	return setPrivateWindowsACL(path, true)
 }
 func securePrivateFile(path string) error {
-	return securePrivateFileContext(context.Background(), path)
-}
-func securePrivateFileContext(ctx context.Context, path string) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	err := setPrivateWindowsACL(path, false)
-	if err != nil {
-		return err
-	}
-	return contextError(ctx)
+	return setPrivateWindowsACL(path, false)
 }
 
 func inspectPrivateDirectoryPermissions(path string) error {
-	return inspectPrivateDirectoryPermissionsContext(context.Background(), path)
-}
-func inspectPrivateDirectoryPermissionsContext(ctx context.Context, path string) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	err := inspectPrivateWindowsACL(path, true)
-	if err != nil {
-		return err
-	}
-	return contextError(ctx)
+	return inspectPrivateWindowsACL(path, true)
 }
 func inspectPrivateFilePermissions(path string) error {
-	return inspectPrivateFilePermissionsContext(context.Background(), path)
-}
-func inspectPrivateFilePermissionsContext(ctx context.Context, path string) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	err := inspectPrivateWindowsACL(path, false)
-	if err != nil {
-		return err
-	}
-	return contextError(ctx)
+	return inspectPrivateWindowsACL(path, false)
 }
 
 func setPrivateWindowsACL(path string, directory bool) error {

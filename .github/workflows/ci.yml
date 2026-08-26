@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -88,7 +89,7 @@ jobs:
           if (-not $rejected) { throw 'installer accepted a destination outside CODEX_HOME' }
           & ./scripts/test-binary-only-uninstall.ps1 -WardBinary (Resolve-Path ./ward.exe).Path
 
-  contracts:
+  plugin:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

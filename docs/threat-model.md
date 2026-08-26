@@ -3,7 +3,7 @@
 ## Protected assets
 
 - reviewed high-confidence workspace secret names;
-- repository metadata and Ward control/state/key paths;
+- repository metadata and Ward control/integration-state paths;
 - filesystem, home, current-work, and repository roots;
 - Git state, databases, schemas, namespaces, and volumes targeted by a small
   literal destructive-command set.
@@ -13,8 +13,7 @@
 - user-global SessionStart health and PreToolUse command hooks;
 - Codex native filesystem permissions;
 - literal high-confidence POSIX, PowerShell/CMD, patch, and structured
-  operations;
-- HMAC-chained metadata for attributable Pre deny/error events.
+  operations.
 
 ## Outside v0.1
 
@@ -28,9 +27,10 @@
 - workflow approval, task state, reviewer verdicts, or a separate Agent;
 - automatic authorization of any operation.
 
-Runtime evaluator errors fail open to the Host by explicit product choice.
-SessionStart health and sparse error audit make that limitation visible without
-turning an operational problem into a new approval bottleneck.
+Runtime evaluator errors fail open to the Host by explicit product choice. They
+emit no permission decision and are not persisted by Ward. SessionStart reports
+structural installation health without turning an operational problem into a
+new approval bottleneck.
 
 The native control boundary is bounded. Ward protects dedicated immediate
 anchors, but does not freeze every ancestor of HOME. When the current project
@@ -42,9 +42,5 @@ after a recursive workspace deny on current Codex. Ward therefore supports
 ordinary project-subdirectory workspaces and reports HOME-as-workspace as an
 unsupported topology instead of claiming both properties simultaneously.
 
-Audit chaining detects inconsistent modification while the key and retained
-head remain trusted. It cannot distinguish restoration of a complete older
-valid snapshot without an external monotonic anchor.
-
-Ward's privacy claim covers Ward-owned audit state. Codex owns its transcript
-and denial UI and may show or retain the original request.
+Ward does not store Hook requests, decisions, paths, or identifiers. Codex owns
+its transcript and denial UI and may show or retain the original request.

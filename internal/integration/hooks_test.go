@@ -9,7 +9,7 @@ import (
 	codexadapter "github.com/jgoneit/ward/internal/adapters/codex"
 )
 
-func TestMergeHooksInstallsOnlyAmbientPairAndPreservesUnrelatedHooks(t *testing.T) {
+func TestMergeHooksInstallsExactPairAndPreservesUnrelatedHooks(t *testing.T) {
 	original := []byte(`{
   "description":"user hooks",
   "hooks":{
@@ -23,10 +23,10 @@ func TestMergeHooksInstallsOnlyAmbientPairAndPreservesUnrelatedHooks(t *testing.
 	if err != nil || !changed {
 		t.Fatalf("mergeHooks() changed=%v err=%v", changed, err)
 	}
-	assertAmbientHookShape(t, merged, binary)
+	assertHookShape(t, merged, binary)
 	for _, preserved := range []string{"/usr/bin/custom", "/usr/bin/start", "user hooks"} {
 		if !strings.Contains(string(merged), preserved) {
-			t.Fatalf("unrelated hook bytes lost %q: %s", preserved, merged)
+			t.Fatalf("unrelated hook lost %q: %s", preserved, merged)
 		}
 	}
 	again, changed, err := mergeHooks(merged, binary)
@@ -40,31 +40,7 @@ func TestMergeHooksInstallsOnlyAmbientPairAndPreservesUnrelatedHooks(t *testing.
 	assertJSONEqual(t, unmerged, original)
 }
 
-func TestMergeHooksMigratesExactLegacyThreeHookForm(t *testing.T) {
-	binary := "/tmp/ward"
-	legacy := legacyHooksFixture(t, binary, []byte(`{"description":"mine","hooks":{"SessionStart":[{"matcher":"^startup$","hooks":[{"type":"command","command":"/bin/true","timeout":1}]}]}}`))
-	merged, changed, err := mergeHooks(legacy, binary)
-	if err != nil || !changed {
-		t.Fatalf("mergeHooks() changed=%v err=%v", changed, err)
-	}
-	assertAmbientHookShape(t, merged, binary)
-	if strings.Contains(string(merged), "codex-permission-request") || strings.Contains(string(merged), "codex-post-tool-use") || strings.Contains(string(merged), "statusMessage") {
-		t.Fatalf("legacy hooks remain: %s", merged)
-	}
-}
-
-func TestUnmergeHooksRecognizesLegacyInstallation(t *testing.T) {
-	binary := "/tmp/ward"
-	original := []byte(`{"description":"mine","hooks":{}}`)
-	legacy := legacyHooksFixture(t, binary, original)
-	got, changed, err := unmergeHooks(legacy, binary)
-	if err != nil || !changed {
-		t.Fatalf("unmergeHooks() changed=%v err=%v", changed, err)
-	}
-	assertJSONEqual(t, got, original)
-}
-
-func TestMergeHooksRejectsModifiedWardHandler(t *testing.T) {
+func TestMergeHooksRejectsModifiedCurrentHandler(t *testing.T) {
 	root := map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
 		"matcher": codexadapter.DestructiveToolMatcher,
 		"hooks":   []any{map[string]any{"type": "command", "command": "/tmp/ward hook codex-pre-tool-use", "timeout": 3}},
@@ -75,15 +51,14 @@ func TestMergeHooksRejectsModifiedWardHandler(t *testing.T) {
 	}
 }
 
-func TestMergeHooksRejectsWardCommandUnderWrongEvent(t *testing.T) {
+func TestObsoleteWardEventsBlockV3MergeAndUnmerge(t *testing.T) {
 	binary := "/tmp/ward"
-	root := map[string]any{"hooks": map[string]any{"PostToolUse": []any{map[string]any{
-		"matcher": "*",
-		"hooks":   []any{map[string]any{"type": "command", "command": hookCommand(binary, "codex-session-start"), "timeout": 2}},
-	}}}}
-	raw, _ := json.Marshal(root)
-	if _, _, err := mergeHooks(raw, binary); !errors.Is(err, ErrConflict) {
-		t.Fatalf("mergeHooks() error=%v, want misplaced Ward conflict", err)
+	original := []byte(`{"hooks":{"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"/tmp/ward hook codex-permission-request","timeout":10}]}]}}`)
+	if _, _, err := mergeHooks(original, binary); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mergeHooks() error=%v, want conflict", err)
+	}
+	if _, _, err := unmergeHooks(original, binary); !errors.Is(err, ErrConflict) {
+		t.Fatalf("unmergeHooks() error=%v, want conflict", err)
 	}
 }
 
@@ -98,34 +73,18 @@ func TestHookCommandQuotesNativeWindowsPaths(t *testing.T) {
 	}
 }
 
-func TestContainsWardHandlerDecodesEscapedWindowsCommand(t *testing.T) {
+func TestContainsWardHandlerRecognizesCurrentAndObsoleteEvents(t *testing.T) {
 	binary := `C:\Users\Example\AppData\Local\Codex\ward\bin\ward.exe`
 	merged, changed, err := mergeHooks([]byte(`{"hooks":{}}`), binary)
 	if err != nil || !changed {
 		t.Fatalf("mergeHooks() changed=%v error=%v", changed, err)
 	}
-	found, err := containsWardHandler(merged, binary)
-	if err != nil || !found {
-		t.Fatalf("containsWardHandler() found=%v error=%v\n%s", found, err, merged)
-	}
-	if found, err := containsWardHandler([]byte(`{"hooks":{}}`), binary); err != nil || found {
-		t.Fatalf("empty containsWardHandler() found=%v error=%v", found, err)
-	}
-}
-
-func TestContainsWardHandlerRejectsStaleBinaryPath(t *testing.T) {
-	raw := []byte(`{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/old/location/ward hook codex-pre-tool-use","timeout":2}]}]}}`)
-	found, err := containsWardHandler(raw, "/new/location/ward")
-	if err != nil || !found {
+	if found, err := containsWardHandler(merged, binary); err != nil || !found {
 		t.Fatalf("containsWardHandler() found=%v error=%v", found, err)
 	}
-}
-
-func TestContainsWardHandlerPreservesUnrelatedHookSubcommand(t *testing.T) {
-	raw := []byte(`{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/usr/local/bin/acme hook codex-pre-tool-use","timeout":2}]}]}}`)
-	found, err := containsWardHandler(raw, "/new/location/ward")
-	if err != nil || found {
-		t.Fatalf("containsWardHandler() found=%v error=%v", found, err)
+	legacyOnly := []byte(`{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/tmp/ward hook codex-post-tool-use","timeout":10}]}]}}`)
+	if found, err := containsWardHandler(legacyOnly, "/tmp/ward"); err != nil || !found {
+		t.Fatalf("legacy containsWardHandler() found=%v error=%v", found, err)
 	}
 }
 
@@ -144,7 +103,7 @@ func TestMergeHooksRejectsInvalidJSONStructures(t *testing.T) {
 	}
 }
 
-func assertAmbientHookShape(t *testing.T, raw []byte, binary string) {
+func assertHookShape(t *testing.T, raw []byte, binary string) {
 	t.Helper()
 	_, hooks, err := decodeHookRoot(raw)
 	if err != nil {
@@ -160,51 +119,23 @@ func assertAmbientHookShape(t *testing.T, raw []byte, binary string) {
 			t.Fatalf("%s count=%d conflict=%v", spec.Event, count, conflict)
 		}
 	}
-	for _, forbidden := range []string{"codex-permission-request", "codex-post-tool-use", `"timeout":10`, "statusMessage", "additionalContext"} {
-		if strings.Contains(string(raw), forbidden) {
-			t.Fatalf("ambient hooks contain %q: %s", forbidden, raw)
-		}
+	if strings.Contains(string(raw), "statusMessage") {
+		t.Fatal("v3 hooks contain status output")
 	}
-}
-
-func legacyHooksFixture(t *testing.T, binary string, original []byte) []byte {
-	t.Helper()
-	root, hooks, err := decodeHookRoot(original)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, spec := range legacyWardHookSpecs {
-		groups, err := decodeGroups(hooks[spec.Event])
-		if err != nil {
-			t.Fatal(err)
-		}
-		group := map[string]any{
-			"matcher": legacyAllMatcher,
-			"hooks":   []map[string]any{{"type": "command", "command": hookCommand(binary, spec.Subcommand), "timeout": 10, "statusMessage": spec.StatusMessage}},
-		}
-		raw, _ := json.Marshal(group)
-		groups = append(groups, raw)
-		setGroups(hooks, spec.Event, groups)
-	}
-	raw, _, err := encodeHookRoot(root, hooks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
 }
 
 func assertJSONEqual(t *testing.T, got, want []byte) {
 	t.Helper()
-	var gotValue, wantValue any
-	if err := json.Unmarshal(got, &gotValue); err != nil {
+	var left, right any
+	if err := json.Unmarshal(got, &left); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(want, &wantValue); err != nil {
+	if err := json.Unmarshal(want, &right); err != nil {
 		t.Fatal(err)
 	}
-	gotJSON, _ := json.Marshal(gotValue)
-	wantJSON, _ := json.Marshal(wantValue)
-	if string(gotJSON) != string(wantJSON) {
-		t.Fatalf("JSON differs\ngot: %s\nwant: %s", gotJSON, wantJSON)
+	leftJSON, _ := json.Marshal(left)
+	rightJSON, _ := json.Marshal(right)
+	if string(leftJSON) != string(rightJSON) {
+		t.Fatalf("JSON differs\ngot=%s\nwant=%s", got, want)
 	}
 }

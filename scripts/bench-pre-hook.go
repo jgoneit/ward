@@ -49,16 +49,10 @@ func main() {
 		command = "Write-Output ordinary"
 	}
 	payload, err := json.Marshal(map[string]any{
-		"session_id":      "ward-benchmark-session",
-		"transcript_path": nil,
 		"cwd":             project,
 		"hook_event_name": "PreToolUse",
-		"model":           "benchmark",
-		"permission_mode": "default",
-		"turn_id":         "ward-benchmark-turn",
 		"tool_name":       tool,
 		"tool_input":      map[string]any{"command": command},
-		"tool_use_id":     "ward-benchmark-tool",
 	})
 	check(err)
 
@@ -89,7 +83,7 @@ func main() {
 
 	for _, candidate := range []string{filepath.Join(stateHome, "ward"), filepath.Join(stateHome, "Ward")} {
 		if _, err := os.Stat(candidate); err == nil || !os.IsNotExist(err) {
-			fail("safe defer created audit state at %s", candidate)
+			fail("safe defer created persistent state at %s", candidate)
 		}
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
@@ -101,7 +95,7 @@ func main() {
 	if p95 > limit {
 		fail("safe Pre process p95 %s exceeds %s", p95, limit)
 	}
-	fmt.Printf("PASS: %d safe Pre processes were silent and audit-free; p95=%s limit=%s\n", iterations, p95, limit)
+	fmt.Printf("PASS: %d safe Pre processes were silent and persistence-free; p95=%s limit=%s\n", iterations, p95, limit)
 }
 
 func withEnvironment(base []string, overrides map[string]string) []string {

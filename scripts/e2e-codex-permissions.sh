@@ -35,7 +35,7 @@ mkdir -p \
   "$WARD_E2E_CODEX_DIR" \
   "$WARD_E2E_MANAGED_BIN_DIR" \
   "$WARD_E2E_WORKSPACE/nested" \
-  "$WARD_E2E_WORKSPACE/schemas" \
+  "$WARD_E2E_WORKSPACE/fixtures" \
   "$WARD_E2E_DEEP" \
   "$WARD_E2E_SIBLING" \
   "$WARD_E2E_CUSTOM_GH_DIR" \
@@ -45,7 +45,7 @@ mkdir -p \
   "$WARD_E2E_CONFIG_DIR/gcloud"
 cp "$WARD_E2E_BIN" "$WARD_E2E_MANAGED_BIN"
 chmod 0755 "$WARD_E2E_MANAGED_BIN"
-printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' > "$WARD_E2E_CODEX_DIR/config.toml"
+printf '%s\n' 'approval_policy = "never"' 'model = "gpt-test"' > "$WARD_E2E_CODEX_DIR/config.toml"
 cp "$WARD_E2E_CODEX_DIR/config.toml" "$WARD_E2E_TMP/config.original.toml"
 
 # Reviewed workspace secrets: the native permission profile must deny these.
@@ -70,7 +70,7 @@ printf '%s\n' 'ordinary' > "$WARD_E2E_WORKSPACE/ordinary.txt"
 printf '%s\n' 'PUBLIC CERTIFICATE FIXTURE' > "$WARD_E2E_WORKSPACE/server.pem"
 printf '%s\n' 'PUBLIC NOTES FIXTURE' > "$WARD_E2E_WORKSPACE/private-notes.pem"
 printf '%s\n' 'ordinary: true' > "$WARD_E2E_WORKSPACE/deployment-secret.yml"
-printf '%s\n' '{"type":"schema"}' > "$WARD_E2E_WORKSPACE/schemas/user-credential.json"
+printf '%s\n' '{"type":"ordinary"}' > "$WARD_E2E_WORKSPACE/fixtures/user-credential.json"
 printf '%s\n' 'registry=https://example.invalid' > "$WARD_E2E_WORKSPACE/.npmrc"
 
 # Sibling and HOME authentication stores are deliberately outside Ward's
@@ -98,21 +98,22 @@ ward_env() {
     "$@"
 }
 
-ward_env "$WARD_E2E_MANAGED_BIN" codex install --scope user --migrate-permissions
+ward_env "$WARD_E2E_MANAGED_BIN" codex install --scope user
+WARD_E2E_JOURNAL="$WARD_E2E_STATE_DIR/ward/core/integration-journal.json"
+test -f "$WARD_E2E_JOURNAL"
+test "$(find "$WARD_E2E_STATE_DIR/ward/core" -type f | wc -l | tr -d '[:space:]')" = 1
 grep -F 'approval_policy = "never"' "$WARD_E2E_CODEX_DIR/config.toml" >/dev/null
-if grep -E '^[[:space:]]*sandbox_mode[[:space:]]*=' "$WARD_E2E_CODEX_DIR/config.toml" >/dev/null; then
-  printf '%s\n' 'Ward E2E: sandbox_mode remained active' >&2
-  exit 1
-fi
+grep -E 'default_permissions[[:space:]]*=[[:space:]]*"ward"' "$WARD_E2E_CODEX_DIR/config.toml" >/dev/null
+grep -F '[permissions.ward]' "$WARD_E2E_CODEX_DIR/config.toml" >/dev/null
 grep -F '"SessionStart"' "$WARD_E2E_CODEX_DIR/hooks.json" >/dev/null
 grep -F '"PreToolUse"' "$WARD_E2E_CODEX_DIR/hooks.json" >/dev/null
 if grep -E '"PermissionRequest"|"PostToolUse"|"matcher"[[:space:]]*:[[:space:]]*"\*"' "$WARD_E2E_CODEX_DIR/hooks.json" >/dev/null; then
-  printf '%s\n' 'Ward E2E: legacy or wildcard Ward hook remained installed' >&2
+  printf '%s\n' 'Ward E2E: unexpected or wildcard Ward hook was installed' >&2
   exit 1
 fi
 
 sandbox() {
-  ward_env "$WARD_E2E_CODEX" sandbox -P ward-baseline -C "$WARD_E2E_WORKSPACE" "$@"
+  ward_env "$WARD_E2E_CODEX" sandbox -P ward -C "$WARD_E2E_WORKSPACE" "$@"
 }
 
 # Keep the bounded expansion depth exercised without claiming unbounded
@@ -148,7 +149,7 @@ for ordinary in \
   server.pem \
   private-notes.pem \
   deployment-secret.yml \
-  schemas/user-credential.json \
+  fixtures/user-credential.json \
   .npmrc; do
   sandbox /bin/sh -c 'cat "$1" >/dev/null && printf "updated\n" > "$1"' sh "$ordinary"
 done
@@ -179,8 +180,8 @@ for protected_anchor in "$WARD_E2E_MANAGED_BIN_DIR" "$WARD_E2E_STATE_DIR/ward"; 
   test -e "$protected_anchor"
 done
 
-audit_snapshot() {
-  find "$WARD_E2E_STATE_DIR/ward/v1" -type f -print | LC_ALL=C sort | while IFS= read -r file; do
+state_snapshot() {
+  find "$WARD_E2E_STATE_DIR/ward/core" -type f -print | LC_ALL=C sort | while IFS= read -r file; do
     cksum "$file"
     if timestamp=$(stat -f '%m' "$file" 2>/dev/null); then
       :
@@ -191,40 +192,51 @@ audit_snapshot() {
   done
 }
 
-# A safe matched command must be a true zero-output, zero-audit defer.
-WARD_E2E_BEFORE=$(audit_snapshot)
-SAFE_PAYLOAD='{"session_id":"ward-e2e-session","cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","model":"gpt-test","permission_mode":"default","turn_id":"ward-e2e-safe","transcript_path":null,"tool_name":"Bash","tool_input":{"command":"cat .env"},"tool_use_id":"ward-e2e-safe-tool"}'
+# Every Hook outcome must leave persistent Ward state byte-identical.
+WARD_E2E_BEFORE=$(state_snapshot)
+SAFE_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cat .env"}}'
 printf '%s' "$SAFE_PAYLOAD" | ward_env "$WARD_E2E_MANAGED_BIN" hook codex-pre-tool-use >"$WARD_E2E_TMP/safe.stdout" 2>"$WARD_E2E_TMP/safe.stderr"
 test ! -s "$WARD_E2E_TMP/safe.stdout"
 test ! -s "$WARD_E2E_TMP/safe.stderr"
-test "$WARD_E2E_BEFORE" = "$(audit_snapshot)"
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 
-# A catastrophic request is denied once and creates one verifiable event.
-DENY_PAYLOAD='{"session_id":"ward-e2e-session","cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","model":"gpt-test","permission_mode":"default","turn_id":"ward-e2e-deny","transcript_path":null,"tool_name":"Bash","tool_input":{"command":"rm -rf ."},"tool_use_id":"ward-e2e-deny-tool"}'
+# A catastrophic request is denied without recording the attempt.
+DENY_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf ."}}'
 printf '%s' "$DENY_PAYLOAD" | ward_env "$WARD_E2E_MANAGED_BIN" hook codex-pre-tool-use >"$WARD_E2E_TMP/deny.stdout" 2>"$WARD_E2E_TMP/deny.stderr"
 grep -F '"permissionDecision":"deny"' "$WARD_E2E_TMP/deny.stdout" >/dev/null
+test "$(wc -l < "$WARD_E2E_TMP/deny.stdout" | tr -d '[:space:]')" = 1
 test ! -s "$WARD_E2E_TMP/deny.stderr"
-ward_env "$WARD_E2E_MANAGED_BIN" audit verify --project "$WARD_E2E_WORKSPACE" --json | grep -F '"valid":true' >/dev/null
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
+
+# Adapter/evaluator errors fail open silently and remain persistence-free.
+ERROR_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}'
+printf '%s' "$ERROR_PAYLOAD" | ward_env "$WARD_E2E_MANAGED_BIN" hook codex-pre-tool-use >"$WARD_E2E_TMP/error.stdout" 2>"$WARD_E2E_TMP/error.stderr"
+test ! -s "$WARD_E2E_TMP/error.stdout"
+test ! -s "$WARD_E2E_TMP/error.stderr"
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 
 # Healthy SessionStart is silent; trusted Doctor stays available outside the
 # guarded project sandbox.
-SESSION_PAYLOAD='{"session_id":"ward-e2e-session","cwd":"'"$WARD_E2E_WORKSPACE"'","model":"gpt-test","permission_mode":"default","transcript_path":null,"hook_event_name":"SessionStart","source":"startup"}'
+SESSION_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"SessionStart"}'
 printf '%s' "$SESSION_PAYLOAD" | ward_env "$WARD_E2E_MANAGED_BIN" hook codex-session-start >"$WARD_E2E_TMP/session.stdout" 2>"$WARD_E2E_TMP/session.stderr"
 test ! -s "$WARD_E2E_TMP/session.stdout"
 test ! -s "$WARD_E2E_TMP/session.stderr"
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 
 DOCTOR_OUTPUT=$(ward_env "$WARD_E2E_MANAGED_BIN" doctor --project "$WARD_E2E_WORKSPACE" --json)
 printf '%s' "$DOCTOR_OUTPUT" | grep -F '"healthy":true' >/dev/null
 printf '%s' "$DOCTOR_OUTPUT" | grep -F '"id":"permissions.state_topology","status":"pass"' >/dev/null
 printf '%s' "$DOCTOR_OUTPUT" | grep -F '"id":"permissions.control_topology","status":"pass"' >/dev/null
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 if sandbox "$WARD_E2E_MANAGED_BIN" doctor --project "$WARD_E2E_WORKSPACE" --json >/dev/null 2>&1; then
   printf '%s\n' 'Ward E2E: guarded process unexpectedly gained Doctor access to denied state' >&2
   exit 1
 fi
+test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 
-WARD_E2E_KEY="$WARD_E2E_STATE_DIR/ward/v1/master.key"
-if sandbox /bin/sh -c 'cat "$1"' sh "$WARD_E2E_KEY" >/dev/null 2>&1; then
-  printf '%s\n' 'Ward E2E: Ward master key read escaped the native profile' >&2
+WARD_E2E_JOURNAL="$WARD_E2E_STATE_DIR/ward/core/integration-journal.json"
+if sandbox /bin/sh -c 'cat "$1"' sh "$WARD_E2E_JOURNAL" >/dev/null 2>&1; then
+  printf '%s\n' 'Ward E2E: Ward integration journal read escaped the native profile' >&2
   exit 1
 fi
 
@@ -234,5 +246,9 @@ if [ -e "$WARD_E2E_CODEX_DIR/hooks.json" ]; then
   printf '%s\n' 'Ward E2E: uninstall did not restore absent hooks.json' >&2
   exit 1
 fi
-test -f "$WARD_E2E_KEY"
-printf '%s\n' 'PASS: isolated Codex ambient-kernel install/defer/deny/uninstall E2E'
+test ! -e "$WARD_E2E_JOURNAL"
+if [ -d "$WARD_E2E_STATE_DIR/ward/core" ] && find "$WARD_E2E_STATE_DIR/ward/core" -type f -print | grep . >/dev/null 2>&1; then
+  printf '%s\n' 'Ward E2E: uninstall left persistent Ward files' >&2
+  exit 1
+fi
+printf '%s\n' 'PASS: isolated Codex ambient-kernel install/defer/deny/uninstall zero-persistence E2E'

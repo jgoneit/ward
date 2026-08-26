@@ -215,7 +215,7 @@ func TestLinuxFindSignedMindepthDefersUnsupportedValue(t *testing.T) {
 	boundaries, err := ResolveBoundarySet(BoundaryOptions{
 		CWD:              "/workspace",
 		HomeDir:          "/home/alice",
-		WardControlPaths: []string{"/home/alice/.local/state/ward/v1"},
+		WardControlPaths: []string{"/home/alice/.local/state/ward/core"},
 		GOOS:             "linux",
 	})
 	if err != nil {
@@ -241,7 +241,7 @@ func TestLinuxGNUmoveOptionsPreserveCriticalSourceClassification(t *testing.T) {
 	boundaries, err := ResolveBoundarySet(BoundaryOptions{
 		CWD:              "/workspace",
 		HomeDir:          "/home/alice",
-		WardControlPaths: []string{"/home/alice/.local/state/ward/v1"},
+		WardControlPaths: []string{"/home/alice/.local/state/ward/core"},
 		GOOS:             "linux",
 	})
 	if err != nil {
@@ -271,7 +271,7 @@ func TestLinuxGNUmoveOptionsPreserveCriticalSourceClassification(t *testing.T) {
 		"mv -vS '' .git /tmp/x",
 		"mv -t/tmp .git",
 		"mv -bv .git /tmp/x",
-		"mv --backup /home/alice/.local/state/ward/v1 /tmp/x",
+		"mv --backup /home/alice/.local/state/ward/core /tmp/x",
 		"mv --exchange .git ordinary",
 		"mv --exchange ordinary .git",
 		"mv --exchange -T ordinary .git",
