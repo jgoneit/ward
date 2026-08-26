@@ -27,7 +27,7 @@ archives:
       - goos: windows
         formats: [zip]
     name_template: >-
-      ward_{{ trimPrefix .Version "v" }}_{{ .Os }}_{{ .Arch }}
+      ward_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
       - LICENSE
       - README.md
