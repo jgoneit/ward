@@ -112,3 +112,7 @@ finally {
     }
     if (Test-Path -LiteralPath $testTemp) { Remove-Item -Recurse -Force -LiteralPath $testTemp }
 }
+
+# Expected refusal probes leave a nonzero native status behind. Reaching this
+# point means every assertion and cleanup operation succeeded.
+exit 0
