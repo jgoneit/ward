@@ -56,13 +56,13 @@ else
 	if [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; then
 		ward_refs=1
 	elif [ -f "$hooks_file" ]; then
-		if LC_ALL=C grep -Fq "$binary" "$hooks_file" || LC_ALL=C grep -Eq 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)' "$hooks_file"; then
+		if LC_ALL=C grep -Fq "$binary" "$hooks_file" || LC_ALL=C grep -Eq 'hook codex-(session-start|pre-tool-use)' "$hooks_file"; then
 			ward_refs=1
 		fi
 	fi
 	if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
 		ward_refs=1
-	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq '# >>> ward (default permissions|permission profile) v[12] >>>|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions[[:space:]]*=[[:space:]]*"ward-baseline"|\[permissions\.ward-baseline\]' "$config_file"; then
+	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq '# >>> ward (default permissions|permission profile) v3 >>>|# ward:migrated-sandbox-mode:v3|default_permissions[[:space:]]*=[[:space:]]*"ward"|\[permissions\.ward\]' "$config_file"; then
 		ward_refs=1
 	fi
 	if [ "$ward_refs" -eq 1 ]; then
@@ -72,4 +72,4 @@ else
 	printf '%s\n' 'Ward integration is already absent; no Ward hook or config references were found.'
 fi
 
-printf '%s\n' 'Ward audit state and key were preserved.'
+printf '%s\n' 'Ward state directory was preserved.'

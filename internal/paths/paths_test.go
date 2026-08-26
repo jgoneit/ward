@@ -14,9 +14,6 @@ func TestResolveUnixDefaults(t *testing.T) {
 	if got.ConfigFile != filepath.Join(home, ".codex", "config.toml") || got.HooksFile != filepath.Join(home, ".codex", "hooks.json") {
 		t.Fatalf("Codex paths = %#v", got)
 	}
-	if got.PolicyFile != filepath.Join(home, ".codex", "ward", "policy.toml") {
-		t.Fatalf("PolicyFile = %q", got.PolicyFile)
-	}
 }
 
 func TestResolveHonorsAbsoluteCodexHome(t *testing.T) {
@@ -31,7 +28,7 @@ func TestResolveHonorsAbsoluteCodexHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CodexDir != codexRoot || got.ConfigFile != filepath.Join(codexRoot, "config.toml") {
+	if got.ConfigFile != filepath.Join(codexRoot, "config.toml") {
 		t.Fatalf("paths = %#v", got)
 	}
 }
@@ -63,8 +60,8 @@ func TestResolveWindowsDoesNotRequireAppData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CodexDir != filepath.Join(home, ".codex") {
-		t.Fatalf("CodexDir = %q", got.CodexDir)
+	if got.ConfigFile != filepath.Join(home, ".codex", "config.toml") {
+		t.Fatalf("ConfigFile = %q", got.ConfigFile)
 	}
 }
 

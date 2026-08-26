@@ -1,6 +1,6 @@
 //go:build darwin
 
-package audit
+package securefs
 
 import (
 	"os"
@@ -10,7 +10,7 @@ import (
 )
 
 func TestPrivateFileRejectsAndRepairsExtendedACL(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "master.key")
+	path := filepath.Join(t.TempDir(), "integration-journal.json")
 	if err := os.WriteFile(path, []byte("synthetic\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

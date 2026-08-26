@@ -119,7 +119,7 @@ ward_binary="$install_dir/ward"
 previous_binary="$tmp_dir/ward.previous"
 hooks_file="$codex_dir/hooks.json"
 config_file="$codex_dir/config.toml"
-journal_file="${state_base%/}/ward/v1/integration-journal.json"
+journal_file="${state_base%/}/ward/core/integration-journal.json"
 previous_hooks="$tmp_dir/hooks.previous"
 previous_config="$tmp_dir/config.previous"
 previous_journal="$tmp_dir/journal.previous"
@@ -236,10 +236,6 @@ if "$ward_binary" codex install --scope user --dry-run >"$preflight_out" 2>"$pre
     fi
     exit 1
   fi
-elif grep -q 'legacy sandbox settings require explicit --migrate-permissions' "$preflight_err"; then
-  printf '%s\n' 'Ward binary installed; Core is not active because legacy permissions require explicit migration.'
-  printf 'review: %s codex install --scope user --migrate-permissions --dry-run\n' "$ward_binary"
-  printf 'activate: %s codex install --scope user --migrate-permissions\n' "$ward_binary"
 else
   sed -n '1,20p' "$preflight_err" >&2
   restore_installation_snapshot

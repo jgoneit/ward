@@ -27,10 +27,10 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 	home := filepath.Join(root, "home")
 	codexHome := filepath.Join(home, ".codex")
 	workspace := filepath.Join(home, "project")
-	stateDir := filepath.Join(home, ".local", "state", "ward", "v1")
+	stateDir := filepath.Join(home, ".local", "state", "ward", "core")
 	options := Options{Paths: Paths{
 		HomeDir: home, ConfigFile: filepath.Join(codexHome, "config.toml"), HooksFile: filepath.Join(codexHome, "hooks.json"),
-		BinaryPath: filepath.Join(codexHome, "ward", "bin", "ward"), UserPolicyPath: filepath.Join(codexHome, "ward", "policy.toml"), StateDir: stateDir,
+		BinaryPath: filepath.Join(codexHome, "ward", "bin", "ward"), StateDir: stateDir,
 	}}
 	for _, directory := range []string{codexHome, workspace, stateDir, filepath.Dir(options.Paths.BinaryPath)} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -70,7 +70,7 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 	}
 	homeAuth := filepath.Join(home, ".config", "gh", "hosts.yml")
 	deepSecret := filepath.Join(workspace, "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", ".env.production")
-	for _, path := range []string{homeAuth, deepSecret, options.Paths.UserPolicyPath, filepath.Join(stateDir, "audit-key.json")} {
+	for _, path := range []string{homeAuth, deepSecret, options.Paths.journalFile()} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -129,7 +129,7 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 		}
 	})
 	for name, path := range map[string]string{
-		"config": options.Paths.ConfigFile, "hooks": options.Paths.HooksFile, "policy": options.Paths.UserPolicyPath, "state": filepath.Join(stateDir, "audit-key.json"),
+		"config": options.Paths.ConfigFile, "hooks": options.Paths.HooksFile, "state": options.Paths.journalFile(),
 	} {
 		t.Run("deny Ward "+name, func(t *testing.T) {
 			if output, err := run(path, false); err == nil {

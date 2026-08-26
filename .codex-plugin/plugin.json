@@ -13,6 +13,6 @@
     "developerName": "jgoneit",
     "category": "Developer Tools",
     "capabilities": [],
-    "defaultPrompt": "Recover safely from a Ward denial or explain a Ward session-health warning. Stay silent for ordinary deferred requests, and run Doctor or audit checks only through an already-authorized Host path."
+    "defaultPrompt": "Recover safely from a Ward denial or explain a Ward session-health warning. Stay silent for ordinary deferred requests, and run Doctor only through an already-authorized Host path."
   }
 }

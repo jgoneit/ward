@@ -26,13 +26,13 @@ $wardOldGHConfigDir = $env:GH_CONFIG_DIR
 
 function Invoke-WardSandbox {
     param([string]$Script)
-    $arguments = @('sandbox', '-P', 'ward-baseline', '-C', $wardE2EWorkspace, 'powershell', '-NoProfile', '-Command', $Script)
+    $arguments = @('sandbox', '-P', 'ward', '-C', $wardE2EWorkspace, 'powershell', '-NoProfile', '-Command', $Script)
     & $CodexBinary @arguments
     return $LASTEXITCODE
 }
 
-function Get-WardAuditSnapshot {
-    $state = Join-Path $wardE2EStateDir 'Ward\state\v1'
+function Get-WardStateSnapshot {
+    $state = Join-Path $wardE2EStateDir 'Ward\state\core'
     if (-not (Test-Path -LiteralPath $state)) { return '' }
     return ((Get-ChildItem -LiteralPath $state -File -Recurse | Sort-Object FullName | ForEach-Object {
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash
@@ -48,7 +48,7 @@ try {
         $wardE2ECodexDir,
         $wardE2EManagedBinDir,
         (Join-Path $wardE2EWorkspace 'nested'),
-        (Join-Path $wardE2EWorkspace 'schemas'),
+        (Join-Path $wardE2EWorkspace 'fixtures'),
         $wardE2EDeep,
         $wardE2ESibling,
         $wardE2ECustomGHDir,
@@ -61,7 +61,7 @@ try {
     Copy-Item -LiteralPath $WardBinary -Destination $wardE2EManagedBin
 
     $configPath = Join-Path $wardE2ECodexDir 'config.toml'
-    @('approval_policy = "never"', 'sandbox_mode = "danger-full-access"') | Set-Content -Encoding utf8NoBOM $configPath
+    @('approval_policy = "never"', 'model = "gpt-test"') | Set-Content -Encoding utf8NoBOM $configPath
     $originalConfig = [System.IO.File]::ReadAllBytes($configPath)
 
     $protectedFixtures = @{
@@ -90,7 +90,7 @@ try {
         'server.pem' = 'PUBLIC CERTIFICATE FIXTURE'
         'private-notes.pem' = 'PUBLIC NOTES FIXTURE'
         'deployment-secret.yml' = 'ordinary: true'
-        'schemas\user-credential.json' = '{"type":"schema"}'
+        'fixtures\user-credential.json' = '{"type":"ordinary"}'
         '.npmrc' = 'registry=https://example.invalid'
     }
     foreach ($entry in $ordinaryFixtures.GetEnumerator()) {
@@ -118,15 +118,20 @@ try {
     $env:USERPROFILE = $wardE2EHome
     $env:GH_CONFIG_DIR = $wardE2ECustomGHDir
 
-    & $wardE2EManagedBin codex install --scope user --migrate-permissions
+    & $wardE2EManagedBin codex install --scope user
     if ($LASTEXITCODE -ne 0) { throw 'Ward E2E: install failed' }
+    $wardJournal = Join-Path $wardE2EStateDir 'Ward\state\core\integration-journal.json'
+    if (-not (Test-Path -LiteralPath $wardJournal -PathType Leaf)) { throw 'Ward E2E: v3 integration journal is missing' }
+    $stateFiles = @(Get-ChildItem -LiteralPath (Split-Path $wardJournal) -File -Recurse)
+    if ($stateFiles.Count -ne 1 -or $stateFiles[0].FullName -cne $wardJournal) { throw 'Ward E2E: install wrote unexpected persistent state' }
 
     $configText = Get-Content -Raw $configPath
     if ($configText -notmatch 'approval_policy\s*=\s*"never"') { throw 'Ward E2E: approval_policy changed' }
-    if ($configText -match '(?m)^\s*sandbox_mode\s*=') { throw 'Ward E2E: sandbox_mode remained active' }
+    if ($configText -notmatch 'default_permissions\s*=\s*"ward"') { throw 'Ward E2E: ward profile was not selected' }
+    if ($configText -notmatch '\[permissions\.ward\]') { throw 'Ward E2E: ward profile was not installed' }
     $hooksText = Get-Content -Raw (Join-Path $wardE2ECodexDir 'hooks.json')
     if ($hooksText -notmatch '"SessionStart"' -or $hooksText -notmatch '"PreToolUse"') { throw 'Ward E2E: ambient hooks are incomplete' }
-    if ($hooksText -match '"PermissionRequest"|"PostToolUse"|"matcher"\s*:\s*"\*"') { throw 'Ward E2E: legacy or wildcard hook remained' }
+    if ($hooksText -match '"PermissionRequest"|"PostToolUse"|"matcher"\s*:\s*"\*"') { throw 'Ward E2E: unexpected or wildcard hook was installed' }
 
     foreach ($relativePath in $protectedFixtures.Keys) {
         $escaped = $relativePath.Replace("'", "''")
@@ -158,24 +163,30 @@ try {
         if (-not (Test-Path -LiteralPath $anchor)) { throw "Ward E2E: protected directory disappeared: $anchor" }
     }
 
-    $before = Get-WardAuditSnapshot
-    $safePayload = '{"session_id":"ward-e2e-session","cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","model":"gpt-test","permission_mode":"default","turn_id":"ward-e2e-safe","transcript_path":null,"tool_name":"Bash","tool_input":{"command":"Get-Content .env"},"tool_use_id":"ward-e2e-safe-tool"}'
+    $before = Get-WardStateSnapshot
+    $safePayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Get-Content .env"}}'
     $safeError = Join-Path $wardE2ETemp 'safe.stderr'
     $safeOutput = @($safePayload | & $wardE2EManagedBin hook codex-pre-tool-use 2> $safeError)
     if ($LASTEXITCODE -ne 0 -or $safeOutput.Count -ne 0 -or (Get-Item $safeError).Length -ne 0) { throw 'Ward E2E: safe matched request was not a silent defer' }
-    if ($before -ne (Get-WardAuditSnapshot)) { throw 'Ward E2E: safe defer mutated audit state' }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: safe defer changed persistent Ward state' }
 
-    $denyPayload = '{"session_id":"ward-e2e-session","cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","model":"gpt-test","permission_mode":"default","turn_id":"ward-e2e-deny","transcript_path":null,"tool_name":"Bash","tool_input":{"command":"Remove-Item -Recurse -Force .; Write-Output done"},"tool_use_id":"ward-e2e-deny-tool"}'
+    $denyPayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Remove-Item -Recurse -Force .; Write-Output done"}}'
     $denyError = Join-Path $wardE2ETemp 'deny.stderr'
     $denyOutput = @($denyPayload | & $wardE2EManagedBin hook codex-pre-tool-use 2> $denyError)
-    if ($LASTEXITCODE -ne 0 -or ($denyOutput -join '') -notmatch '"permissionDecision"\s*:\s*"deny"' -or (Get-Item $denyError).Length -ne 0) { throw 'Ward E2E: catastrophic request was not denied cleanly' }
-    $verify = (& $wardE2EManagedBin audit verify --project $wardE2EWorkspace --json | Out-String | ConvertFrom-Json)
-    if ($LASTEXITCODE -ne 0 -or $verify.schema -ne 'ward-audit-verify/v1' -or -not $verify.result.valid) { throw 'Ward E2E: sparse audit chain did not verify' }
+    if ($LASTEXITCODE -ne 0 -or $denyOutput.Count -ne 1 -or ($denyOutput -join '') -notmatch '"permissionDecision"\s*:\s*"deny"' -or (Get-Item $denyError).Length -ne 0) { throw 'Ward E2E: catastrophic request was not denied cleanly' }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: deny changed persistent Ward state' }
 
-    $sessionPayload = '{"session_id":"ward-e2e-session","cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","model":"gpt-test","permission_mode":"default","transcript_path":null,"hook_event_name":"SessionStart","source":"startup"}'
+    $errorPayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}'
+    $errorOutputPath = Join-Path $wardE2ETemp 'error.stderr'
+    $errorOutput = @($errorPayload | & $wardE2EManagedBin hook codex-pre-tool-use 2> $errorOutputPath)
+    if ($LASTEXITCODE -ne 0 -or $errorOutput.Count -ne 0 -or (Get-Item $errorOutputPath).Length -ne 0) { throw 'Ward E2E: evaluator error was not a silent Host defer' }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: evaluator error changed persistent Ward state' }
+
+    $sessionPayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"SessionStart"}'
     $sessionError = Join-Path $wardE2ETemp 'session.stderr'
     $sessionOutput = @($sessionPayload | & $wardE2EManagedBin hook codex-session-start 2> $sessionError)
     if ($LASTEXITCODE -ne 0 -or $sessionOutput.Count -ne 0 -or (Get-Item $sessionError).Length -ne 0) { throw 'Ward E2E: healthy SessionStart was not silent' }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: SessionStart changed persistent Ward state' }
 
     $doctor = (& $wardE2EManagedBin doctor --project $wardE2EWorkspace --json | Out-String | ConvertFrom-Json)
     if ($LASTEXITCODE -ne 0 -or -not $doctor.healthy) { throw 'Ward E2E: trusted Host-side Doctor failed' }
@@ -183,23 +194,29 @@ try {
         $check = $doctor.checks | Where-Object { $_.id -eq $checkID } | Select-Object -First 1
         if (-not $check -or $check.status -ne 'pass') { throw "Ward E2E: default project topology did not pass: $checkID" }
     }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: Doctor changed persistent Ward state' }
     $managedBinEscaped = $wardE2EManagedBin.Replace("'", "''")
     $workspaceEscaped = $wardE2EWorkspace.Replace("'", "''")
     $exitCode = Invoke-WardSandbox "& '$managedBinEscaped' doctor --project '$workspaceEscaped' --json | Out-Null; exit `$LASTEXITCODE"
     if ($exitCode -eq 0) { throw 'Ward E2E: guarded process unexpectedly gained Doctor access to denied state' }
+    if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: guarded Doctor attempt changed persistent Ward state' }
 
-    $wardKey = Join-Path $wardE2EStateDir 'Ward\state\v1\master.key'
-    $escapedKey = $wardKey.Replace("'", "''")
-    $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath '$escapedKey' | Out-Null"
-    if ($exitCode -eq 0) { throw 'Ward E2E: Ward master key read escaped the native profile' }
+    $escapedJournal = $wardJournal.Replace("'", "''")
+    $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath '$escapedJournal' | Out-Null"
+    if ($exitCode -eq 0) { throw 'Ward E2E: Ward integration journal read escaped the native profile' }
 
     & $wardE2EManagedBin codex uninstall --scope user
     if ($LASTEXITCODE -ne 0) { throw 'Ward E2E: uninstall failed' }
     $restored = [System.IO.File]::ReadAllBytes($configPath)
     if ([Convert]::ToBase64String($originalConfig) -ne [Convert]::ToBase64String($restored)) { throw 'Ward E2E: config bytes were not restored' }
     if (Test-Path -LiteralPath (Join-Path $wardE2ECodexDir 'hooks.json')) { throw 'Ward E2E: hooks.json was not restored to absent' }
-    if (-not (Test-Path -LiteralPath $wardKey -PathType Leaf)) { throw 'Ward E2E: uninstall removed audit key' }
-    Write-Output 'PASS: isolated native Windows Codex ambient-kernel install/defer/deny/uninstall E2E'
+    if (Test-Path -LiteralPath $wardJournal) { throw 'Ward E2E: uninstall left the integration journal' }
+    $coreState = Join-Path $wardE2EStateDir 'Ward\state\core'
+    if (Test-Path -LiteralPath $coreState) {
+        $remaining = @(Get-ChildItem -LiteralPath $coreState -File -Recurse)
+        if ($remaining.Count -ne 0) { throw 'Ward E2E: uninstall left persistent Ward files' }
+    }
+    Write-Output 'PASS: isolated native Windows Codex ambient-kernel install/defer/deny/uninstall zero-persistence E2E'
 }
 finally {
     $env:CODEX_HOME = $wardOldCodexHome

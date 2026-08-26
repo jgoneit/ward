@@ -1,6 +1,6 @@
 ---
 name: ward
-description: Recover safely from a Ward WARD_* denial, explain a Ward session-health warning, or perform an explicitly requested Ward status, doctor, audit, install, or uninstall workflow. Do not invoke for ordinary deferred tool requests or use Ward to grant access.
+description: Recover safely from a Ward WARD_* denial, explain a Ward session-health warning, or perform an explicitly requested Ward status, doctor, install, or uninstall workflow. Do not invoke for ordinary deferred tool requests or use Ward to grant access.
 ---
 
 # Ward
@@ -18,7 +18,7 @@ authoritative.
   weaken permissions or disable Ward. Use a deeper Doctor flow only when the
   user asks or the warning blocks the requested work.
 - On an ordinary `defer`, do nothing: do not invoke this Skill, run Doctor,
-  inspect audit state, add an approval prompt, or describe Ward to the user.
+  add an approval prompt, or describe Ward to the user.
 
 Never reflect raw commands, patches, paths, environment variables, output, or
 secret material from a denial. Do not repeat a blocked destructive request in
@@ -28,30 +28,27 @@ a different spelling merely to evade the rule.
 
 Plugin presence does not prove that the user-global Core, SessionStart hook,
 PreToolUse hook, or native permission profile is active. For an explicit
-status, Doctor, or audit request:
+status or Doctor request:
 
 1. Locate `ward` and run `ward --version`.
 2. Prefer the redacted SessionStart health result already supplied by the Host.
 3. Run `ward doctor --project <current-project> --json` only through an
    already-authorized Host path or trusted local terminal.
-4. Use the same path for `ward audit verify` before `audit show` or `stats`.
 
 An ordinary guarded tool process intentionally cannot read Ward's protected
-control or audit state. If no trusted execution path exists, report the check
-as `Not run (trusted Host execution required)` and provide the exact terminal
-command. Do not reinterpret `EPERM` as an unhealthy installation or request
-weaker permissions. Report `PASS`, `FAIL`, and `Not run` separately.
+control or integration state. If no trusted execution path exists, report the
+check as `Not run (trusted Host execution required)` and provide the exact
+terminal command. Do not reinterpret `EPERM` as an unhealthy installation or
+request weaker permissions. Report `PASS`, `FAIL`, and `Not run` separately.
 
 ## Explain the narrow contract
 
-- `deny`: a high-confidence destructive rule matched. The Pre attempt is
-  offered to the bounded privacy-preserving audit writer; a healthy initialized
-  store records one event, but audit failure does not change the deny. A record
-  is not proof of execution.
-- `defer`: Ward emits no output, performs no audit write, and adds no prompt.
-- `error`: Ward emits no permission decision and defers to the Host. A valid,
-  attributable Pre error may be recorded; malformed input is not assigned to a
-  guessed project.
+- `deny`: a high-confidence destructive rule matched. Ward emits only the
+  canonical denial and performs no persistent Hook write.
+- `defer`: Ward emits no output, performs no persistent Hook write, and adds no
+  prompt.
+- `error`: Ward emits no permission decision and defers to the Host. It emits no
+  output and performs no persistent Hook write.
 
 The native profile protects a bounded set of high-confidence workspace secret
 names plus Ward control state. It intentionally does not claim every custom
@@ -69,11 +66,10 @@ enforcement.
 
 ## Mutation boundary
 
-Never install, uninstall, migrate permissions, or repair audit data during a
-diagnostic or explanation request. Perform those mutations only when the user
-explicitly requests them. Show a dry run when supported, preserve
-`approval_policy` exactly, and require explicit `--migrate-permissions` before
-replacing legacy `sandbox_mode` settings.
+Never install or uninstall during a diagnostic or explanation request. Perform
+those mutations only when the user explicitly requests them. Show a dry run
+when supported, preserve `approval_policy` exactly, and stop on unsupported
+Host permission configuration instead of rewriting it.
 
 Ward must never output `permissionDecision: allow` or `ask`, create a separate
 approval step, or suggest disabling Ward to finish ordinary development work.

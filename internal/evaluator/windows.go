@@ -1,7 +1,6 @@
 package evaluator
 
 import (
-	"path"
 	"strconv"
 	"strings"
 	"unicode"
@@ -1077,10 +1076,4 @@ func (e *Evaluator) normalizePowerShellFileOperand(value string) string {
 
 func isWindowsAbsolutePath(value string) bool {
 	return len(value) >= 3 && value[1] == ':' && value[2] == '/' || strings.HasPrefix(value, "//")
-}
-
-func windowsPathWithin(candidate, root string) bool {
-	candidate = strings.TrimSuffix(path.Clean(candidate), "/")
-	root = strings.TrimSuffix(path.Clean(root), "/")
-	return strings.EqualFold(candidate, root) || strings.HasPrefix(strings.ToLower(candidate), strings.ToLower(root)+"/")
 }

@@ -9,41 +9,17 @@ import (
 	"github.com/jgoneit/ward/internal/evaluator"
 )
 
-func TestUnknownHostedAndReadOnlyMCPToolsDefer(t *testing.T) {
-	engine := adapterEvaluator(t, "/workspace")
-	for name, tool := range map[string]string{
-		"unknown local":     "custom_status_tool",
-		"hosted MCP":        "mcp__github__delete_file",
-		"filesystem read":   "mcp__filesystem__read_file",
-		"filesystem search": "mcp__filesystem__search_files",
-	} {
-		t.Run(name, func(t *testing.T) {
-			payload := officialFixture()
-			payload["tool_name"] = tool
-			payload["tool_input"] = map[string]any{"path": ".env"}
-			raw, _ := jsonMarshal(payload)
-			invocation, err := Decode(raw, EventPreToolUse)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if decision := engine.Evaluate(invocation.Request); decision.Outcome != contract.OutcomeDefer {
-				t.Fatalf("decision = %#v, want defer", decision)
-			}
-		})
-	}
-}
-
 func TestOfficialFilesystemDeleteOfGitMetadataDenies(t *testing.T) {
 	engine := adapterEvaluator(t, "/workspace")
 	payload := officialFixture()
 	payload["tool_name"] = "mcp__filesystem__delete_file"
 	payload["tool_input"] = map[string]any{"path": "/workspace/.git/config"}
 	raw, _ := jsonMarshal(payload)
-	invocation, err := Decode(raw, EventPreToolUse)
+	request, err := DecodePreToolUse(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision := engine.Evaluate(invocation.Request)
+	decision := engine.Evaluate(request)
 	if decision.Outcome != contract.OutcomeDeny || decision.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
 		t.Fatalf("decision = %#v", decision)
 	}
@@ -82,14 +58,14 @@ func TestStructuredDeleteUsesOnlyReviewedTargetRole(t *testing.T) {
 			payload["tool_name"] = "mcp__filesystem__delete_file"
 			payload["tool_input"] = test.toolInput
 			raw, _ := jsonMarshal(payload)
-			invocation, err := Decode(raw, EventPreToolUse)
+			request, err := DecodePreToolUse(raw)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(invocation.Request.Input.Paths, test.wantPaths) {
-				t.Fatalf("paths = %#v, want %#v", invocation.Request.Input.Paths, test.wantPaths)
+			if !reflect.DeepEqual(request.Input.Paths, test.wantPaths) {
+				t.Fatalf("paths = %#v, want %#v", request.Input.Paths, test.wantPaths)
 			}
-			if decision := engine.Evaluate(invocation.Request); decision.Outcome != test.want {
+			if decision := engine.Evaluate(request); decision.Outcome != test.want {
 				t.Fatalf("decision = %#v, want %s", decision, test.want)
 			}
 		})
@@ -103,7 +79,7 @@ func TestStructuredMoveRolesSurviveAdapterRoundTrip(t *testing.T) {
 		wantPaths                             []string
 		wantOutcome                           contract.Outcome
 	}{
-		{"workspace boundary source", `{"source":"/workspace","destination":"/backup"}`, "/workspace", "/backup", []string{"/backup", "/workspace"}, contract.OutcomeDefer},
+		{"workspace boundary source", `{"source":"/workspace","destination":"/backup"}`, "/workspace", "/backup", []string{"/workspace", "/backup"}, contract.OutcomeDefer},
 		{"workspace boundary destination", `{"source":"/ordinary","destination":"/workspace"}`, "/ordinary", "/workspace", []string{"/ordinary", "/workspace"}, contract.OutcomeDefer},
 	}
 	for _, tt := range tests {
@@ -113,15 +89,15 @@ func TestStructuredMoveRolesSurviveAdapterRoundTrip(t *testing.T) {
 	"transcript_path":null,"model":"gpt-test","permission_mode":"default","turn_id":"turn_1",
   "tool_name":"mcp__filesystem__move_file","tool_use_id":"call_move","tool_input":` + tt.toolInput + `
 }`)
-			invocation, err := Decode(raw, EventPreToolUse)
+			request, err := DecodePreToolUse(raw)
 			if err != nil {
 				t.Fatal(err)
 			}
-			input := invocation.Request.Input
+			input := request.Input
 			if !reflect.DeepEqual(input.Paths, tt.wantPaths) || input.SourcePath != tt.wantSource || input.DestinationPath != tt.wantDest {
 				t.Fatalf("adapter lost move roles: %#v", input)
 			}
-			if decision := engine.Evaluate(invocation.Request); decision.Outcome != tt.wantOutcome {
+			if decision := engine.Evaluate(request); decision.Outcome != tt.wantOutcome {
 				t.Fatalf("decision = %#v, want %s", decision, tt.wantOutcome)
 			}
 		})
@@ -135,14 +111,14 @@ func TestStructuredMoveConflictingAliasesNeverGuesses(t *testing.T) {
   "tool_name":"mcp__filesystem__move_file","tool_use_id":"call_move",
   "tool_input":{"source":"z-source","source_path":"other-source","destination":"a-destination"}
 }`)
-	invocation, err := Decode(raw, EventPreToolUse)
+	request, err := DecodePreToolUse(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if invocation.Request.Input.SourcePath != "" || invocation.Request.Input.DestinationPath != "a-destination" {
-		t.Fatalf("conflicting aliases were guessed: %#v", invocation.Request.Input)
+	if request.Input.SourcePath != "" || request.Input.DestinationPath != "a-destination" {
+		t.Fatalf("conflicting aliases were guessed: %#v", request.Input)
 	}
-	decision := adapterEvaluator(t, "/workspace").Evaluate(invocation.Request)
+	decision := adapterEvaluator(t, "/workspace").Evaluate(request)
 	if decision.Outcome != contract.OutcomeDefer || decision.CoverageGap == nil || decision.CoverageGap.Code != "missing_structured_move_roles" {
 		t.Fatalf("decision = %#v", decision)
 	}

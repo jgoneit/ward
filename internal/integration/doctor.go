@@ -2,7 +2,6 @@ package integration
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jgoneit/ward/internal/audit"
+	"github.com/jgoneit/ward/internal/securefs"
+	"github.com/pelletier/go-toml/v2"
 )
 
 const doctorSchemaV1 = "ward-doctor/v1"
@@ -43,12 +43,12 @@ func Doctor(options Options) DoctorReport {
 		add("journal", CheckFail, err.Error())
 		return report
 	}
-	if journal.Schema != journalSchemaV2 {
-		add("journal.version", CheckFail, "Ward integration journal requires the atomic v2 migration.")
+	if journal.Schema != journalSchemaV3 {
+		add("journal.version", CheckFail, "Ward integration journal must use v3.")
 	} else {
-		add("journal.version", CheckPass, "Ward integration journal uses v2.")
+		add("journal.version", CheckPass, "Ward integration journal uses v3.")
 	}
-	if journal.ProfileName != options.profileName() || filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
+	if journal.ProfileName != DefaultProfileName || filepath.Clean(journal.BinaryPath) != filepath.Clean(options.Paths.BinaryPath) {
 		add("journal.identity", CheckFail, "Journal identity does not match this Ward installation.")
 	} else {
 		add("journal.identity", CheckPass, "Ward integration journal identity is valid.")
@@ -88,17 +88,9 @@ func Doctor(options Options) DoctorReport {
 			add("permissions.changed", CheckWarn, "config.toml changed after installation; managed bytes were checked separately.")
 		}
 	}
-
-	if _, policyExists, err := readOptional(options.Paths.UserPolicyPath); err != nil {
-		add("policy.additive", CheckFail, "Ward additive policy path could not be inspected.")
-	} else if policyExists {
-		add("policy.additive", CheckFail, "Additive user policy conflicts with the ambient kernel.")
-	} else {
-		add("policy.additive", CheckPass, "No additive user policy is active.")
-	}
 	if info, err := os.Lstat(options.Paths.StateDir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		add("state", CheckFail, "Ward state directory is missing or not a real directory.")
-	} else if err := audit.InspectPrivateDirectory(options.Paths.StateDir); err != nil {
+	} else if err := securefs.InspectPrivateDirectory(options.Paths.StateDir); err != nil {
 		add("state.permissions", CheckFail, "Ward state directory permissions are not private.")
 	} else {
 		add("state.permissions", CheckPass, "Ward state directory permissions are private.")
@@ -132,6 +124,13 @@ func checkHooks(report *DoctorReport, raw []byte, binaryPath string) {
 		return
 	}
 	allPass := true
+	if event, found, err := findObsoleteWardHandler(hooks, binaryPath); err != nil {
+		add("hooks.obsolete", CheckFail, err.Error())
+		allPass = false
+	} else if found {
+		add("hooks.obsolete", CheckFail, fmt.Sprintf("Obsolete Ward %s handler is still installed.", event))
+		allPass = false
+	}
 	for _, spec := range wardHookSpecs {
 		groups, err := decodeGroups(hooks[spec.Event])
 		if err != nil {
@@ -147,46 +146,9 @@ func checkHooks(report *DoctorReport, raw []byte, binaryPath string) {
 		}
 		add("hooks."+spec.Event, CheckPass, "Ward handler has its canonical matcher and a 2 second command timeout.")
 	}
-	legacyCount, legacyConflict := countLegacyHandlers(hooks, binaryPath)
-	if legacyConflict || legacyCount > 0 {
-		add("hooks.legacy_stale", CheckFail, fmt.Sprintf("Legacy or modified Ward handlers remain: %d.", legacyCount))
-		allPass = false
-	} else {
-		add("hooks.legacy_stale", CheckPass, "No v1 PermissionRequest/PostToolUse handlers remain.")
-	}
 	if allPass {
 		add("hooks", CheckPass, "Exactly the two ambient Ward hook handlers are installed.")
 	}
-}
-
-func countLegacyHandlers(hooks map[string]json.RawMessage, binaryPath string) (int, bool) {
-	count := 0
-	for _, event := range managedHookEvents() {
-		groups, err := decodeGroups(hooks[event])
-		if err != nil {
-			return count, true
-		}
-		for _, rawGroup := range groups {
-			group, err := decodeGroup(rawGroup)
-			if err != nil {
-				return count, true
-			}
-			handlers, err := decodeHandlers(group["hooks"])
-			if err != nil {
-				return count, true
-			}
-			for _, handler := range handlers {
-				legacy, _, conflict, err := classifyWardHandler(handler, groupMatcher(group), event, binaryPath)
-				if err != nil || conflict {
-					return count, true
-				}
-				if legacy {
-					count++
-				}
-			}
-		}
-	}
-	return count, false
 }
 
 func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, options Options) {
@@ -201,10 +163,10 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 	} else {
 		add("hooks.feature", CheckPass, "Codex hooks are not explicitly disabled.")
 	}
-	if hasActiveLegacySandbox(raw) {
-		add("permissions.legacy_sandbox", CheckFail, "A legacy sandbox setting overrides permission profiles.")
+	if hasUnsupportedSandbox(raw) {
+		add("permissions.sandbox_mode", CheckFail, "sandbox_mode configuration overrides permission profiles.")
 	} else {
-		add("permissions.legacy_sandbox", CheckPass, "No legacy sandbox setting overrides permission profiles.")
+		add("permissions.sandbox_mode", CheckPass, "No sandbox_mode configuration overrides permission profiles.")
 	}
 	defaults := findAssignments(raw, "default_permissions")
 	selected := ""
@@ -233,7 +195,6 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 	checkNativeSecretVocabulary(report, profile)
 	for _, protected := range []struct{ id, path, mode string }{
 		{"permissions.state", options.Paths.StateDir, "deny"},
-		{"permissions.user_policy", options.Paths.UserPolicyPath, "deny"},
 		{"permissions.control_config", options.Paths.ConfigFile, "deny"},
 		{"permissions.control_hooks", options.Paths.HooksFile, "deny"},
 		{"permissions.control_binary", options.Paths.BinaryPath, "read"},
@@ -258,14 +219,15 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 		add("permissions.control_boundaries", CheckPass, "Only bounded Ward-owned relocation anchors are read-only.")
 	}
 	if containsInlineHooksTable(raw) {
-		if bytes.Contains(raw, []byte(options.Paths.BinaryPath)) || bytes.Contains(raw, []byte("ward hook codex-")) {
+		var parsed map[string]any
+		if err := toml.Unmarshal(raw, &parsed); err == nil && containsWardConfigHookValue(parsed["hooks"], options.Paths.BinaryPath) {
 			add("hooks.inline_ward", CheckFail, "Inline configuration also references Ward; duplicate Hook execution cannot be excluded.")
 		} else {
 			add("hooks.inline", CheckWarn, "config.toml also defines unrelated inline hooks; Codex merges them with hooks.json.")
 		}
 	}
 	if len(journal.ConfigEdits.SandboxOriginal) > 0 && bytes.Count(raw, journal.ConfigEdits.SandboxReplacement) != 1 {
-		add("permissions.migration", CheckFail, "Sandbox migration marker is missing or duplicated.")
+		add("permissions.rollback_marker", CheckFail, "The live-transition rollback marker is missing or duplicated.")
 	}
 }
 
@@ -300,7 +262,7 @@ func checkNativeSecretVocabulary(report *DoctorReport, profile []byte) {
 
 func checkPrivateFile(report *DoctorReport, id, path string) {
 	add := reportAdder(report)
-	if err := audit.InspectPrivateFile(path); err != nil {
+	if err := securefs.InspectPrivateFile(path); err != nil {
 		add(id, CheckFail, "Expected private regular file is missing or has unsafe permissions.")
 		return
 	}
@@ -325,14 +287,4 @@ func reportAdder(report *DoctorReport) func(string, CheckStatus, string) {
 			report.Healthy = false
 		}
 	}
-}
-
-func CleanPaths(paths Paths) Paths {
-	paths.HomeDir = filepath.Clean(paths.HomeDir)
-	paths.HooksFile = filepath.Clean(paths.HooksFile)
-	paths.ConfigFile = filepath.Clean(paths.ConfigFile)
-	paths.BinaryPath = filepath.Clean(paths.BinaryPath)
-	paths.UserPolicyPath = filepath.Clean(paths.UserPolicyPath)
-	paths.StateDir = filepath.Clean(paths.StateDir)
-	return paths
 }

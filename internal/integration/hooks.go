@@ -13,11 +13,8 @@ import (
 )
 
 const (
-	hookTimeoutSeconds           = 2
-	sessionStartMatcher          = `^(?:startup|resume|clear)$`
-	legacyAllMatcher             = "*"
-	legacyEventPermissionRequest = "PermissionRequest"
-	legacyEventPostToolUse       = "PostToolUse"
+	hookTimeoutSeconds  = 2
+	sessionStartMatcher = `^(?:startup|resume|clear)$`
 )
 
 type hookSpec struct {
@@ -31,18 +28,12 @@ var wardHookSpecs = []hookSpec{
 	{Event: codexadapter.EventPreToolUse, Subcommand: "codex-pre-tool-use", Matcher: codexadapter.DestructiveToolMatcher},
 }
 
-type legacyHookSpec struct {
-	Event         string
-	Subcommand    string
-	StatusMessage string
-}
-
-// legacyWardHookSpecs describes the exact v1 three-hook installation. It is
-// removal-only: v2 never installs PermissionRequest or PostToolUse.
-var legacyWardHookSpecs = []legacyHookSpec{
-	{Event: codexadapter.EventPreToolUse, Subcommand: "codex-pre-tool-use", StatusMessage: "Ward: evaluating tool request"},
-	{Event: legacyEventPermissionRequest, Subcommand: "codex-permission-request", StatusMessage: "Ward: evaluating permission request"},
-	{Event: legacyEventPostToolUse, Subcommand: "codex-post-tool-use", StatusMessage: "Ward: recording tool result"},
+// obsoleteWardHookSpecs are not managed or migrated by v3. They are retained
+// only as conflict sentinels so a fresh install cannot silently coexist with a
+// development-version handler whose CLI entry point no longer exists.
+var obsoleteWardHookSpecs = []hookSpec{
+	{Event: "PermissionRequest", Subcommand: "codex-permission-request"},
+	{Event: "PostToolUse", Subcommand: "codex-post-tool-use"},
 }
 
 func mergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
@@ -50,21 +41,12 @@ func mergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	changed := false
-	for _, event := range managedHookEvents() {
-		groups, err := decodeGroups(hooks[event])
-		if err != nil {
-			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
-		}
-		next, eventChanged, err := removeOwnedLegacyGroups(groups, event, binaryPath)
-		if err != nil {
-			return nil, false, err
-		}
-		if eventChanged {
-			changed = true
-			setGroups(hooks, event, next)
-		}
+	if event, found, err := findObsoleteWardHandler(hooks, binaryPath); err != nil {
+		return nil, false, err
+	} else if found {
+		return nil, false, fmt.Errorf("%w: obsolete Ward %s handler must be removed before installing v3", ErrConflict, event)
 	}
+	changed := false
 	for _, spec := range wardHookSpecs {
 		groups, err := decodeGroups(hooks[spec.Event])
 		if err != nil {
@@ -96,13 +78,18 @@ func unmergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	if event, found, err := findObsoleteWardHandler(hooks, binaryPath); err != nil {
+		return nil, false, err
+	} else if found {
+		return nil, false, fmt.Errorf("%w: obsolete Ward %s handler is outside v3 ownership", ErrConflict, event)
+	}
 	changed := false
 	for _, event := range managedHookEvents() {
 		groups, err := decodeGroups(hooks[event])
 		if err != nil {
 			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
 		}
-		next, removed, err := removeWardGroups(groups, event, binaryPath, true)
+		next, removed, err := removeWardGroups(groups, event, binaryPath)
 		if err != nil {
 			return nil, false, err
 		}
@@ -120,56 +107,13 @@ func unmergeHooks(original []byte, binaryPath string) ([]byte, bool, error) {
 	return encodeHookRoot(root, hooks)
 }
 
-// unmergeLegacyHooksExact is the v1 migration ownership gate. A valid v1
-// installation has one exact wildcard handler for each of PreToolUse,
-// PermissionRequest, and PostToolUse, and no other Ward-like handler in a
-// managed event. Validation completes before any transformed bytes are used.
-func unmergeLegacyHooksExact(original []byte, binaryPath string) ([]byte, bool, error) {
-	_, hooks, err := decodeHookRoot(original)
-	if err != nil {
-		return nil, false, err
-	}
-	counts := make(map[string]int, len(legacyWardHookSpecs))
-	for _, event := range managedHookEvents() {
-		groups, err := decodeGroups(hooks[event])
-		if err != nil {
-			return nil, false, fmt.Errorf("parse %s hooks: %w", event, err)
-		}
-		for _, rawGroup := range groups {
-			group, err := decodeGroup(rawGroup)
-			if err != nil {
-				return nil, false, err
-			}
-			handlers, err := decodeHandlers(group["hooks"])
-			if err != nil {
-				return nil, false, err
-			}
-			for _, rawHandler := range handlers {
-				legacy, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
-				if err != nil {
-					return nil, false, err
-				}
-				if desired || conflict {
-					return nil, false, fmt.Errorf("%w: v1 Ward hook ownership differs from the journal", ErrConflict)
-				}
-				if legacy {
-					counts[event]++
-				}
-			}
-		}
-	}
-	for _, spec := range legacyWardHookSpecs {
-		if counts[spec.Event] != 1 {
-			return nil, false, fmt.Errorf("%w: v1 Ward hook ownership differs from the journal", ErrConflict)
-		}
-	}
-	return unmergeHooks(original, binaryPath)
-}
-
 func containsWardHandler(original []byte, binaryPath string) (bool, error) {
 	_, hooks, err := decodeHookRoot(original)
 	if err != nil {
 		return false, err
+	}
+	if _, found, err := findObsoleteWardHandler(hooks, binaryPath); err != nil || found {
+		return found, err
 	}
 	for _, event := range managedHookEvents() {
 		groups, err := decodeGroups(hooks[event])
@@ -186,11 +130,11 @@ func containsWardHandler(original []byte, binaryPath string) (bool, error) {
 				return false, err
 			}
 			for _, rawHandler := range handlers {
-				legacy, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
+				desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
 				if err != nil {
 					return false, err
 				}
-				if legacy || desired || conflict {
+				if desired || conflict {
 					return true, nil
 				}
 			}
@@ -199,20 +143,47 @@ func containsWardHandler(original []byte, binaryPath string) (bool, error) {
 	return false, nil
 }
 
-func removeOwnedLegacyGroups(groups []json.RawMessage, event, binaryPath string) ([]json.RawMessage, bool, error) {
-	next, removed, err := removeWardGroups(groups, event, binaryPath, false)
-	if err != nil {
-		return nil, false, err
+func findObsoleteWardHandler(hooks map[string]json.RawMessage, binaryPath string) (string, bool, error) {
+	for _, spec := range obsoleteWardHookSpecs {
+		groups, err := decodeGroups(hooks[spec.Event])
+		if err != nil {
+			return "", false, fmt.Errorf("parse %s hooks: %w", spec.Event, err)
+		}
+		for _, rawGroup := range groups {
+			group, err := decodeGroup(rawGroup)
+			if err != nil {
+				return "", false, err
+			}
+			handlers, err := decodeHandlers(group["hooks"])
+			if err != nil {
+				return "", false, err
+			}
+			for _, rawHandler := range handlers {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(rawHandler, &fields); err != nil || fields == nil {
+					return "", false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+				}
+				var handler struct {
+					Command       string `json:"command"`
+					StatusMessage string `json:"statusMessage"`
+				}
+				if err := json.Unmarshal(rawHandler, &handler); err != nil {
+					return "", false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+				}
+				if handler.Command == hookCommand(binaryPath, spec.Subcommand) ||
+					looksLikeWardHookCommandFor(handler.Command, []hookSpec{spec}) ||
+					strings.HasPrefix(handler.StatusMessage, "Ward:") {
+					return spec.Event, true, nil
+				}
+			}
+		}
 	}
-	if removed > 1 {
-		return nil, false, fmt.Errorf("%w: duplicate legacy Ward %s handlers", ErrConflict, event)
-	}
-	return next, removed > 0, nil
+	return "", false, nil
 }
 
-// removeWardGroups removes exact v1 handlers, and optionally exact v2
-// handlers. Unrelated handlers in a shared group are preserved.
-func removeWardGroups(groups []json.RawMessage, event, binaryPath string, includeDesired bool) ([]json.RawMessage, int, error) {
+// removeWardGroups removes exact v3 handlers. Unrelated handlers in a shared
+// group are preserved.
+func removeWardGroups(groups []json.RawMessage, event, binaryPath string) ([]json.RawMessage, int, error) {
 	next := make([]json.RawMessage, 0, len(groups))
 	removed := 0
 	for _, rawGroup := range groups {
@@ -227,14 +198,14 @@ func removeWardGroups(groups []json.RawMessage, event, binaryPath string, includ
 		kept := make([]json.RawMessage, 0, len(handlers))
 		removedFromGroup := 0
 		for _, rawHandler := range handlers {
-			ownedLegacy, ownedDesired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
+			owned, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), event, binaryPath)
 			if err != nil {
 				return nil, 0, err
 			}
 			if conflict {
 				return nil, 0, fmt.Errorf("%w: modified Ward %s handler", ErrConflict, event)
 			}
-			if ownedLegacy || (includeDesired && ownedDesired) {
+			if owned {
 				removed++
 				removedFromGroup++
 				continue
@@ -274,7 +245,7 @@ func countDesiredHandlers(groups []json.RawMessage, spec hookSpec, binaryPath st
 			return count, true
 		}
 		for _, rawHandler := range handlers {
-			_, desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), spec.Event, binaryPath)
+			desired, conflict, err := classifyWardHandler(rawHandler, groupMatcher(group), spec.Event, binaryPath)
 			if err != nil || conflict {
 				return count, true
 			}
@@ -286,10 +257,10 @@ func countDesiredHandlers(groups []json.RawMessage, spec hookSpec, binaryPath st
 	return count, false
 }
 
-func classifyWardHandler(raw json.RawMessage, matcher, event, binaryPath string) (legacy, desired, conflict bool, err error) {
+func classifyWardHandler(raw json.RawMessage, matcher, event, binaryPath string) (desired, conflict bool, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-		return false, false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+		return false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
 	}
 	var handler struct {
 		Type          string `json:"type"`
@@ -298,50 +269,36 @@ func classifyWardHandler(raw json.RawMessage, matcher, event, binaryPath string)
 		StatusMessage string `json:"statusMessage"`
 	}
 	if err := json.Unmarshal(raw, &handler); err != nil {
-		return false, false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
+		return false, false, fmt.Errorf("%w: hook handler must be an object", ErrConflict)
 	}
 	wardCommand := false
-	for _, spec := range legacyWardHookSpecs {
-		if handler.Command != hookCommand(binaryPath, spec.Subcommand) {
-			continue
-		}
-		wardCommand = true
-		if spec.Event == event && handler.Type == "command" && handler.Timeout == 10 && handler.StatusMessage == spec.StatusMessage && len(fields) == 4 && matcher == legacyAllMatcher {
-			return true, false, false, nil
-		}
-	}
 	for _, spec := range wardHookSpecs {
 		if handler.Command != hookCommand(binaryPath, spec.Subcommand) {
 			continue
 		}
 		wardCommand = true
 		if spec.Event == event && handler.Type == "command" && handler.Timeout == hookTimeoutSeconds && handler.StatusMessage == "" && len(fields) == 3 && matcher == spec.Matcher {
-			return false, true, false, nil
+			return true, false, nil
 		}
 	}
 	if wardCommand || looksLikeWardHookCommand(handler.Command) || strings.HasPrefix(handler.StatusMessage, "Ward:") {
-		return false, false, true, nil
+		return false, true, nil
 	}
-	return false, false, false, nil
+	return false, false, nil
 }
 
 func looksLikeWardHookCommand(command string) bool {
+	return looksLikeWardHookCommandFor(command, wardHookSpecs) || looksLikeWardHookCommandFor(command, obsoleteWardHookSpecs)
+}
+
+func looksLikeWardHookCommandFor(command string, specs []hookSpec) bool {
 	command = strings.TrimSpace(command)
 	executable := ""
-	for _, spec := range wardHookSpecs {
+	for _, spec := range specs {
 		suffix := " hook " + spec.Subcommand
 		if strings.HasSuffix(command, suffix) {
 			executable = strings.TrimSpace(strings.TrimSuffix(command, suffix))
 			break
-		}
-	}
-	if executable == "" {
-		for _, spec := range legacyWardHookSpecs {
-			suffix := " hook " + spec.Subcommand
-			if strings.HasSuffix(command, suffix) {
-				executable = strings.TrimSpace(strings.TrimSuffix(command, suffix))
-				break
-			}
 		}
 	}
 	if len(executable) >= 2 && (executable[0] == '\'' && executable[len(executable)-1] == '\'' || executable[0] == '"' && executable[len(executable)-1] == '"') {
@@ -355,7 +312,7 @@ func looksLikeWardHookCommand(command string) bool {
 }
 
 func managedHookEvents() []string {
-	return []string{codexadapter.EventSessionStart, codexadapter.EventPreToolUse, legacyEventPermissionRequest, legacyEventPostToolUse}
+	return []string{codexadapter.EventSessionStart, codexadapter.EventPreToolUse}
 }
 
 func decodeHookRoot(original []byte) (map[string]json.RawMessage, map[string]json.RawMessage, error) {

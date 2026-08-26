@@ -4,23 +4,22 @@ No release may skip these gates.
 
 ## RC entry
 
-- Install, v1-to-v2 upgrade, reinstall, uninstall, SessionStart, and Doctor E2E
-  pass on macOS, Linux/WSL, and native Windows. Handler/profile tests that pipe
+- Fresh install, reinstall, uninstall, SessionStart, and Doctor E2E pass on
+  macOS, Linux/WSL, and native Windows. Handler/profile tests that pipe
   synthetic payloads do not substitute for one trusted real-Codex Hook dispatch
   on each supported Host.
 - The installed definition contains exactly one narrow PreToolUse hook and one
   SessionStart hook; Ward PermissionRequest/Post hooks are absent.
 - Ward-added and duplicate prompts are zero.
-- Safe defer output, model-visible context, and audit mutations are zero.
+- Defer and evaluator-error output is zero. Deny, defer, and evaluator-error
+  Hook persistence is zero.
 - Protected-secret and defined catastrophic-destruction fixtures have zero
   escapes within the documented 16-level native expansion bound. The
   max-supported depth and max-plus-one behavior are recorded per platform.
 - Normal workflows have zero unresolved false deny.
-- With a healthy initialized store, each attributable deny/error produces one
-  sparse event containing no raw canary material; old v1 histories still
-  verify. Separate contention/corruption tests prove that audit failure cannot
-  suppress the enforcement response or delay it beyond the bounded local audit
-  budget.
+- Hook requests do not create or change Ward state. Only explicit management
+  commands may update the integration journal, and uninstall removes it after
+  restoring owned Host configuration.
 - Hook latency meets the documented p95 targets and the two-second timeout.
 - Twenty real Tasks finish without disabling Ward or asking a human to perform
   ordinary development work in Ward's place.

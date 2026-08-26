@@ -14,7 +14,7 @@ $testBinary = Join-Path $testInstallDir 'ward.exe'
 $testStateHome = Join-Path $testTemp 'state'
 $testConfig = Join-Path $testCodexHome 'config.toml'
 $testHooks = Join-Path $testCodexHome 'hooks.json'
-$testJournal = Join-Path $testStateHome 'Ward\state\v1\integration-journal.json'
+$testJournal = Join-Path $testStateHome 'Ward\state\core\integration-journal.json'
 $savedEnvironment = @{
     HOME = $env:HOME
     USERPROFILE = $env:USERPROFILE
@@ -56,7 +56,7 @@ try {
     }
     if (Test-Path -LiteralPath $testHooks) { throw 'Ward binary-only uninstall test: hooks.json was created' }
     if (Test-Path -LiteralPath $testJournal) { throw 'Ward binary-only uninstall test: integration journal was created' }
-    if (Test-Path -LiteralPath $testStateHome) { throw 'Ward binary-only uninstall test: audit state was created' }
+    if (Test-Path -LiteralPath $testStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
 
     Write-Output 'PASS: Windows binary-only uninstall removed only the Ward binary'
 }

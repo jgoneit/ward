@@ -47,7 +47,7 @@ if (Test-Path -LiteralPath $binary) {
         else {
             $hooksText = Get-Content -Raw -LiteralPath $hooksFile
             $escapedBinary = $binary.Replace('\', '\\')
-            $wardRefs = $hooksText.Contains($binary) -or $hooksText.Contains($escapedBinary) -or $hooksText -match 'hook codex-(session-start|pre-tool-use|permission-request|post-tool-use)'
+            $wardRefs = $hooksText.Contains($binary) -or $hooksText.Contains($escapedBinary) -or $hooksText -match 'hook codex-(session-start|pre-tool-use)'
         }
     }
     if (Test-Path -LiteralPath $configFile) {
@@ -57,7 +57,7 @@ if (Test-Path -LiteralPath $binary) {
         }
         else {
             $configText = Get-Content -Raw -LiteralPath $configFile
-            if ($configText -match '# >>> ward (default permissions|permission profile) v[12] >>>|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions\s*=\s*"ward-baseline"|\[permissions\.ward-baseline\]') {
+            if ($configText -match '# >>> ward (default permissions|permission profile) v3 >>>|# ward:migrated-sandbox-mode:v3|default_permissions\s*=\s*"ward"|\[permissions\.ward\]') {
                 $wardRefs = $true
             }
         }
@@ -67,4 +67,4 @@ if (Test-Path -LiteralPath $binary) {
     }
     Write-Output 'Ward integration is already absent; no Ward hook or config references were found.'
 }
-Write-Output 'Ward audit state and key were preserved.'
+Write-Output 'Ward state directory was preserved.'

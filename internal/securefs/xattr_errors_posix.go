@@ -1,6 +1,6 @@
 //go:build !windows && !darwin
 
-package audit
+package securefs
 
 import (
 	"errors"

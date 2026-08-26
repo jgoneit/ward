@@ -109,17 +109,6 @@ func (e *Evaluator) evaluatePOSIXWithCWD(command, cwd string, depth int, cwdKnow
 	return result
 }
 
-func posixIntroducesCWDIsolation(node syntax.Node) bool {
-	switch typed := node.(type) {
-	case *syntax.Subshell, *syntax.CmdSubst:
-		return true
-	case *syntax.BinaryCmd:
-		return typed.Op == syntax.Pipe || typed.Op == syntax.PipeAll
-	default:
-		return false
-	}
-}
-
 func singleSimpleCall(file *syntax.File) *syntax.CallExpr {
 	if file == nil || len(file.Stmts) != 1 {
 		return nil
@@ -3539,11 +3528,6 @@ func sqlClientAttachedValueOption(base, value string) bool {
 	return false
 }
 
-func splitLiteralSQLStatements(input string) []string {
-	statements, _ := splitLiteralSQLStatementsDialect(input, false)
-	return statements
-}
-
 func splitLiteralSQLStatementsDialect(input string, hashComments bool) ([]string, bool) {
 	statements := make([]string, 0, 2)
 	var current strings.Builder
@@ -3735,37 +3719,9 @@ func sqlDollarTagAt(input string, index int) (string, bool) {
 	return "", false
 }
 
-func literalOptionValue(args []literalArg, index int, names ...string) string {
-	value := args[index].value
-	for _, name := range names {
-		if value == name {
-			if index+1 < len(args) && args[index+1].static {
-				return args[index+1].value
-			}
-			return ""
-		}
-		if strings.HasPrefix(value, name+"=") {
-			return strings.TrimPrefix(value, name+"=")
-		}
-		if len(name) == 2 && strings.HasPrefix(value, name) && len(value) > len(name) {
-			return strings.TrimPrefix(value, name)
-		}
-	}
-	return ""
-}
-
 func hasLiteral(args []literalArg, expected string) bool {
 	for _, arg := range args {
 		if arg.static && arg.value == expected {
-			return true
-		}
-	}
-	return false
-}
-
-func hasLiteralPrefix(args []literalArg, prefix string) bool {
-	for _, arg := range args {
-		if arg.static && strings.HasPrefix(arg.value, prefix) {
 			return true
 		}
 	}

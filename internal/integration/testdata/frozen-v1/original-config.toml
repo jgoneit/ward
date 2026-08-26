@@ -1,2 +1,0 @@
-approval_policy   = "on-request" # frozen exact
-sandbox_mode = "workspace-write"

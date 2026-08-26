@@ -48,6 +48,9 @@ func TestEvaluatorConformanceFixtures(t *testing.T) {
 		if fixture.Name == "" {
 			t.Fatalf("fixture line %d has no name", line)
 		}
+		if !hookMatcherTool(fixture.Request.Tool) {
+			t.Fatalf("fixture line %d uses tool %q outside the Hook matcher", line, fixture.Request.Tool)
+		}
 		if _, exists := seen[fixture.Name]; exists {
 			t.Fatalf("duplicate fixture name %q", fixture.Name)
 		}
@@ -56,9 +59,6 @@ func TestEvaluatorConformanceFixtures(t *testing.T) {
 		t.Run(fixture.Name, func(t *testing.T) {
 			active := evaluatorForRequest(t, fixture.Request)
 			decision := active.Evaluate(fixture.Request)
-			if decision.Schema != contract.DecisionSchemaV1 {
-				t.Fatalf("schema = %q", decision.Schema)
-			}
 			if decision.Outcome != fixture.Want.Outcome {
 				t.Fatalf("outcome = %q, want %q (decision %#v)", decision.Outcome, fixture.Want.Outcome, decision)
 			}
@@ -379,7 +379,11 @@ func TestEvaluatorNeverReflectsSensitiveInput(t *testing.T) {
 	for _, req := range []contract.Request{
 		request("bash", "cat $"+canary),
 		request("bash", "cat .env # "+canary),
-		request("unknown_"+canary, canary),
+		{
+			Tool:  "delete_file",
+			CWD:   "/workspace",
+			Input: contract.Input{Command: "structured-tool-input", Paths: []string{canary}},
+		},
 	} {
 		active := evaluatorForRequest(t, req)
 		encoded, err := json.Marshal(active.Evaluate(req))
@@ -396,7 +400,7 @@ func TestEvaluatorInvalidRequestAndBoundaryAreErrors(t *testing.T) {
 	valid := request("bash", "true")
 	active := evaluatorForRequest(t, valid)
 	invalid := valid
-	invalid.Schema = "ward-request/v999"
+	invalid.CWD = ""
 	if got := active.Evaluate(invalid); got.Outcome != contract.OutcomeError || got.ErrorCode != "invalid_request" {
 		t.Fatalf("invalid request decision: %#v", got)
 	}
@@ -427,7 +431,10 @@ func TestSecretsInteractiveAndAdditiveShapedCommandsDefer(t *testing.T) {
 }
 
 func TestSQLStatementSplitterKeepsBackslashEscapedQuote(t *testing.T) {
-	statements := splitLiteralSQLStatements(`SELECT E'quote \' ; DROP DATABASE prod;'; SELECT 2;`)
+	statements, complete := splitLiteralSQLStatementsDialect(`SELECT E'quote \' ; DROP DATABASE prod;'; SELECT 2;`, false)
+	if !complete {
+		t.Fatal("statement splitter rejected complete literal SQL")
+	}
 	if len(statements) != 2 {
 		t.Fatalf("statement count = %d: %#v", len(statements), statements)
 	}
@@ -438,15 +445,80 @@ func TestSQLStatementSplitterKeepsBackslashEscapedQuote(t *testing.T) {
 	}
 }
 
+func FuzzEvaluatorIsBoundedDeterministicAndVetoOnly(f *testing.F) {
+	tools := []string{
+		"bash", "powershell", "pwsh", "cmd", "cmd.exe", "apply_patch",
+		"delete_file", "move_file", "mcp__filesystem__delete_file", "mcp__filesystem__move_file",
+	}
+	for index := range tools {
+		f.Add(uint8(index), "seed")
+	}
+	f.Fuzz(func(t *testing.T, toolIndex uint8, suffix string) {
+		if len(suffix) > 4<<10 {
+			t.Skip()
+		}
+		tool := tools[int(toolIndex)%len(tools)]
+		canary := "WARD_FUZZ_CANARY_" + suffix
+		req := request(tool, canary)
+		if tool == "delete_file" || tool == "mcp__filesystem__delete_file" {
+			req.Input = contract.Input{Command: "structured-tool-input", Paths: []string{canary}}
+		} else if tool == "move_file" || tool == "mcp__filesystem__move_file" {
+			req.Input = contract.Input{
+				Command:         "structured-tool-input",
+				Paths:           []string{canary, "ordinary-destination"},
+				SourcePath:      canary,
+				DestinationPath: "ordinary-destination",
+			}
+		}
+		active := evaluatorForRequest(t, req)
+		first, err := json.Marshal(active.Evaluate(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := json.Marshal(active.Evaluate(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first, second) {
+			t.Fatalf("decision changed for identical input: %s, %s", first, second)
+		}
+		if strings.Contains(string(first), "WARD_FUZZ_CANARY_") {
+			t.Fatalf("decision reflected evaluator input: %s", first)
+		}
+		var decision contract.Decision
+		if err := json.Unmarshal(first, &decision); err != nil {
+			t.Fatal(err)
+		}
+		switch decision.Outcome {
+		case contract.OutcomeDeny, contract.OutcomeDefer, contract.OutcomeError:
+		default:
+			t.Fatalf("evaluator emitted permission outcome %q: %s", decision.Outcome, first)
+		}
+		if bytes.Contains(first, []byte(`"outcome":"allow"`)) || bytes.Contains(first, []byte(`"outcome":"ask"`)) {
+			t.Fatalf("evaluator emitted host permission: %s", first)
+		}
+	})
+}
+
+func hookMatcherTool(tool string) bool {
+	switch tool {
+	case "bash", "powershell", "pwsh", "cmd", "cmd.exe", "apply_patch",
+		"delete_file", "move_file", "mcp__filesystem__delete_file", "mcp__filesystem__move_file":
+		return true
+	default:
+		return false
+	}
+}
+
 func evaluatorForRequest(t *testing.T, req contract.Request) *Evaluator {
 	t.Helper()
 	goos := "darwin"
 	home := "/Users/alice"
-	wardPaths := []string{"/Users/alice/.local/state/ward/v1"}
+	wardPaths := []string{"/Users/alice/.local/state/ward/core"}
 	if isWindowsAbsolutePath(strings.ReplaceAll(req.CWD, `\`, "/")) {
 		goos = "windows"
 		home = "C:/Users/Example"
-		wardPaths = []string{"C:/Users/Example/AppData/Local/Ward/state/v1"}
+		wardPaths = []string{"C:/Users/Example/AppData/Local/Ward/state/core"}
 	}
 	boundaries, err := ResolveBoundarySet(BoundaryOptions{
 		CWD:              req.CWD,
@@ -466,11 +538,8 @@ func evaluatorForRequest(t *testing.T, req contract.Request) *Evaluator {
 
 func request(tool, command string) contract.Request {
 	return contract.Request{
-		Schema: contract.RequestSchemaV1,
-		Host:   "codex",
-		Event:  "PreToolUse",
-		Tool:   tool,
-		CWD:    "/workspace",
-		Input:  contract.Input{Command: command},
+		Tool:  tool,
+		CWD:   "/workspace",
+		Input: contract.Input{Command: command},
 	}
 }

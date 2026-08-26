@@ -19,8 +19,10 @@ Ward succeeds only when both statements are true:
 Ward has no user-selected runtime modes. A Core installation owns:
 
 - a synchronous destructive-action veto for supported tool paths;
-- a native profile for reviewed high-confidence workspace secret names;
-- privacy-preserving audit events only for attributable `deny` and `error`.
+- a native profile for reviewed high-confidence workspace secret names.
+
+Hook evaluation is runtime-stateless. A deny, defer, or evaluator error does not
+create or update persistent Ward state.
 
 The Plugin and Skill explain health and help the current Agent recover after a
 deny. They are not security boundaries and do not approve access.
@@ -28,13 +30,12 @@ deny. They are not security boundaries and do not approve access.
 ## Decision vocabulary
 
 - `deny`: a narrow, high-confidence destructive rule matched.
-- `defer`: Ward made no decision and produced no prompt, context, or audit
+- `defer`: Ward made no decision and produced no prompt, context, or persistent
   mutation.
-- `error`: Ward could not evaluate reliably; the Codex adapter emits no
+- `error`: Ward could not classify reliably; the Codex adapter emits no
   permission decision and the Host remains authoritative.
 
-Ward never returns `allow`, `ask`, or legacy `approve`, and never edits
-`approval_policy`.
+Ward never returns `allow` or `ask`, and never edits `approval_policy`.
 
 ## Autonomy constraint
 
@@ -43,5 +44,3 @@ ordinary deletion, builds, normal Git, migrations, and infrastructure planning
 defer. A new built-in deny is admitted only for a recoverability-critical
 target that can be identified with high confidence and has attack plus normal
 workflow counterexamples.
-
-Harness Legacy fixtures are test input, not inherited policy.

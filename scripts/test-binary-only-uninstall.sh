@@ -12,7 +12,7 @@ WARD_TEST_STATE_HOME="$WARD_TEST_TEMP/state"
 WARD_TEST_CONFIG="$WARD_TEST_CODEX_HOME/config.toml"
 WARD_TEST_CONFIG_BEFORE="$WARD_TEST_TEMP/config.before.toml"
 WARD_TEST_HOOKS="$WARD_TEST_CODEX_HOME/hooks.json"
-WARD_TEST_JOURNAL="$WARD_TEST_STATE_HOME/ward/v1/integration-journal.json"
+WARD_TEST_JOURNAL="$WARD_TEST_STATE_HOME/ward/core/integration-journal.json"
 
 cleanup() {
   chmod -R u+w "$WARD_TEST_TEMP" 2>/dev/null || true

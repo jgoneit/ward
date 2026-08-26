@@ -138,12 +138,11 @@ $wardBinary = Join-Path $InstallDir 'ward.exe'
 $previousBinary = Join-Path $tempDir 'ward.previous.exe'
 $hooksFile = Join-Path $codexDir 'hooks.json'
 $configFile = Join-Path $codexDir 'config.toml'
-$journalFile = Join-Path (Join-Path (Join-Path $localAppData 'Ward') 'state\v1') 'integration-journal.json'
+$journalFile = Join-Path (Join-Path (Join-Path $localAppData 'Ward') 'state\core') 'integration-journal.json'
 $previousHooks = Join-Path $tempDir 'hooks.previous'
 $previousConfig = Join-Path $tempDir 'config.previous'
 $previousJournal = Join-Path $tempDir 'journal.previous'
 $binaryReplaced = $false
-$legacyBinaryOnly = $false
 $failureHandled = $false
 
 try {
@@ -190,12 +189,6 @@ try {
         }
         Write-Output 'Ward Core configured. Hook definition trust is required and was not verified; confirm it once in Codex /hooks.'
     }
-    elseif (($preflight -join "`n") -match 'legacy sandbox settings require explicit --migrate-permissions') {
-        $legacyBinaryOnly = $true
-        Write-Output 'Ward binary installed; Core is not active because legacy permissions require explicit migration.'
-        Write-Output "review: $wardBinary codex install --scope user --migrate-permissions --dry-run"
-        Write-Output "activate: $wardBinary codex install --scope user --migrate-permissions"
-    }
     else {
         $preflight | Select-Object -First 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
         $failureHandled = $true
@@ -205,7 +198,7 @@ try {
 }
 catch {
     $failure = $_
-    if ($binaryReplaced -and -not $legacyBinaryOnly -and -not $failureHandled) {
+    if ($binaryReplaced -and -not $failureHandled) {
         $failureHandled = $true
         Restore-WardInstallationSnapshot -Hooks $hooksSnapshot -Config $configSnapshot -Journal $journalSnapshot -Binary $binarySnapshot
     }

@@ -1,4 +1,4 @@
-// Package contract defines the host-neutral request and decision wire contract.
+// Package contract defines Ward's normalized evaluator input and output.
 package contract
 
 import (
@@ -8,11 +8,6 @@ import (
 )
 
 const (
-	RequestSchemaV1    = "ward-request/v1"
-	DecisionSchemaV1   = "ward-decision/v1"
-	AuditEventSchemaV1 = "ward-audit-event/v1"
-	DoctorSchemaV1     = "ward-doctor/v1"
-
 	maxCommandBytes = 1 << 20
 	maxPaths        = 256
 	maxPathBytes    = 16 << 10
@@ -29,12 +24,9 @@ const (
 
 // Request is the canonical request produced by a host adapter.
 type Request struct {
-	Schema string `json:"schema"`
-	Host   string `json:"host"`
-	Event  string `json:"event"`
-	Tool   string `json:"tool"`
-	CWD    string `json:"cwd"`
-	Input  Input  `json:"input"`
+	Tool  string `json:"tool"`
+	CWD   string `json:"cwd"`
+	Input Input  `json:"input"`
 }
 
 // Input contains only normalized fields the evaluator understands. Adapters
@@ -57,7 +49,6 @@ type CoverageGap struct {
 // ErrorCode come from static catalogs so decisions do not reflect sensitive
 // input.
 type Decision struct {
-	Schema      string       `json:"schema"`
 	Outcome     Outcome      `json:"outcome"`
 	RuleID      string       `json:"rule_id,omitempty"`
 	Reason      string       `json:"reason,omitempty"`
@@ -69,15 +60,6 @@ type Decision struct {
 // ValidateRequest rejects malformed canonical requests. Ambiguous but valid
 // tool input is not an error; the evaluator returns defer with a coverage gap.
 func ValidateRequest(req Request) error {
-	if req.Schema != RequestSchemaV1 {
-		return fmt.Errorf("unsupported request schema %q", req.Schema)
-	}
-	if strings.TrimSpace(req.Host) == "" {
-		return errors.New("host is required")
-	}
-	if req.Event != "PreToolUse" && req.Event != "PermissionRequest" {
-		return fmt.Errorf("unsupported event %q", req.Event)
-	}
 	if strings.TrimSpace(req.Tool) == "" {
 		return errors.New("tool is required")
 	}
@@ -132,25 +114,20 @@ func validatePath(candidate string) error {
 	return nil
 }
 
-// Deny constructs a static hard-deny decision.
-func Deny(ruleID, reason string, recovery ...string) Decision {
-	decision := Decision{
-		Schema:  DecisionSchemaV1,
-		Outcome: OutcomeDeny,
-		RuleID:  ruleID,
-		Reason:  reason,
+// Deny constructs a static hard-deny decision with recovery guidance.
+func Deny(ruleID, reason, recovery string) Decision {
+	return Decision{
+		Outcome:  OutcomeDeny,
+		RuleID:   ruleID,
+		Reason:   reason,
+		Recovery: recovery,
 	}
-	if len(recovery) > 0 {
-		decision.Recovery = recovery[0]
-	}
-	return decision
 }
 
 // Defer constructs a recognized no-veto decision. Host policy remains
 // authoritative and Ward does not approve the operation.
 func Defer(reason string) Decision {
 	return Decision{
-		Schema:  DecisionSchemaV1,
 		Outcome: OutcomeDefer,
 		Reason:  reason,
 	}
@@ -167,7 +144,6 @@ func DeferWithGap(reason, code, detail string) Decision {
 // ErrorDecision constructs an evaluator error without exposing raw input.
 func ErrorDecision(code, reason string) Decision {
 	return Decision{
-		Schema:    DecisionSchemaV1,
 		Outcome:   OutcomeError,
 		Reason:    reason,
 		ErrorCode: code,

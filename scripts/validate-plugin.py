@@ -55,5 +55,20 @@ if "Ward emits no permission decision and defers to the Host" not in skill_text:
     fail("Ward skill must preserve fail-open-to-Host error semantics")
 if "retry it without asking the user" not in skill_text:
     fail("Ward skill must guide autonomous recovery after a deny")
+if skill_text.count("performs no persistent Hook write") != 3:
+    fail("Ward skill must make every Hook outcome persistence-free")
+
+contract_dir = ROOT / "contracts"
+contract_names = sorted(path.name for path in contract_dir.glob("*.schema.json"))
+if contract_names != ["ward-doctor-v1.schema.json"]:
+    fail("only the retained ward-doctor/v1 public contract may be shipped")
+try:
+    doctor_schema = json.loads((contract_dir / contract_names[0]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError, IndexError) as exc:
+    fail(f"invalid ward-doctor/v1 schema: {exc}")
+if doctor_schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+    fail("ward-doctor/v1 must use JSON Schema draft 2020-12")
+if doctor_schema.get("properties", {}).get("schema", {}).get("const") != "ward-doctor/v1":
+    fail("ward-doctor/v1 schema identity is missing")
 
 print("PASS: Ward plugin and skill contracts are valid")

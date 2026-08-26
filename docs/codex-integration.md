@@ -6,57 +6,50 @@ Ward installs two user-global command hooks.
 
 | Event | Ward behavior |
 | --- | --- |
-| `SessionStart` | Run a Host-side health check on startup/resume/clear, excluding automatic compaction; emit nothing when healthy and only redacted check IDs when unhealthy. |
-| `PreToolUse` | Evaluate the canonical shell, patch, delete, and move tool-name list with a two-second timeout. |
+| `SessionStart` | Check installation health on startup, resume, and clear, excluding automatic compaction. Healthy is silent; unhealthy emits only redacted check IDs. |
+| `PreToolUse` | Classify the canonical shell, patch, delete, and move tool-name list with a two-second timeout. |
 
-The Pre matcher is derived from the same exported list used by the Codex
-adapter. It is never `*`. Ward does not install PermissionRequest or
-PostToolUse, does not emit a normal status message, and does not add context for
-a defer.
+The Pre matcher comes from the same exported list used by the Codex adapter. It
+is never `*`. Ward does not install PermissionRequest or PostToolUse hooks and
+does not add normal-path status or model context.
 
-| Core result | Adapter output |
-| --- | --- |
-| `deny` | `permissionDecision: "deny"` with static rule and recovery text |
-| `defer` | no stdout or stderr |
-| `error` | no permission decision; Host flow continues |
+| Core result | Adapter output | Persistent Hook write |
+| --- | --- | --- |
+| `deny` | `permissionDecision: "deny"` with static rule and recovery text | none |
+| `defer` | no stdout or stderr | none |
+| `error` | no permission decision; Host flow continues | none |
 
-Ward never returns `allow`, `ask`, or updated input.
+Ward never returns `allow`, `ask`, or updated input. A Hook request is never
+stored by Ward.
 
-Current Codex runs command hook handlers but cannot use a Hook to create a
-separate Agent. The current Agent handles a denial using the Ward Skill and
-retries a safer operation when it needs no new authority.
+Current Codex runs command handlers but cannot use a Hook to create a separate
+Agent. The current Agent handles a denial using the Ward Skill and retries a
+safer operation when that needs no new authority.
 
 ## Installation ownership
 
 The CLI owns only:
 
 - the two Ward command entries in user-global `hooks.json`;
-- one marked `ward-baseline` block and its selection in `config.toml`;
-- the versioned integration journal and Ward audit state.
+- one marked `ward` permission-profile block and its selection in `config.toml`;
+- one private integration journal below the Ward `core` state directory.
 
-Journal v2 records the pre-Ward bytes and Ward-owned digests. An existing
-three-Hook installation is upgraded atomically: the wildcard Pre entry is
-replaced, Ward PermissionRequest/Post entries are removed, SessionStart is
-added, and unrelated configuration is preserved. Rerun and uninstall are
-idempotent. Because the v1 journal bound each complete file, any hooks/config
-change after v1 installation makes automatic migration a conflict. Modified
-owned bytes or an additive user policy are conflicts.
+Fresh install requires the current Codex permission-profile configuration.
+Ward preserves unrelated Host bytes, refuses unsupported authority, and keeps
+rerun and uninstall idempotent. It does not import or translate older Ward
+installations.
 
 `approval_policy` is never edited. A named active permission profile is a safe
 parent only when it directly extends `:workspace` or `:read-only`, has no
 filesystem authority, and otherwise contains only string `description`
-metadata plus the currently documented Codex network subtree. Those values are
+metadata plus the currently supported Codex network subtree. Those values are
 inherited unchanged; unknown authority fields stop installation. With no active
-profile the default is `:workspace`. Legacy
-`sandbox_mode` requires explicit `--migrate-permissions`. An explicitly
-migrated danger-full configuration retains command network access while
-filesystem authority is intentionally narrowed. Ambiguous legacy network or
-workspace semantics are rejected instead of guessed.
+profile the parent is `:workspace`.
 
-Hook commands use the absolute stable binary path below
-`${CODEX_HOME:-$HOME/.codex}/ward/bin`. Control paths, dedicated state anchors,
-symlinks/reparse points, ownership, and replacement authority are validated
-before integration writes.
+Hook commands use the absolute managed binary path below
+`${CODEX_HOME:-$HOME/.codex}/ward/bin`. Control paths, the private integration
+journal, dedicated state anchors, symlinks/reparse points, ownership, and
+replacement authority are validated before integration writes.
 
 The v0.1 lifecycle supports only an absolute `CODEX_HOME` directly below the
 actual user HOME. Nested, external, symlinked, or reparse-point layouts are an
@@ -64,13 +57,12 @@ explicit install conflict pending a broader control-anchor design.
 
 ## Management UX
 
-SessionStart runs Doctor through the Host hook path. A healthy result is exactly
-silent. An unhealthy result exposes only bounded check IDs, never paths,
-diagnostic messages, or environment values.
+SessionStart runs the bounded structural Doctor subset through the Host hook
+path. A healthy result is exactly silent. An unhealthy result exposes only
+bounded check IDs, never paths, diagnostic messages, or environment values.
 
-The two-second Hook budget uses the bounded structural Doctor subset. Codex
-version discovery and the native sandbox probe remain explicit trusted-terminal
-Doctor checks; they are not repeated at every SessionStart.
+Codex version discovery and the native sandbox probe remain explicit
+trusted-terminal Doctor checks; they are not repeated at every SessionStart.
 
 Ward cannot inspect Codex's exact-definition trust decision. `hooks.trust` is
 therefore always an unverified warning for user hooks, never a PASS. Ward
@@ -81,9 +73,9 @@ Doctor do not prove Host dispatch; a trusted real-Codex dispatch remains an RC
 gate.
 
 An ordinary guarded project tool does not gain privilege to read Ward control
-or audit state. Explicit `ward doctor`, audit, install, uninstall, and repair
-commands therefore require an already-authorized Host path or trusted local
-terminal. The Plugin reports `Not run` when such a path is unavailable.
+or integration state. Explicit Doctor, install, and uninstall commands require
+an already-authorized Host path or trusted local terminal. The Plugin reports
+`Not run` when such a path is unavailable.
 
 ## Known limits
 
@@ -99,9 +91,10 @@ terminal. The Plugin reports `Not run` when such a path is unavailable.
 - If the current workspace can relocate a Ward control/state anchor, Doctor
   reports a project-scoped health warning instead of making the entire home or
   project tree read-only.
-- Lexical evaluation does not close kernel, mount, hard-link, or TOCTOU races.
+- Lexical classification does not close kernel, mount, hard-link, or TOCTOU
+  races.
 - The Host may retain original tool input in its own transcript even though
-  Ward audit does not.
+  Ward stores no Hook request or result.
 - Repository scripts prove handler behavior and native profile behavior in
-  isolation. Actual Codex Hook dispatch/trust is a separate RC gate until a real
-  Host session demonstrates it.
+  isolation. Actual Codex Hook dispatch/trust remains a separate RC gate until
+  a real Host session demonstrates it.

@@ -44,10 +44,10 @@ func (e *Evaluator) Evaluate(req contract.Request) contract.Decision {
 		return contract.ErrorDecision("boundary_mismatch", "Ward boundary context does not match the request.")
 	}
 
-	tool := strings.ToLower(strings.TrimSpace(req.Tool))
+	tool := req.Tool
 	var result scanResult
 	switch tool {
-	case "bash", "sh", "zsh", "shell", "exec_command", "unified_exec":
+	case "bash":
 		if strings.TrimSpace(req.Input.Command) == "" {
 			result.gap = gap("missing_command", "A shell request has no normalized command.")
 		} else if e.boundaries.goos == "windows" {
@@ -61,12 +61,10 @@ func (e *Evaluator) Evaluate(req contract.Request) contract.Decision {
 		result = e.evaluatePowerShell(req.Input.Command, req.CWD)
 	case "cmd", "cmd.exe":
 		result = e.evaluateCMD(req.Input.Command, req.CWD)
+	case "delete_file", "move_file", "mcp__filesystem__delete_file", "mcp__filesystem__move_file":
+		result = e.evaluateStructuredPaths(tool, req.Input, req.CWD)
 	default:
-		if isStructuredFilesystemTool(tool) {
-			result = e.evaluateStructuredPaths(tool, req.Input, req.CWD)
-		} else {
-			result.gap = gap("unsupported_tool", "This tool does not have a Ward evaluator yet.")
-		}
+		return contract.ErrorDecision("invalid_request", "Canonical Ward request is invalid.")
 	}
 	if result.deny != nil {
 		return *result.deny
@@ -99,22 +97,6 @@ func (e *Evaluator) evaluateCanonicalWindowsShell(command, cwd string) scanResul
 		return scanResult{gap: firstGap}
 	}
 	return scanResult{}
-}
-
-func isStructuredFilesystemTool(tool string) bool {
-	switch tool {
-	case "read", "write", "edit", "read_file", "read_text_file", "read_media_file", "read_multiple_files",
-		"write_file", "edit_file", "multi_edit", "delete_file", "move_file", "copy_file",
-		"search_files", "view_image", "grep", "glob",
-		"mcp__filesystem__read_file", "mcp__filesystem__read_text_file",
-		"mcp__filesystem__read_media_file", "mcp__filesystem__read_multiple_files",
-		"mcp__filesystem__write_file", "mcp__filesystem__edit_file",
-		"mcp__filesystem__move_file", "mcp__filesystem__copy_file",
-		"mcp__filesystem__delete_file", "mcp__filesystem__search_files":
-		return true
-	default:
-		return false
-	}
 }
 
 func (e *Evaluator) evaluateStructuredPaths(tool string, input contract.Input, cwd string) scanResult {

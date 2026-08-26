@@ -24,7 +24,7 @@ type BoundaryOptions struct {
 
 // BoundarySet is an immutable, request-scoped set of catastrophic filesystem
 // boundaries. Its fields are deliberately private so raw home, repository, and
-// Ward control paths cannot accidentally enter a decision or audit record.
+// Ward control paths cannot accidentally enter a decision or diagnostic.
 type BoundarySet struct {
 	goos      string
 	cwd       string
@@ -368,7 +368,7 @@ func (b BoundarySet) isAbsoluteCandidate(candidate string) bool {
 }
 
 // protectsCriticalMetadata reports whether a non-recursive delete directly
-// targets Git metadata or Ward's own control/audit boundary.
+// targets Git metadata or Ward's own control boundary.
 // General filesystem roots, HOME, CWD, and repository roots are deliberately
 // excluded here: Ward only vetoes those targets when the operation is known to
 // recurse.
@@ -388,7 +388,7 @@ func (b BoundarySet) protectsCriticalRelocation(candidate string) bool {
 		// Moving Git metadata itself removes it from the repository and remains
 		// protected, but moving an ordinary directory that merely contains a
 		// repository is a Host-controlled, recoverable operation. Ward control
-		// and audit anchors are the only paths whose ancestors are relocation
+		// and state anchors are the only paths whose ancestors are relocation
 		// boundaries.
 		if containsDotGitComponent(target, b.goos) || b.targetsGitPath(target, false) || b.overlapsWardPath(target, false) {
 			return true

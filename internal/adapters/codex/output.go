@@ -2,7 +2,6 @@ package codex
 
 import (
 	"encoding/json"
-	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,14 +23,7 @@ var (
 // Output translates a Ward decision to Codex hook stdout. A nil or empty byte
 // slice means the hook must write nothing. Ward intentionally never emits
 // Codex allow, ask, updatedInput, or approval-bypass output.
-func Output(event string, decision contract.Decision) ([]byte, error) {
-	if event != EventPreToolUse {
-		return nil, fmt.Errorf("unsupported Codex hook event %q", event)
-	}
-	if decision.Schema != contract.DecisionSchemaV1 {
-		return nil, nil
-	}
-
+func Output(decision contract.Decision) ([]byte, error) {
 	switch decision.Outcome {
 	case contract.OutcomeDefer:
 		return nil, nil
