@@ -57,7 +57,11 @@ if (Test-Path -LiteralPath $binary) {
         }
         else {
             $configText = Get-Content -Raw -LiteralPath $configFile
-            if ($configText -match '# >>> ward (default permissions|permission profile) v[123] >>>|# ward:migrated-sandbox-mode:v[13]|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions\s*=\s*("(ward|ward-baseline)"|''(ward|ward-baseline)'')|\[permissions\.(ward|ward-baseline)\]') {
+            # Detection-only fallback when Core is unavailable: recognize Ward's
+            # reserved profile-key shapes and owned markers without depending on
+            # a particular migration version or TOML quoting style.
+            $wardConfigReferencePattern = '(?m)"ward(-baseline)?"|''ward(-baseline)?''|(\[|\.)[ \t]*ward(-baseline)?[ \t]*(\.|\])|^[ \t]*#[ \t<>]*ward([ \t:]|$)'
+            if ($configText -cmatch $wardConfigReferencePattern) {
                 $wardRefs = $true
             }
         }

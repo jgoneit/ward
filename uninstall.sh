@@ -62,8 +62,16 @@ else
 	fi
 	if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
 		ward_refs=1
-	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq "# >>> ward (default permissions|permission profile) v[123] >>>|# ward:migrated-sandbox-mode:v[13]|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions[[:space:]]*=[[:space:]]*(\"(ward|ward-baseline)\"|'(ward|ward-baseline)')|\[permissions\.(ward|ward-baseline)\]" "$config_file"; then
-		ward_refs=1
+	elif [ -f "$config_file" ]; then
+		# Detection-only fallback for a missing Core binary. Recognize Ward's
+		# reserved TOML key and marker shapes without retaining migration parsers.
+		ward_config_pattern="\"ward(-baseline)?\"|'ward(-baseline)?'|(\\[|\\.)[[:blank:]]*ward(-baseline)?[[:blank:]]*(\\.|\\])|^[[:blank:]]*#[[:blank:]<>]*ward([[:blank:]:]|$)"
+		if LC_ALL=C grep -Eq "$ward_config_pattern" "$config_file"; then
+			ward_refs=1
+		else
+			ward_config_status=$?
+			[ "$ward_config_status" -eq 1 ] || ward_refs=1
+		fi
 	fi
 	if [ "$ward_refs" -eq 1 ]; then
 		printf 'Ward uninstaller: binary is missing at %s while Ward hook or config references remain; reinstall the same version, then retry\n' "$binary" >&2
