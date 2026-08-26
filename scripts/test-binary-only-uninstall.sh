@@ -95,6 +95,25 @@ fi
 cmp "$WARD_TEST_TEMP/legacy.config.before" "$WARD_TEST_CONFIG"
 grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy-config.stderr"
 
+printf '%s\n' "default_permissions = 'ward'" > "$WARD_TEST_CONFIG"
+cp "$WARD_TEST_CONFIG" "$WARD_TEST_TEMP/single-quoted.config.before"
+set +e
+env \
+  HOME="$WARD_TEST_USER_HOME" \
+  USERPROFILE="$WARD_TEST_USER_HOME" \
+  CODEX_HOME="$WARD_TEST_CODEX_HOME" \
+  WARD_INSTALL_DIR="$WARD_TEST_INSTALL_DIR" \
+  XDG_STATE_HOME="$WARD_TEST_STATE_HOME" \
+  "$WARD_TEST_ROOT/uninstall.sh" >"$WARD_TEST_TEMP/single-quoted.stdout" 2>"$WARD_TEST_TEMP/single-quoted.stderr"
+WARD_TEST_SINGLE_QUOTED_EXIT=$?
+set -e
+if [ "$WARD_TEST_SINGLE_QUOTED_EXIT" -eq 0 ]; then
+  printf '%s\n' 'Ward binary-only uninstall test: missing binary ignored single-quoted Ward selector' >&2
+  exit 1
+fi
+cmp "$WARD_TEST_TEMP/single-quoted.config.before" "$WARD_TEST_CONFIG"
+grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/single-quoted.stderr"
+
 printf '%s\n' '# ward:migrated-sandbox-mode:v1' > "$WARD_TEST_CONFIG"
 cp "$WARD_TEST_CONFIG" "$WARD_TEST_TEMP/legacy-marker.config.before"
 set +e
@@ -114,4 +133,4 @@ fi
 cmp "$WARD_TEST_TEMP/legacy-marker.config.before" "$WARD_TEST_CONFIG"
 grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy-marker.stderr"
 
-printf '%s\n' 'PASS: POSIX binary-only uninstall detected legacy hooks, config, and v1 marker'
+printf '%s\n' 'PASS: POSIX binary-only uninstall detected legacy hooks, config, selectors, and v1 marker'

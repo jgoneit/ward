@@ -62,7 +62,7 @@ else
 	fi
 	if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
 		ward_refs=1
-	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq '# >>> ward (default permissions|permission profile) v[123] >>>|# ward:migrated-sandbox-mode:v[13]|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions[[:space:]]*=[[:space:]]*"(ward|ward-baseline)"|\[permissions\.(ward|ward-baseline)\]' "$config_file"; then
+	elif [ -f "$config_file" ] && LC_ALL=C grep -Eq "# >>> ward (default permissions|permission profile) v[123] >>>|# ward:migrated-sandbox-mode:v[13]|# ward:migrated-sandbox-(mode|workspace-write):v2|default_permissions[[:space:]]*=[[:space:]]*(\"(ward|ward-baseline)\"|'(ward|ward-baseline)')|\[permissions\.(ward|ward-baseline)\]" "$config_file"; then
 		ward_refs=1
 	fi
 	if [ "$ward_refs" -eq 1 ]; then

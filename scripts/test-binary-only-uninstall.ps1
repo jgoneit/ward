@@ -89,6 +89,21 @@ try {
         throw "Ward binary-only uninstall test: legacy config refusal was not reported: $($legacyConfigOutput -join [Environment]::NewLine)"
     }
 
+    $singleQuotedConfigBytes = ([System.Text.UTF8Encoding]::new($false)).GetBytes("default_permissions = 'ward'`n")
+    [System.IO.File]::WriteAllBytes($testConfig, $singleQuotedConfigBytes)
+    $singleQuotedOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
+    $singleQuotedExitCode = $LASTEXITCODE
+    if ($singleQuotedExitCode -eq 0) {
+        throw 'Ward binary-only uninstall test: missing binary ignored single-quoted Ward selector'
+    }
+    $singleQuotedConfigAfter = [System.IO.File]::ReadAllBytes($testConfig)
+    if ([Convert]::ToBase64String($singleQuotedConfigBytes) -cne [Convert]::ToBase64String($singleQuotedConfigAfter)) {
+        throw 'Ward binary-only uninstall test: single-quoted Ward selector bytes changed'
+    }
+    if (($singleQuotedOutput -join [Environment]::NewLine) -notmatch 'Ward hook or config references remain') {
+        throw "Ward binary-only uninstall test: single-quoted selector refusal was not reported: $($singleQuotedOutput -join [Environment]::NewLine)"
+    }
+
     $legacyMarkerBytes = ([System.Text.UTF8Encoding]::new($false)).GetBytes("# ward:migrated-sandbox-mode:v1`n")
     [System.IO.File]::WriteAllBytes($testConfig, $legacyMarkerBytes)
     $legacyMarkerOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
@@ -104,7 +119,7 @@ try {
         throw "Ward binary-only uninstall test: v1 sandbox marker refusal was not reported: $($legacyMarkerOutput -join [Environment]::NewLine)"
     }
 
-    Write-Output 'PASS: Windows binary-only uninstall detected legacy hooks, config, and v1 marker'
+    Write-Output 'PASS: Windows binary-only uninstall detected legacy hooks, config, selectors, and v1 marker'
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) {
