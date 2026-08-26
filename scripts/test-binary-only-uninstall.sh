@@ -95,4 +95,23 @@ fi
 cmp "$WARD_TEST_TEMP/legacy.config.before" "$WARD_TEST_CONFIG"
 grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy-config.stderr"
 
-printf '%s\n' 'PASS: POSIX binary-only uninstall detected legacy hooks and config'
+printf '%s\n' '# ward:migrated-sandbox-mode:v1' > "$WARD_TEST_CONFIG"
+cp "$WARD_TEST_CONFIG" "$WARD_TEST_TEMP/legacy-marker.config.before"
+set +e
+env \
+  HOME="$WARD_TEST_USER_HOME" \
+  USERPROFILE="$WARD_TEST_USER_HOME" \
+  CODEX_HOME="$WARD_TEST_CODEX_HOME" \
+  WARD_INSTALL_DIR="$WARD_TEST_INSTALL_DIR" \
+  XDG_STATE_HOME="$WARD_TEST_STATE_HOME" \
+  "$WARD_TEST_ROOT/uninstall.sh" >"$WARD_TEST_TEMP/legacy-marker.stdout" 2>"$WARD_TEST_TEMP/legacy-marker.stderr"
+WARD_TEST_LEGACY_MARKER_EXIT=$?
+set -e
+if [ "$WARD_TEST_LEGACY_MARKER_EXIT" -eq 0 ]; then
+  printf '%s\n' 'Ward binary-only uninstall test: missing binary ignored v1 sandbox marker' >&2
+  exit 1
+fi
+cmp "$WARD_TEST_TEMP/legacy-marker.config.before" "$WARD_TEST_CONFIG"
+grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy-marker.stderr"
+
+printf '%s\n' 'PASS: POSIX binary-only uninstall detected legacy hooks, config, and v1 marker'
