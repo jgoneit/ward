@@ -75,4 +75,24 @@ fi
 grep -Fq 'codex-permission-request' "$WARD_TEST_HOOKS"
 grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy.stderr"
 
-printf '%s\n' 'PASS: POSIX binary-only uninstall preserved config and detected legacy hooks'
+printf '%s\n' '{"hooks":{}}' > "$WARD_TEST_HOOKS"
+printf '%s\n' 'default_permissions = "ward-baseline"' '[permissions.ward-baseline]' > "$WARD_TEST_CONFIG"
+cp "$WARD_TEST_CONFIG" "$WARD_TEST_TEMP/legacy.config.before"
+set +e
+env \
+  HOME="$WARD_TEST_USER_HOME" \
+  USERPROFILE="$WARD_TEST_USER_HOME" \
+  CODEX_HOME="$WARD_TEST_CODEX_HOME" \
+  WARD_INSTALL_DIR="$WARD_TEST_INSTALL_DIR" \
+  XDG_STATE_HOME="$WARD_TEST_STATE_HOME" \
+  "$WARD_TEST_ROOT/uninstall.sh" >"$WARD_TEST_TEMP/legacy-config.stdout" 2>"$WARD_TEST_TEMP/legacy-config.stderr"
+WARD_TEST_LEGACY_CONFIG_EXIT=$?
+set -e
+if [ "$WARD_TEST_LEGACY_CONFIG_EXIT" -eq 0 ]; then
+  printf '%s\n' 'Ward binary-only uninstall test: missing binary ignored legacy Ward config' >&2
+  exit 1
+fi
+cmp "$WARD_TEST_TEMP/legacy.config.before" "$WARD_TEST_CONFIG"
+grep -Fq 'Ward hook or config references remain' "$WARD_TEST_TEMP/legacy-config.stderr"
+
+printf '%s\n' 'PASS: POSIX binary-only uninstall detected legacy hooks and config'

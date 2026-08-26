@@ -73,7 +73,23 @@ try {
         throw "Ward binary-only uninstall test: legacy refusal was not reported: $($legacyOutput -join [Environment]::NewLine)"
     }
 
-    Write-Output 'PASS: Windows binary-only uninstall preserved config and detected legacy hooks'
+    [System.IO.File]::WriteAllText($testHooks, '{"hooks":{}}', [System.Text.UTF8Encoding]::new($false))
+    $legacyConfigBytes = ([System.Text.UTF8Encoding]::new($false)).GetBytes("default_permissions = `"ward-baseline`"`n[permissions.ward-baseline]`n")
+    [System.IO.File]::WriteAllBytes($testConfig, $legacyConfigBytes)
+    $legacyConfigOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
+    $legacyConfigExitCode = $LASTEXITCODE
+    if ($legacyConfigExitCode -eq 0) {
+        throw 'Ward binary-only uninstall test: missing binary ignored legacy Ward config'
+    }
+    $legacyConfigAfter = [System.IO.File]::ReadAllBytes($testConfig)
+    if ([Convert]::ToBase64String($legacyConfigBytes) -cne [Convert]::ToBase64String($legacyConfigAfter)) {
+        throw 'Ward binary-only uninstall test: legacy config bytes changed'
+    }
+    if (($legacyConfigOutput -join [Environment]::NewLine) -notmatch 'Ward hook or config references remain') {
+        throw "Ward binary-only uninstall test: legacy config refusal was not reported: $($legacyConfigOutput -join [Environment]::NewLine)"
+    }
+
+    Write-Output 'PASS: Windows binary-only uninstall detected legacy hooks and config'
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) {
