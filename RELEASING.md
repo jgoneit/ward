@@ -1,8 +1,24 @@
 # Releasing Ward
 
-No release may skip these gates.
+## Development prerelease
+
+Before the RC gates pass, Ward may publish only a `vX.Y.Z-dev.N` GitHub
+prerelease for installation and burn-in. A development prerelease must:
+
+- point to an exact, reviewed `main` commit whose pull-request and post-merge
+  CI completed successfully;
+- remain marked as a prerelease and must not be selected as the latest release;
+- state `KEEP + BURN-IN, NOT STABLE` and list the unmet RC gates in its notes;
+- publish checksummed artifacts built from the tag and pass an isolated
+  installer verification; and
+- make no RC, stable, or Harness release-pin claim.
+
+A development prerelease is not promoted or retagged. RC or stable releases
+use a new tag after all applicable gates below pass.
 
 ## RC entry
+
+No RC or stable release may skip these gates.
 
 - Fresh install, reinstall, uninstall, SessionStart, and Doctor E2E pass on
   macOS, Linux/WSL, and native Windows. Handler/profile tests that pipe
