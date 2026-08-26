@@ -228,7 +228,7 @@ func TestDecodeAcceptsExactlyConfiguredToolVocabulary(t *testing.T) {
 	}
 }
 
-func TestDecodeBoundsRequiredAndIgnoresOversizedOptionalMetadata(t *testing.T) {
+func TestDecodeBoundsMetadataButAcceptsLongAbsoluteCWD(t *testing.T) {
 	payload := officialFixture()
 	payload["permission_mode"] = strings.Repeat("x", maxRequiredStringBytes+1)
 	raw, err := json.Marshal(payload)
@@ -240,10 +240,23 @@ func TestDecodeBoundsRequiredAndIgnoresOversizedOptionalMetadata(t *testing.T) {
 		t.Fatalf("DecodePreToolUse() error = %v", err)
 	}
 
-	payload["cwd"] = "/" + strings.Repeat("x", maxRequiredStringBytes)
+	longCWD := "/" + strings.Repeat("x", maxRequiredStringBytes)
+	payload["cwd"] = longCWD
+	raw, _ = json.Marshal(payload)
+	got, err := DecodePreToolUse(raw)
+	if err != nil || got.CWD != longCWD {
+		t.Fatalf("DecodePreToolUse() cwd length=%d error=%v", len(got.CWD), err)
+	}
+
+	sessionRaw, _ := json.Marshal(map[string]any{"cwd": longCWD, "hook_event_name": EventSessionStart})
+	if got, err := DecodeSessionStart(sessionRaw); err != nil || got != longCWD {
+		t.Fatalf("DecodeSessionStart() cwd length=%d error=%v", len(got), err)
+	}
+
+	payload["tool_name"] = strings.Repeat("x", maxRequiredStringBytes+1)
 	raw, _ = json.Marshal(payload)
 	if _, err := DecodePreToolUse(raw); !errors.Is(err, errInvalidPayload) {
-		t.Fatalf("DecodePreToolUse() error = %v, want invalid payload", err)
+		t.Fatalf("DecodePreToolUse() oversized tool error = %v, want invalid payload", err)
 	}
 }
 

@@ -56,7 +56,7 @@ func DecodeSessionStart(data []byte) (string, error) {
 	if event != EventSessionStart {
 		return "", fmt.Errorf("%w: got %q, want %q", errEventMismatch, event, EventSessionStart)
 	}
-	cwd, err := requiredString(fields, "cwd")
+	cwd, err := requiredPathString(fields, "cwd")
 	if err != nil {
 		return "", err
 	}
@@ -87,7 +87,7 @@ func DecodePreToolUse(data []byte) (contract.Request, error) {
 	if event != EventPreToolUse {
 		return contract.Request{}, fmt.Errorf("%w: got %q, want %q", errEventMismatch, event, EventPreToolUse)
 	}
-	cwd, err := requiredString(fields, "cwd")
+	cwd, err := requiredPathString(fields, "cwd")
 	if err != nil {
 		return contract.Request{}, err
 	}
@@ -129,6 +129,21 @@ func requiredString(fields map[string]json.RawMessage, name string) (string, err
 	}
 	if len(value) > maxRequiredStringBytes {
 		return "", fmt.Errorf("%w: %s exceeds metadata size limit", errInvalidPayload, name)
+	}
+	return value, nil
+}
+
+// requiredPathString relies on the enclosing payload bound instead of the
+// smaller metadata bound. Long-path-enabled Hosts can legitimately provide a
+// CWD larger than ordinary event and tool-name metadata.
+func requiredPathString(fields map[string]json.RawMessage, name string) (string, error) {
+	raw, exists := fields[name]
+	if !exists {
+		return "", fmt.Errorf("%w: %s is required", errInvalidPayload, name)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%w: %s must be a non-empty string", errInvalidPayload, name)
 	}
 	return value, nil
 }
