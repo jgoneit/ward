@@ -2,9 +2,10 @@ package diagnostics
 
 import (
 	"errors"
-	"github.com/jgoneit/ward/internal/securefs"
 	"os"
 	"path/filepath"
+
+	"github.com/jgoneit/ward/internal/securefs"
 )
 
 func acquireManagementLock(controlDir string) (func(), error) {
@@ -19,17 +20,21 @@ func acquireManagementLock(controlDir string) (func(), error) {
 			return nil, err
 		}
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
+	flags := os.O_RDWR
+	if !exists {
+		// Only an exclusive create grants authority to initialize ownership.
+		flags |= os.O_CREATE | os.O_EXCL
 	}
-	if err := inspectRegularOwnedFile(path); err != nil {
-		file.Close()
+	file, err := os.OpenFile(path, flags, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, ErrServiceConflict
+		}
 		return nil, err
 	}
 	actual, err := os.Lstat(path)
 	opened, statErr := file.Stat()
-	if err != nil || statErr != nil || !os.SameFile(actual, opened) {
+	if err != nil || statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(actual, opened) {
 		file.Close()
 		return nil, ErrServiceConflict
 	}
@@ -38,6 +43,17 @@ func acquireManagementLock(controlDir string) (func(), error) {
 			file.Close()
 			return nil, err
 		}
+	}
+	// New Windows objects may initially have the token's Administrators
+	// owner. Inspect after securing our exclusively created file; existing
+	// files receive no permission or ownership changes.
+	if err := inspectRegularOwnedFile(path); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := securefs.InspectPrivateFile(path); err != nil {
+		file.Close()
+		return nil, err
 	}
 	if err := lockManagementFile(file); err != nil {
 		file.Close()
