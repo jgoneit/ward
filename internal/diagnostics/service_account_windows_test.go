@@ -22,7 +22,7 @@ func TestScheduledTaskAccountNormalizationUsesCurrentWindowsIdentity(t *testing.
 		t.Fatal("cannot construct the current-user task fixture")
 	}
 	expected := string(d.Content)
-	const prefix = "<LogonTrigger><Enabled>true</Enabled>"
+	const prefix = "<LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>"
 	userLeaf := "<UserId>" + xmlText(current.Uid) + "</UserId>"
 	const account = "__WARD_CURRENT_ACCOUNT__"
 	cases := []struct {

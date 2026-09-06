@@ -236,6 +236,58 @@ func TestScheduledTaskMutableEnabledAndMetadataRemainLeafOnly(t *testing.T) {
 	}
 }
 
+func TestScheduledTaskRecoveryTriggersRemainStrict(t *testing.T) {
+	paths, _, _ := lifecycleFixture(t)
+	d, err := makeServiceDefinition(paths, "windows", "S-1-5-21-1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := string(d.Content)
+	const repetition = "<Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>"
+	triggers := []struct{ name, xml string }{
+		{"logon", "<LogonTrigger><Enabled>true</Enabled>" + repetition + "<UserId>S-1-5-21-1000</UserId></LogonTrigger>"},
+		{"registration", "<RegistrationTrigger><Enabled>true</Enabled>" + repetition + "</RegistrationTrigger>"},
+	}
+	if strings.Count(expected, repetition) != 2 || !strings.Contains(expected, "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") {
+		t.Fatal("recovery requires two one-minute checks that preserve a running collector")
+	}
+	omitted := expected
+	for _, trigger := range triggers {
+		withoutDefaults := strings.Replace(trigger.xml, "<Enabled>true</Enabled>", "", 1)
+		withoutDefaults = strings.Replace(withoutDefaults, "<StopAtDurationEnd>false</StopAtDurationEnd>", "", 1)
+		omitted = replaceTaskFixture(t, omitted, trigger.xml, withoutDefaults)
+		t.Run(trigger.name, func(t *testing.T) {
+			for name, changedTrigger := range map[string]string{
+				"interval":               strings.Replace(trigger.xml, "<Interval>PT1M</Interval>", "<Interval>PT2M</Interval>", 1),
+				"stop_at_duration":       strings.Replace(trigger.xml, "<StopAtDurationEnd>false</StopAtDurationEnd>", "<StopAtDurationEnd>true</StopAtDurationEnd>", 1),
+				"finite_duration":        strings.Replace(trigger.xml, "</Repetition>", "<Duration>PT1H</Duration></Repetition>", 1),
+				"disabled":               strings.Replace(trigger.xml, "<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1),
+				"stop_attribute":         strings.Replace(trigger.xml, "<StopAtDurationEnd>", `<StopAtDurationEnd marker="changed">`, 1),
+				"stop_child":             strings.Replace(trigger.xml, "</StopAtDurationEnd>", "<Unknown/></StopAtDurationEnd>", 1),
+				"stop_duplicate":         strings.Replace(trigger.xml, "</Repetition>", "<StopAtDurationEnd>false</StopAtDurationEnd></Repetition>", 1),
+				"stop_foreign_namespace": strings.Replace(trigger.xml, "<StopAtDurationEnd>", `<StopAtDurationEnd xmlns="urn:foreign">`, 1),
+				"stop_unknown_parent":    strings.Replace(trigger.xml, "<StopAtDurationEnd>false</StopAtDurationEnd>", "<Unknown><StopAtDurationEnd>false</StopAtDurationEnd></Unknown>", 1),
+				"removed":                "",
+				"duplicate":              trigger.xml + trigger.xml,
+			} {
+				t.Run(name, func(t *testing.T) {
+					actual := replaceTaskFixture(t, expected, trigger.xml, changedTrigger)
+					if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+						t.Fatal("accepted a changed recovery trigger")
+					}
+				})
+			}
+			without := replaceTaskFixture(t, expected, trigger.xml, withoutDefaults)
+			if !scheduledTaskMatches([]byte(without), d.Content) || !scheduledTaskMatches(d.Content, []byte(without)) {
+				t.Fatal("rejected omitted recovery trigger defaults")
+			}
+		})
+	}
+	if !scheduledTaskMatches([]byte(omitted), d.Content) || !scheduledTaskMatches(d.Content, []byte(omitted)) {
+		t.Fatal("rejected both recovery triggers with exact schema defaults omitted")
+	}
+}
+
 func replaceTaskFixture(t *testing.T, source, before, after string) string {
 	t.Helper()
 	if strings.Count(source, before) != 1 {
