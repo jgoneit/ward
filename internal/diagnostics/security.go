@@ -50,15 +50,21 @@ func ensurePrivateDirectory(path string) error {
 		return err
 	}
 	if created {
-		if err := os.MkdirAll(path, 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		// Secure only a directory created by this operation. In particular,
+		// an elevated Windows token can initially assign Administrators as
+		// owner, so apply our private owner/DACL before strict inspection.
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		if err := securefs.SecurePrivateDirectory(path); err != nil {
 			return err
 		}
 	}
 	if err := inspectDirectoryMetadata(path, false); err != nil {
 		return err
-	}
-	if created {
-		return securefs.SecurePrivateDirectory(path)
 	}
 	return securefs.InspectPrivateDirectory(path)
 }

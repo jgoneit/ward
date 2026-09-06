@@ -121,6 +121,14 @@ func lockCollector(path string) (func(), error) {
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || info.NumberOfLinks != 1 {
 		return fail(errors.New("collector_lock_untrusted"))
 	}
+	if created {
+		// An elevated token can give new objects the Administrators owner.
+		// Only CREATE_NEW proves this is our new lock. Secure its owner/DACL
+		// before inspecting it; the open handle disallows rename or deletion.
+		if err := securefs.SecurePrivateFile(path); err != nil {
+			return fail(err)
+		}
+	}
 	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return fail(err)
@@ -132,12 +140,7 @@ func lockCollector(path string) (func(), error) {
 	if err := windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlapped); err != nil {
 		return fail(err)
 	}
-	var permissionErr error
-	if created {
-		permissionErr = securefs.SecurePrivateFile(path)
-	} else {
-		permissionErr = securefs.InspectPrivateFile(path)
-	}
+	permissionErr := securefs.InspectPrivateFile(path)
 	if permissionErr != nil {
 		_ = windows.UnlockFileEx(handle, 0, 1, 0, &overlapped)
 		return fail(permissionErr)
