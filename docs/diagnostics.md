@@ -35,6 +35,16 @@ does not overwrite another service or a changed owned file.
 | Linux | systemd user service | While the user manager runs; no linger setup |
 | Windows | Current-user logon scheduled task | While logged in; no administrator account, execution time limit, or battery stop condition |
 
+On Windows, registration and logon triggers repeat every minute with
+`IgnoreNew`, so a running collector is not duplicated and a stopped collector
+can start again. Registration starts this recovery schedule for the current
+login; the logon trigger starts it after later logins. This supplements Task
+Scheduler's failure retries, which did not recover a terminated collector in
+native testing. Recovery can leave a gap of a minute or longer under scheduler
+load. Disabling the task stops repetition before process and file cleanup.
+Rollback suppresses registration-trigger execution when restoring a previously
+stopped task.
+
 Linux requires an available systemd user manager and `busctl` with JSON output.
 The unit directory is `${XDG_CONFIG_HOME:-~/.config}/systemd/user`; preflight
 verifies that the running manager actually searches that directory. WSL
