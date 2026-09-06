@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jgoneit/ward/internal/securefs"
 )
 
 type fakeServiceBackend struct {
@@ -194,6 +196,13 @@ func lifecycleFixture(t *testing.T) (Paths, lifecycleManager, *fakeServiceBacken
 	}
 	if err := os.WriteFile(paths.BinaryPath, []byte("original core binary"), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		// The fixture models an installed, user-owned Core binary. Elevated
+		// Windows tokens can otherwise create an Administrators-owned file.
+		if err := securefs.SecurePrivateFile(paths.BinaryPath); err != nil {
+			t.Fatal(err)
+		}
 	}
 	backend := &fakeServiceBackend{}
 	d := serviceDefinition{Backend: "fixture", ID: "fixture-service", Binary: filepath.Join(filepath.Dir(paths.BinaryPath), "ward-diagnostics"), Content: []byte("managed service definition")}

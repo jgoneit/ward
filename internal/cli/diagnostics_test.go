@@ -23,14 +23,14 @@ func TestPreDiagnosticsPreservePolicyAndSeparateFailureStages(t *testing.T) {
 	previous := diagnosticWorker
 	t.Cleanup(func() { diagnosticWorker = previous })
 	for _, tc := range []struct {
-		name, command, stage, outcome, code string
-		raw                                 string
-		engineFail, writeFail               bool
-		readFail                            bool
+		name, tool, command, stage, outcome, code string
+		raw                                       string
+		engineFail, writeFail                     bool
+		readFail                                  bool
 	}{
 		{name: "ordinary", command: "printf diagnostic-secret-canary", stage: "evaluate", outcome: "defer"},
 		{name: "deny", command: "git reset --hard", stage: "evaluate", outcome: "deny"},
-		{name: "ambiguous", command: "rm -rf \"$TARGET\"", stage: "evaluate", outcome: "defer"},
+		{name: "ambiguous", tool: "PowerShell", command: "Get-Content $TARGET", stage: "evaluate", outcome: "defer"},
 		{name: "decode", raw: `{"secret":"diagnostic-secret-canary"}`, stage: "decode", outcome: "not_evaluated", code: "payload_invalid"},
 		{name: "read", readFail: true, stage: "read", outcome: "not_evaluated", code: "input_read"},
 		{name: "engine", command: "printf ordinary", engineFail: true, stage: "engine", outcome: "error", code: "engine_init"},
@@ -44,7 +44,18 @@ func TestPreDiagnosticsPreservePolicyAndSeparateFailureStages(t *testing.T) {
 				executablePath = func() (string, error) { return "", errors.New("diagnostic-secret-canary") }
 			}
 			defer func() { executablePath = originalBinary }()
-			var input io.Reader = bytes.NewReader(mustHookPayload(t, filepath.Join(root, "project"), tc.command))
+			tool := tc.tool
+			if tool == "" {
+				tool = "Bash"
+			}
+			payload, err := json.Marshal(map[string]any{
+				"hook_event_name": "PreToolUse", "cwd": filepath.Join(root, "project"),
+				"tool_name": tool, "tool_input": map[string]any{"command": tc.command},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var input io.Reader = bytes.NewReader(payload)
 			if tc.raw != "" {
 				input = strings.NewReader(tc.raw)
 			}

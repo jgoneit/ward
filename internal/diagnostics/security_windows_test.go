@@ -10,6 +10,25 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestCollectorLockAssignsCurrentUserOwnerWhenCreated(t *testing.T) {
+	paths := fixturePaths(t)
+	if err := ensurePrivateDirectory(paths.ControlDir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(paths.ControlDir, "collector.lock")
+	unlock, err := lockCollector(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if err := currentUserOwnsPath(path); err != nil {
+		t.Fatalf("new lock owner: %v", err)
+	}
+	if err := securefs.InspectPrivateFile(path); err != nil {
+		t.Fatalf("new lock DACL: %v", err)
+	}
+}
+
 func TestCollectorLockRejectsChangedDACLWithoutRepair(t *testing.T) {
 	paths := fixturePaths(t)
 	if err := ensurePrivateDirectory(paths.ControlDir); err != nil {
