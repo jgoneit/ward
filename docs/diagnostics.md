@@ -117,7 +117,7 @@ enabled, and correlate only the corresponding received event. Do not use a
 destructive command or treat missing records as proof of a Host failure.
 
 The opt-in `native_diagnostics` input on the CI workflow runs
-`scripts/test-native-diagnostics.py` on actual Ubuntu and Windows runners. It
+`scripts/test-native-diagnostics.py` on actual macOS, Ubuntu, and Windows runners. It
 requires a working user service environment; an unavailable systemd user
 manager or interactive Windows task session fails the check and is recorded
 in the JSON result. It does not enable linger, install a system service, or

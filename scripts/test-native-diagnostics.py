@@ -198,13 +198,29 @@ class NativeSmoke:
             require(not status["enabled"] and not status["running"], "windows_task_remains")
 
     def assert_fixture_unchanged(self, before):
-        require(self.fixture_snapshot() == before, "dry_run_created_or_changed_artifacts")
+        after = self.fixture_snapshot()
+        if after != before:
+            # Relative fixture names only; no contents or runtime credentials.
+            raise CheckFailure("dry_run_created_or_changed_artifacts",
+                               added=sorted(after.keys() - before.keys()),
+                               removed=sorted(before.keys() - after.keys()),
+                               changed=sorted(key for key in before.keys() & after.keys()
+                                              if before[key] != after[key]))
         self.require_native_absent()
 
     def fixture_snapshot(self):
         # Called before activation only: no runtime descriptor/key is read.
-        return {str(path.relative_to(self.root)): ("dir" if path.is_dir() else digest(path))
-                for path in self.root.rglob("*")}
+        # Windows PowerShell may maintain its own LOCALAPPDATA caches even
+        # during read-only COM queries. Inspect every Ward/Codex fixture path;
+        # native registration absence is checked separately on all platforms.
+        snapshot = {}
+        for root in (self.bin_dir, self.core.parent, self.root / "codex"):
+            if root.exists():
+                for path in (root, *root.rglob("*")):
+                    snapshot[str(path.relative_to(self.root))] = (
+                        "dir" if path.is_dir() else digest(path)
+                    )
+        return snapshot
 
     def require_ready(self):
         status = self.status()
@@ -359,6 +375,11 @@ class NativeSmoke:
 
     def exercise(self):
         self.identify_service()
+        # Cold Windows PowerShell initializes module/runtime caches in its
+        # isolated profile. Warm the same COM inspection before the snapshot;
+        # the dry-run claim concerns Ward-owned artifacts, not OS first use.
+        initial = self.status()
+        require(not initial["enabled"] and not initial["running"], "initial_status_not_disabled")
         snapshot = self.fixture_snapshot()
         # Let Ward's real preflight classify unsupported environments before
         # interpreting an unavailable manager as a missing registration.
@@ -366,8 +387,6 @@ class NativeSmoke:
         require(dry["changed"] and dry["dry_run"], "enable_dry_run_result_invalid")
         self.require_native_absent()
         self.initial_absence = True
-        initial = self.status()
-        require(not initial["enabled"] and not initial["running"], "initial_status_not_disabled")
         self.assert_fixture_unchanged(snapshot)
         dry = self.command_json("diagnostics", "disable", "--dry-run")
         require(not dry["changed"] and dry["dry_run"], "disabled_dry_run_not_noop")
