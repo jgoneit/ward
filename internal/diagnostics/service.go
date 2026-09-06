@@ -53,8 +53,17 @@ type serviceCommandError struct{ code int }
 
 func (e serviceCommandError) Error() string { return "diagnostics service command failed" }
 
+func serviceCommandTimeout() time.Duration {
+	if runtime.GOOS == "windows" {
+		// Cold Windows PowerShell/COM startup can exceed five seconds.
+		// This bounds management commands only, never the Hook sender.
+		return 15 * time.Second
+	}
+	return 5 * time.Second
+}
+
 func runServiceCommand(ctx context.Context, program string, args []string, input []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, serviceCommandTimeout())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, program, args...)
 	cmd.Stdin = bytes.NewReader(input)

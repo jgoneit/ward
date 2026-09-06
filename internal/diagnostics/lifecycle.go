@@ -662,7 +662,7 @@ func (m lifecycleManager) artifactsAbsent(paths Paths) (bool, error) {
 	// Check the exact derived task ID before saying an artifact-free install
 	// is disabled; an orphan registration is an ownership conflict.
 	if n, ok := m.backend.(nativeService); ok && n.platform == "windows" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), serviceCommandTimeout())
 		defer cancel()
 		state, err := n.inspect(ctx, m.definition)
 		if err != nil {
