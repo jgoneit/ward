@@ -54,7 +54,21 @@ def run(argv, env, label, *, payload=None, timeout=45, expected=0):
             code = "unsupported_user_service_environment"
         elif b"ownership conflict" in result.stderr:
             code = "ownership_conflict"
-        raise CheckFailure(code, command=label, exit_code=result.returncode)
+        elif b"diagnostics_owner_mismatch" in result.stderr:
+            code = "diagnostics_owner_mismatch"
+        elif b"diagnostics collector readiness failed" in result.stderr:
+            code = "collector_readiness_failed"
+        elif b"diagnostics collector stop is unconfirmed" in result.stderr:
+            code = "collector_stop_unconfirmed"
+        details = {"command": label, "exit_code": result.returncode}
+        for phrase, outcome in (
+                (b"rollback failed", "failed"),
+                (b"previous state restored", "previous_state_restored"),
+                (b"newly created artifacts removed", "new_artifacts_removed")):
+            if phrase in result.stderr:
+                details["rollback"] = outcome
+                break
+        raise CheckFailure(code, **details)
     return result
 
 
