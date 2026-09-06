@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 
 class CheckFailure(Exception):
@@ -96,6 +97,54 @@ def powershell_path():
     length = kernel.GetSystemDirectoryW(buffer, len(buffer))
     require(0 < length < len(buffer), "windows_system_directory_unavailable")
     return str(Path(buffer.value) / "WindowsPowerShell/v1.0/powershell.exe")
+
+
+def project_task_xml(xml_text):
+    """Bounded structural evidence; no dynamic values or raw XML escape."""
+    require(len(xml_text) <= 65536 and "<!DOCTYPE" not in xml_text.upper()
+            and "<!ENTITY" not in xml_text.upper(), "task_projection_xml_rejected")
+    known = set("Task RegistrationInfo Description URI Author Date Version Source Documentation "
+                "Triggers LogonTrigger Enabled UserId Delay StartBoundary EndBoundary Repetition "
+                "Interval Duration StopAtDurationEnd Principals Principal GroupId LogonType "
+                "RunLevel DisplayName ProcessTokenSidType RequiredPrivileges Privilege Settings "
+                "MultipleInstancesPolicy DisallowStartIfOnBatteries StopIfGoingOnBatteries "
+                "AllowHardTerminate StartWhenAvailable RunOnlyIfNetworkAvailable IdleSettings "
+                "WaitTimeout StopOnIdleEnd RestartOnIdle AllowStartOnDemand Hidden RunOnlyIfIdle "
+                "WakeToRun ExecutionTimeLimit Priority RestartOnFailure Count NetworkSettings "
+                "Id Name NetworkProfileName DeleteExpiredTaskAfter UseUnifiedSchedulingEngine "
+                "DisallowStartOnRemoteAppSession Volatile MaintenanceSettings Period Deadline "
+                "Exclusive Actions Exec Command Arguments WorkingDirectory".split())
+    booleans = set("Enabled DisallowStartIfOnBatteries StopIfGoingOnBatteries AllowHardTerminate "
+                   "StartWhenAvailable RunOnlyIfNetworkAvailable StopOnIdleEnd RestartOnIdle "
+                   "AllowStartOnDemand Hidden RunOnlyIfIdle WakeToRun UseUnifiedSchedulingEngine "
+                   "DisallowStartOnRemoteAppSession Volatile Exclusive".split())
+    durations = {"Duration", "WaitTimeout", "ExecutionTimeLimit", "Interval", "DeleteExpiredTaskAfter"}
+    result = {"element_counts": {}, "settings": {}}
+    root = ET.fromstring(xml_text)
+    visited = 0
+
+    def visit(node, parents):
+        nonlocal visited
+        visited += 1
+        require(visited <= 128 and len(parents) < 10, "task_projection_bounds_exceeded")
+        local = node.tag.rsplit("}", 1)[-1]
+        name = local if local in known else "Unknown"
+        path = parents + [name]
+        key = "/".join(path)
+        result["element_counts"][key] = result["element_counts"].get(key, 0) + 1
+        if path[:2] == ["Task", "Settings"] and len(node) == 0:
+            value = (node.text or "").strip()
+            allowed = ((name in booleans and value in {"true", "false"})
+                       or (name in durations and value in {"PT0S", "PT1M", "PT5M", "PT10M", "PT1H", "P3D"})
+                       or (name == "MultipleInstancesPolicy" and value in {"Parallel", "Queue", "IgnoreNew", "StopExisting"})
+                       or (name == "Priority" and value in {str(i) for i in range(11)})
+                       or (name == "Count" and value in {"1", "2", "3"}))
+            result["settings"].setdefault(key, []).append(value if allowed else "redacted")
+        for child in node:
+            visit(child, path)
+
+    visit(root, [])
+    return result
 
 
 def normalize_linux_bus(env):
@@ -177,6 +226,40 @@ class NativeSmoke:
 
     def status(self):
         return self.command_json("diagnostics", "status", "--json")
+
+    def record_windows_task_projection(self):
+        if self.platform != "win32" or self.native_id is None:
+            return
+        script = r"""$ErrorActionPreference='Stop'
+$utf8=[Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8
+$request=[Console]::In.ReadToEnd()|ConvertFrom-Json
+$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+$folder=$scheduler.GetFolder('\'); $task=$null
+try { $task=$folder.GetTask($request.Name) } catch {
+  if($_.Exception.GetBaseException().HResult -ne -2147024894){ throw }
+}
+if($null -eq $task){ '{"exists":false}' }else{
+  @{exists=$true;xml=$task.Xml}|ConvertTo-Json -Compress
+}
+"""
+        try:
+            response = run([powershell_path(), "-NoLogo", "-NoProfile", "-NonInteractive",
+                            "-Command", script], self.env, "fixture_task_projection",
+                           payload=json.dumps({"Name": self.native_id}).encode(), timeout=15)
+            require(len(response.stdout) <= 131072, "task_projection_reply_too_large")
+            task = json.loads(response.stdout)
+            if task.get("exists") is False:
+                self.record("windows_task_projection", available=True, task_exists=False)
+                return
+            require(task.get("exists") is True and isinstance(task.get("xml"), str),
+                    "task_projection_reply_invalid")
+            projection = project_task_xml(task["xml"])
+            self.record("windows_task_projection", available=True, task_exists=True,
+                        dynamic_values_redacted=True, **projection)
+        except (CheckFailure, OSError, ValueError, ET.ParseError) as error:
+            code = error.code if isinstance(error, CheckFailure) else type(error).__name__
+            self.record("windows_task_projection", available=False, error_code=code)
 
     def identify_service(self):
         if self.platform == "win32":
@@ -439,6 +522,8 @@ class NativeSmoke:
 
         self.service_attempted = True
         enabled = self.command_json("diagnostics", "enable")
+        self.record("native_enable_return", exit_code=0, enabled=enabled.get("enabled"),
+                    changed=enabled.get("changed"))
         status = self.require_ready()
         require(enabled["enabled"] and enabled["changed"], "enable_result_invalid")
         require(Path(enabled["collector_binary"]) == self.collector, "unexpected_collector_path")
@@ -535,6 +620,7 @@ def main():
             return 1
         smoke.failure = failure
         smoke.record("failure", **failure)
+        smoke.record_windows_task_projection()
     finally:
         if smoke is not None:
             smoke.cleanup()
