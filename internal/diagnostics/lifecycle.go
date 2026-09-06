@@ -312,10 +312,10 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 	collectorRelease()
 	collectorRelease = nil
 	if err = m.backend.install(ctx, m.definition); err != nil {
-		return result, err
+		return result, fmt.Errorf("diagnostics service registration failed: %w", err)
 	}
 	if err = m.backend.start(ctx, m.definition); err != nil {
-		return result, err
+		return result, fmt.Errorf("diagnostics service start failed: %w", err)
 	}
 	if err = m.waitReady(ctx, paths); err != nil {
 		return result, err

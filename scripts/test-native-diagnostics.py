@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -60,7 +61,20 @@ def run(argv, env, label, *, payload=None, timeout=45, expected=0):
             code = "collector_readiness_failed"
         elif b"diagnostics collector stop is unconfirmed" in result.stderr:
             code = "collector_stop_unconfirmed"
+        elif b"diagnostics service backend failed" in result.stderr:
+            code = "service_backend_failed"
+        elif b"diagnostics service command failed" in result.stderr:
+            code = "service_command_failed"
+        elif b"diagnostics service response is invalid" in result.stderr:
+            code = "service_response_invalid"
         details = {"command": label, "exit_code": result.returncode}
+        hresult = re.search(rb"diagnostics service backend failed \(hresult=0x([0-9a-f]{8})\)", result.stderr)
+        if hresult:
+            details["hresult"] = "0x" + hresult[1].decode("ascii")
+        for phase in ("registration", "start"):
+            if ("diagnostics service " + phase + " failed").encode() in result.stderr:
+                details["phase"] = phase
+                break
         for phrase, outcome in (
                 (b"rollback failed", "failed"),
                 (b"previous state restored", "previous_state_restored"),

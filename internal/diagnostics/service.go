@@ -445,10 +445,17 @@ func (n nativeService) windowsRequest(ctx context.Context, request windowsServic
 	if err != nil {
 		return result, err
 	}
-	if err := json.Unmarshal(out, &result); err != nil {
+	var reply struct {
+		windowsServiceReply
+		BackendHResult *int32
+	}
+	if err := json.Unmarshal(out, &reply); err != nil {
 		return result, fmt.Errorf("diagnostics service response is invalid")
 	}
-	return result, nil
+	if reply.BackendHResult != nil {
+		return result, fmt.Errorf("diagnostics service backend failed (hresult=0x%08x)", uint32(*reply.BackendHResult))
+	}
+	return reply.windowsServiceReply, nil
 }
 
 const windowsServiceScript = `$ErrorActionPreference='Stop'
@@ -456,6 +463,7 @@ $utf8=[System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding=$utf8
 [Console]::OutputEncoding=$utf8
 $OutputEncoding=$utf8
+try {
 $inputData=[Console]::In.ReadToEnd()|ConvertFrom-Json
 $scheduler=New-Object -ComObject 'Schedule.Service'
 $scheduler.Connect()
@@ -471,4 +479,8 @@ switch($inputData.Action){
  'remove' { if($null -ne $task){$folder.DeleteTask($inputData.Name,0)}; '{}'; break }
  'restore' { $definition=$scheduler.NewTask(0); $definition.XmlText=$inputData.XML; $definition.Settings.Enabled=$inputData.Enabled; $restored=$folder.RegisterTaskDefinition($inputData.Name,$definition,6,$inputData.UserID,$null,3,$null); if($inputData.Running){$restored.Enabled=$true; $null=$restored.Run($null); $restored.Enabled=$inputData.Enabled}; '{}'; break }
  default { throw 'unsupported action' }
+}
+} catch {
+ @{BackendHResult=[int]$_.Exception.GetBaseException().HResult}|ConvertTo-Json -Compress
+ exit 0
 }`
