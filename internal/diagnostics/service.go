@@ -458,7 +458,32 @@ func (n nativeService) windowsRequest(ctx context.Context, request windowsServic
 	return reply.windowsServiceReply, nil
 }
 
-const windowsServiceScript = `$ErrorActionPreference='Stop'
+// Task Scheduler may export a logon trigger's SID as an account name. Resolve
+// that name inside the already time-bounded PowerShell command and rewrite only
+// a plain leaf proven to identify the same user. All other XML remains strict.
+const windowsTaskUserNormalization = `function Normalize-WardTaskUser($xmlText,$expectedSID) {
+ $document=[System.Xml.XmlDocument]::new()
+ $document.XmlResolver=$null
+ $document.LoadXml($xmlText)
+ $namespaces=[System.Xml.XmlNamespaceManager]::new($document.NameTable)
+ $namespaces.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+ $users=$document.SelectNodes('/t:Task/t:Triggers/t:LogonTrigger/t:UserId',$namespaces)
+ if($users.Count -eq 1){
+  $user=$users.Item(0)
+  $elements=@($user.ChildNodes|Where-Object {$_.NodeType -eq [System.Xml.XmlNodeType]::Element})
+  if($user.Attributes.Count -eq 0 -and $elements.Count -eq 0 -and $user.InnerText -cne $expectedSID){
+   try {
+    $account=[System.Security.Principal.NTAccount]::new($user.InnerText)
+    $resolved=$account.Translate([System.Security.Principal.SecurityIdentifier])
+    if($resolved.Value -ceq $expectedSID){$user.InnerText=$expectedSID}
+   } catch { }
+  }
+ }
+ return $document.OuterXml
+}
+`
+
+const windowsServiceScript = windowsTaskUserNormalization + `$ErrorActionPreference='Stop'
 $utf8=[System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding=$utf8
 [Console]::OutputEncoding=$utf8
@@ -472,7 +497,7 @@ if($inputData.Action -eq 'preflight'){ '{}'; exit 0 }
 $task=$null
 try { $task=$folder.GetTask($inputData.Name) } catch { if($_.Exception.GetBaseException().HResult -ne -2147024894){throw} }
 switch($inputData.Action){
- 'inspect' { if($null -eq $task){ '{"Exists":false}' }else{ @{Exists=$true;Enabled=$task.Enabled;Running=($task.State -eq 4 -or $task.State -eq 2);XML=$task.Xml}|ConvertTo-Json -Compress }; break }
+ 'inspect' { if($null -eq $task){ '{"Exists":false}' }else{ @{Exists=$true;Enabled=$task.Enabled;Running=($task.State -eq 4 -or $task.State -eq 2);XML=(Normalize-WardTaskUser $task.Xml $inputData.UserID)}|ConvertTo-Json -Compress }; break }
  'install' { $null=$folder.RegisterTask($inputData.Name,$inputData.XML,6,$inputData.UserID,$null,3,$null); '{}'; break }
  'start' { if($null -eq $task){throw 'absent'}; $task.Enabled=$true; $null=$task.Run($null); '{}'; break }
  'stop' { if($null -ne $task){$task.Enabled=$false; $task.Stop(0)}; '{}'; break }
