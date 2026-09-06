@@ -180,7 +180,7 @@ func (e *Evaluator) evaluateWindowsArgv(values []string, leadingQuoted []bool, c
 		}
 	}
 
-	// Git, database, and infrastructure subcommands have identical literal
+	// Git subcommands have identical literal
 	// argv semantics once Windows shell expansion has been ruled out.
 	switch base {
 	case "git":
@@ -205,31 +205,6 @@ func (e *Evaluator) evaluateWindowsArgv(values []string, leadingQuoted []bool, c
 		if destructiveGit(operationArgs) {
 			return denied("WARD_DESTRUCTIVE_GIT", destructiveGitReason)
 		}
-	case "terraform":
-		if destructiveTerraform(operationArgs) {
-			return denied("WARD_DESTRUCTIVE_INFRASTRUCTURE", destructiveOpsReason)
-		}
-	case "kubectl":
-		destructive, kubectlGap := destructiveKubectl(operationArgs)
-		result.addGap(kubectlGap)
-		if destructive {
-			return denied("WARD_DESTRUCTIVE_INFRASTRUCTURE", destructiveOpsReason)
-		}
-	case "docker":
-		destructive, composeGap := destructiveDocker(operationArgs)
-		result.addGap(composeGap)
-		if destructive {
-			return denied("WARD_DESTRUCTIVE_INFRASTRUCTURE", destructiveOpsReason)
-		}
-	case "docker-compose":
-		destructive, composeGap := destructiveCompose(operationArgs)
-		result.addGap(composeGap)
-		if destructive {
-			return denied("WARD_DESTRUCTIVE_INFRASTRUCTURE", destructiveOpsReason)
-		}
-	}
-	if containsDestructiveSQL(base, argv[1:]) {
-		return denied("WARD_DESTRUCTIVE_DATABASE", destructiveDBReason)
 	}
 	return result
 }

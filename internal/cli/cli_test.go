@@ -74,6 +74,13 @@ func TestPreHookDenyDeferAndErrorNeverPersist(t *testing.T) {
 		wantDeny   bool
 	}{
 		{name: "defer", command: "printf ordinary"},
+		{name: "compose volume teardown", command: "docker compose down -v"},
+		{name: "legacy compose volume teardown", command: "docker-compose down --volumes"},
+		{name: "database teardown", command: "psql -c 'DROP DATABASE app'"},
+		{name: "schema teardown", command: "psql -c 'DROP SCHEMA app CASCADE'"},
+		{name: "terraform teardown", command: "terraform destroy"},
+		{name: "terraform apply teardown", command: "terraform apply -destroy"},
+		{name: "namespace teardown", command: "kubectl delete namespace app"},
 		{name: "deny", command: "rm -rf .", wantDeny: true},
 		{name: "error", command: "printf ordinary", engineFail: true},
 	} {
