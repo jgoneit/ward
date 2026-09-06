@@ -40,7 +40,7 @@ Ward never returns `allow` or `ask`, and never edits `approval_policy`.
 ## Autonomy constraint
 
 Ambiguous syntax, unknown tools, interactive sessions, secret-reading commands,
-ordinary deletion, builds, normal Git, migrations, and infrastructure planning
+ordinary deletion, builds, normal Git, SQL, and infrastructure operations
 defer. A new built-in deny is admitted only for a recoverability-critical
 target that can be identified with high confidence and has attack plus normal
 workflow counterexamples.

@@ -67,28 +67,17 @@
 {"name":"git force push dry run remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git push --dry-run --force origin main"}},"want":{"outcome":"defer"}}
 {"name":"git checkout remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git checkout -- README.md"}},"want":{"outcome":"defer"}}
 {"name":"git branch delete remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git branch -D topic"}},"want":{"outcome":"defer"}}
-{"name":"terraform destroy","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform chdir destroy","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform -chdir=infra destroy"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl namespace delete","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace production"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl context namespace delete","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --context prod delete namespace production"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl namespace delete client dry run","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=client"}},"want":{"outcome":"defer"}}
-{"name":"kubectl pod delete remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete pod test-pod"}},"want":{"outcome":"defer"}}
+{"name":"terraform destroy defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy"}},"want":{"outcome":"defer"}}
+{"name":"terraform chdir destroy defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform -chdir=infra destroy"}},"want":{"outcome":"defer"}}
+{"name":"kubectl namespace delete defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace production"}},"want":{"outcome":"defer"}}
+{"name":"kubectl context namespace delete defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --context prod delete namespace production"}},"want":{"outcome":"defer"}}
 {"name":"helm uninstall remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"helm uninstall test-release"}},"want":{"outcome":"defer"}}
-{"name":"docker compose volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker context compose volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --context prod compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose project volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --project-name demo down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose direct volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker-compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose direct ordinary down","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker-compose down"}},"want":{"outcome":"defer"}}
-{"name":"docker compose volume deletion dry run","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run down -v"}},"want":{"outcome":"defer"}}
-{"name":"docker compose explicit disabled dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=false down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
+{"name":"docker compose volume deletion defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v"}},"want":{"outcome":"defer"}}
+{"name":"docker context compose volume deletion defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --context prod compose down -v"}},"want":{"outcome":"defer"}}
+{"name":"docker compose direct volume deletion defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker-compose down -v"}},"want":{"outcome":"defer"}}
 {"name":"docker volume rm remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker volume rm test-volume"}},"want":{"outcome":"defer"}}
-{"name":"drop database command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE production;'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"drop schema cascade command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql --command 'DROP SCHEMA accounting CASCADE;'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"drop schema restrict remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP SCHEMA accounting;'"}},"want":{"outcome":"defer"}}
-{"name":"drop table remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP TABLE users;'"}},"want":{"outcome":"defer"}}
-{"name":"truncate remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'TRUNCATE TABLE users;'"}},"want":{"outcome":"defer"}}
-{"name":"delete rows remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DELETE FROM users;'"}},"want":{"outcome":"defer"}}
-{"name":"drop database text in select remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c \"SELECT 'DROP DATABASE production';\""}},"want":{"outcome":"defer"}}
+{"name":"drop database command defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE production;'"}},"want":{"outcome":"defer"}}
+{"name":"drop schema cascade command defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql --command 'DROP SCHEMA accounting CASCADE;'"}},"want":{"outcome":"defer"}}
 {"name":"exact bare shell interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash"}},"want":{"outcome":"defer"}}
 {"name":"exact bare repl interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"python3"}},"want":{"outcome":"defer"}}
 {"name":"explicit shell interactive flag","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -i"}},"want":{"outcome":"defer"}}
@@ -127,9 +116,6 @@
 {"name":"ambiguous cmd defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"type %USERPROFILE%\\.env"}},"want":{"outcome":"defer","gap_code":"ambiguous_cmd"}}
 {"name":"git no pager reset hard","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git --no-pager reset --hard"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
 {"name":"git no pager status remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git --no-pager status"}},"want":{"outcome":"defer"}}
-{"name":"terraform no color destroy","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform -no-color destroy"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl namespace global option delete","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --namespace default delete namespace production"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker log level compose volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --log-level debug compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
 {"name":"env wrapped bare shell interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"env bash"}},"want":{"outcome":"defer"}}
 {"name":"command wrapped bare repl interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"command python"}},"want":{"outcome":"defer"}}
 {"name":"shell option only interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash --noprofile"}},"want":{"outcome":"defer"}}
@@ -152,28 +138,15 @@
 {"name":"piped script shell is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"printf 'echo safe\\n' | bash"}},"want":{"outcome":"defer","gap_code":"dynamic_interpreter_payload"}}
 {"name":"invalid git config override does not trigger destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git -c not-a-config-key reset --hard"}},"want":{"outcome":"defer","gap_code":"unsupported_git_global_option"}}
 {"name":"valid git config override retains destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git -c core.pager=cat reset --hard"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
-{"name":"invalid kubectl boolean does not trigger destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --insecure-skip-tls-verify=maybe delete namespace demo"}},"want":{"outcome":"defer","gap_code":"unsupported_global_option"}}
-{"name":"valid kubectl false boolean retains destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --insecure-skip-tls-verify=false delete namespace demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"invalid docker log level does not trigger destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --log-level loud compose down -v"}},"want":{"outcome":"defer","gap_code":"unsupported_docker_global_option"}}
-{"name":"valid docker disabled debug retains destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --debug=false compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
 {"name":"git config env remains runtime dependent","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git --config-env=core.pager=PAGER reset --hard"}},"want":{"outcome":"defer","gap_code":"unsupported_global_option"}}
-{"name":"invalid kubectl verbosity does not trigger destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --v loud delete namespace demo"}},"want":{"outcome":"defer","gap_code":"unsupported_kubectl_global_option"}}
-{"name":"valid kubectl verbosity retains destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl --v 4 delete namespace demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"invalid docker host does not trigger destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --host loud compose down -v"}},"want":{"outcome":"defer","gap_code":"unsupported_docker_global_option"}}
-{"name":"valid docker unix host retains destructive deny","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --host unix:///var/run/docker.sock compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
 {"name":"nohup explicit repl is not classified interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"nohup python -i"}},"want":{"outcome":"defer"}}
 {"name":"repository gh hosts fixture remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cat testdata/gh/hosts.yml"}},"want":{"outcome":"defer"}}
 {"name":"repository docker config fixture remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cat fixtures/docker/config.json"}},"want":{"outcome":"defer"}}
 {"name":"repository aws credentials fixture remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cat testdata/.aws/credentials"}},"want":{"outcome":"defer"}}
 {"name":"psql database option interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -d app"}},"want":{"outcome":"defer"}}
 {"name":"env psql database option interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"env psql --dbname=app"}},"want":{"outcome":"defer"}}
-{"name":"psql command option is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -d app -c 'SELECT 1'"}},"want":{"outcome":"defer"}}
-{"name":"psql version is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql --version"}},"want":{"outcome":"defer"}}
 {"name":"piped psql is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"printf '\\q\\n' | psql -d app"}},"want":{"outcome":"defer"}}
 {"name":"redirected psql is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -d app < schema.sql"}},"want":{"outcome":"defer"}}
-{"name":"mysql user option interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -u root"}},"want":{"outcome":"defer"}}
-{"name":"mysql attached password option interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql --password=x -u root"}},"want":{"outcome":"defer"}}
-{"name":"mysql execute option is not interactive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -u root -e 'SELECT 1'"}},"want":{"outcome":"defer"}}
 {"name":"powershell no profile interactive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"powershell -NoProfile"}},"want":{"outcome":"defer"}}
 {"name":"pwsh no logo interactive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"pwsh -NoLogo"}},"want":{"outcome":"defer"}}
 {"name":"powershell command option is not interactive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"powershell -NoProfile -Command Get-Date"}},"want":{"outcome":"defer"}}
@@ -199,24 +172,7 @@
 {"name":"versioned python version remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"python3.12 --version"}},"want":{"outcome":"defer"}}
 {"name":"versioned python payload remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"python3.12 -c 'print(1)'"}},"want":{"outcome":"defer","gap_code":"interpreter_payload"}}
 {"name":"python prefix near miss remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"python3.12-dev --version"}},"want":{"outcome":"defer"}}
-{"name":"terraform apply destroy mode","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform apply explicit destroy mode","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy=true"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform plan destroy mode remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform plan -destroy"}},"want":{"outcome":"defer"}}
-{"name":"terraform apply disabled destroy mode remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy=false"}},"want":{"outcome":"defer"}}
-{"name":"terraform apply last disabled destroy mode remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy -destroy=false"}},"want":{"outcome":"defer"}}
-{"name":"compound drop database command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'SELECT 1; DROP DATABASE prod;'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"compound drop schema cascade command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'SELECT 1; DROP SCHEMA accounting CASCADE;'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"compound selects remain ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'SELECT 1; SELECT 2;'"}},"want":{"outcome":"defer"}}
-{"name":"compound quoted drop text remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c \"SELECT 'DROP DATABASE prod;'; SELECT 2;\""}},"want":{"outcome":"defer"}}
-{"name":"compound commented drop text remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c $'SELECT 1; -- DROP DATABASE prod;\\nSELECT 2;'"}},"want":{"outcome":"defer"}}
-{"name":"compound dollar quoted drop text remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'SELECT $$DROP DATABASE prod;$$; SELECT 2;'"}},"want":{"outcome":"defer"}}
-{"name":"comment separated drop database command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c $'SELECT 1; /* reviewed */ DROP DATABASE prod;'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"docker compose file volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose -f compose.yml down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose direct env profile volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker-compose --env-file x --profile p down --volumes"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose project directory volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --project-directory project down --volumes"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"docker compose missing file remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose -f"}},"want":{"outcome":"defer","gap_code":"unsupported_compose_option"}}
-{"name":"docker compose unknown option remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --future-option x down -v"}},"want":{"outcome":"defer","gap_code":"unsupported_compose_option"}}
-{"name":"docker compose ordinary file config remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose -f compose.yml config"}},"want":{"outcome":"defer"}}
+{"name":"terraform apply destroy mode defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy"}},"want":{"outcome":"defer"}}
 {"name":"compound cwd change does not promote pwd","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cd build && rm -rf \"$PWD\""}},"want":{"outcome":"defer","gap_code":"dynamic_shell_word"}}
 {"name":"bash xtrace stdin session","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -x"}},"want":{"outcome":"defer"}}
 {"name":"bash noglob stdin session","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -f"}},"want":{"outcome":"defer"}}
@@ -231,19 +187,10 @@
 {"name":"rsync remote shell local custom env source","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -e ssh .env.customer host:/dst/"}},"want":{"outcome":"defer"}}
 {"name":"rsync remote shell ordinary source","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -e ssh src/ host:/dst/"}},"want":{"outcome":"defer"}}
 {"name":"rsync dynamic remote shell remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -e \"$RSYNC_SHELL\" .env.customer host:/dst/"}},"want":{"outcome":"defer","gap_code":"dynamic_shell_word"}}
-{"name":"kubectl namespace option value is not resource type","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete --namespace namespace pod demo"}},"want":{"outcome":"defer"}}
-{"name":"kubectl namespace resource after namespace option","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete --namespace default namespace demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl unknown delete option remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --future-option"}},"want":{"outcome":"defer","gap_code":"unsupported_kubectl_delete_option"}}
-{"name":"kubectl explicit non dry run namespace delete","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=none"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"sql option terminator prevents command interpretation","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -- -c 'DROP DATABASE prod;'"}},"want":{"outcome":"defer"}}
 {"name":"dynamic sql option remains ambiguous","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql \"$PSQL_OPTION\" -c 'DROP DATABASE prod;'"}},"want":{"outcome":"defer","gap_code":"dynamic_shell_word"}}
 {"name":"at prefixed env basename remains literal","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cat @.env"}},"want":{"outcome":"defer"}}
-{"name":"compose dry run token used as env file value","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --env-file --dry-run down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform destroy flag is case sensitive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -DESTROY"}},"want":{"outcome":"defer"}}
-{"name":"terraform destroy with help remains informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy --help"}},"want":{"outcome":"defer"}}
 {"name":"uppercase bash is not a posix alias","request":{"tool":"bash","cwd":"/workspace","input":{"command":"BASH"}},"want":{"outcome":"defer"}}
 {"name":"uppercase versioned python is not a posix alias","request":{"tool":"bash","cwd":"/workspace","input":{"command":"PYTHON3.12"}},"want":{"outcome":"defer"}}
-{"name":"mixed case terraform is not a posix alias","request":{"tool":"bash","cwd":"/workspace","input":{"command":"Terraform apply -destroy"}},"want":{"outcome":"defer"}}
 {"name":"uppercase ripgrep is not a posix alias","request":{"tool":"bash","cwd":"/workspace","input":{"command":"RG TOKEN .env.customer"}},"want":{"outcome":"defer"}}
 {"name":"windows executable identity remains case insensitive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"PoWeRsHeLl -NoProfile"}},"want":{"outcome":"defer"}}
 {"name":"bash norc nested destructive command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash --norc -c 'rm -rf /'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
@@ -283,16 +230,6 @@
 {"name":"rsync remote shell protected executable","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -e .env.customer src/ host:/dst/"}},"want":{"outcome":"defer"}}
 {"name":"rsync long remote shell protected executable","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync --rsh=.env.customer src/ host:/dst/"}},"want":{"outcome":"defer"}}
 {"name":"rsync embedded remote shell remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -e 'ssh -i .env.customer' src/ host:/dst/"}},"want":{"outcome":"defer"}}
-{"name":"compose attached timeout volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v -t10"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose assigned remove orphans volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v --remove-orphans=true"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose service volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v web"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose ansi parallel volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --ansi never --parallel 1 down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose last dry run false remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run --dry-run=false down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose last dry run true remains non mutating","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=false --dry-run down -v"}},"want":{"outcome":"defer"}}
-{"name":"kubectl last dry run none remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=client --dry-run=none"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl last dry run client remains non mutating","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=none --dry-run=client"}},"want":{"outcome":"defer"}}
-{"name":"terraform help token used as var file value","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy -var-file --help"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform option terminator prevents destroy flag interpretation","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -- -destroy"}},"want":{"outcome":"defer"}}
 {"name":"recursive pwd deletion help remains informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rm -rf \"$PWD\" --help"}},"want":{"outcome":"defer"}}
 {"name":"recursive pwd deletion version remains informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rm -rf \"$PWD\" --version"}},"want":{"outcome":"defer"}}
 {"name":"rm option terminator preserves catastrophic pwd target","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rm -rf \"$PWD\" -- --help"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
@@ -304,16 +241,8 @@
 {"name":"cmd compound interactive tail","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"echo ready & cmd /q"}},"want":{"outcome":"defer"}}
 {"name":"powershell piped interactive-looking command remains ambiguous","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Write-Output ready | pwsh -NoProfile"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell"}}
 {"name":"cmd redirected interactive-looking command remains ambiguous","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"cmd /q < script.cmd"}},"want":{"outcome":"defer","gap_code":"ambiguous_cmd"}}
-{"name":"mysql drop schema without cascade defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e 'DROP SCHEMA prod'"}},"want":{"outcome":"defer"}}
-{"name":"mysql drop schema if exists without cascade defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e 'DROP SCHEMA IF EXISTS prod'"}},"want":{"outcome":"defer"}}
-{"name":"mysql executable comment drop database","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e '/*! DROP DATABASE prod */'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"mariadb executable comment drop database","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mariadb -e '/*M! DROP DATABASE prod */'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"mysql ordinary comment drop text remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e '/* DROP DATABASE prod */ SELECT 1'"}},"want":{"outcome":"defer"}}
-{"name":"psql destructive command with help remains informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE prod' --help"}},"want":{"outcome":"defer"}}
-{"name":"psql help token used as database value","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -d --help -c 'DROP DATABASE prod'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"psql unterminated block comment remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE prod /*'"}},"want":{"outcome":"defer"}}
-{"name":"psql hash trailing text is not a comment","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE prod # trailing'"}},"want":{"outcome":"defer"}}
-{"name":"psql backtick identifier remains invalid","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE `prod`'"}},"want":{"outcome":"defer"}}
+{"name":"mysql executable comment drop database defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e '/*! DROP DATABASE prod */'"}},"want":{"outcome":"defer"}}
+{"name":"mariadb executable comment drop database defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mariadb -e '/*M! DROP DATABASE prod */'"}},"want":{"outcome":"defer"}}
 {"name":"bash noexec stdin remains non executing","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -n"}},"want":{"outcome":"defer","gap_code":"dynamic_interpreter_payload"}}
 {"name":"bash noexec command payload remains non executing","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -n -c 'rm -rf /'"}},"want":{"outcome":"defer","gap_code":"dynamic_interpreter_payload"}}
 {"name":"bash dump strings remains non executing","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash --dump-strings"}},"want":{"outcome":"defer","gap_code":"dynamic_interpreter_payload"}}
@@ -323,9 +252,6 @@
 {"name":"python combined interactive flags after command payload","request":{"tool":"bash","cwd":"/workspace","input":{"command":"python3.12 -iB -c 'print(1)'"}},"want":{"outcome":"defer"}}
 {"name":"rsync clustered attached remote shell custom env source","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -avessh .env.customer host:/dst/"}},"want":{"outcome":"defer"}}
 {"name":"rsync clustered attached temp directory custom env source","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rsync -aT/tmp .env.customer host:/dst/"}},"want":{"outcome":"defer"}}
-{"name":"compose invalid service name remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v 'bad service'"}},"want":{"outcome":"defer","gap_code":"unsupported_compose_option"}}
-{"name":"mysql executable comment marker inside line comment remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e $'-- /*! DROP DATABASE prod */\\nSELECT 1'"}},"want":{"outcome":"defer"}}
-{"name":"psql invalid assigned help remains informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE prod' --help=topic"}},"want":{"outcome":"defer"}}
 {"name":"ripgrep short file option equals custom env","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rg -f=.env TOKEN README.md"}},"want":{"outcome":"defer"}}
 {"name":"grep short file option equals remains literal equals path","request":{"tool":"bash","cwd":"/workspace","input":{"command":"grep -f=.env TOKEN README.md"}},"want":{"outcome":"defer"}}
 {"name":"ripgrep empty short file option remains gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rg -f= .env.customer"}},"want":{"outcome":"defer"}}
@@ -343,17 +269,6 @@
 {"name":"node input type retains stdin channel","request":{"tool":"bash","cwd":"/workspace","input":{"command":"node --input-type=module"}},"want":{"outcome":"defer"}}
 {"name":"node require option retains stdin channel","request":{"tool":"bash","cwd":"/workspace","input":{"command":"node --require fs"}},"want":{"outcome":"defer"}}
 {"name":"node require option with script is ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"node --require fs script.js"}},"want":{"outcome":"defer"}}
-{"name":"compose false dry run after down remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v --dry-run=false"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose numeric false dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=0 down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose case folded false dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=False down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose true dry run after down is non mutating","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v --dry-run=1"}},"want":{"outcome":"defer"}}
-{"name":"kubectl numeric false dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=0"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl short false dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=f"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform destroy apply with assigned auto approve","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy -auto-approve=true"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform destroy apply with assigned no color","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy -no-color=false"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"terraform invalid assigned boolean remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform apply -destroy -auto-approve=maybe"}},"want":{"outcome":"defer"}}
-{"name":"mysql ssl ca consumes execute shaped value","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql --ssl-ca -e 'DROP DATABASE prod'"}},"want":{"outcome":"defer"}}
-{"name":"mysql ssl ca consumes help shaped value","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mysql -e 'DROP DATABASE prod' --ssl-ca --help"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
 {"name":"git force with lease remains host controlled","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git push --force-with-lease origin main"}},"want":{"outcome":"defer"}}
 {"name":"posix workspace relocation remains host controlled","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mv /workspace /archive/workspace"}},"want":{"outcome":"defer"}}
 {"name":"posix ordinary relocation into workspace defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mv /tmp/ordinary.txt /workspace/ordinary.txt"}},"want":{"outcome":"defer"}}
@@ -375,9 +290,6 @@
 {"name":"posix mv no clobber of git metadata still mutates","request":{"tool":"bash","cwd":"/workspace","input":{"command":"mv -n .git/config elsewhere"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"rmdir help at workspace is informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rmdir --help /workspace"}},"want":{"outcome":"defer"}}
 {"name":"unlink help at workspace is informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"unlink --help /workspace"}},"want":{"outcome":"defer"}}
-{"name":"terraform destroy long help is informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy --help"}},"want":{"outcome":"defer"}}
-{"name":"terraform destroy short help is informational","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy -help"}},"want":{"outcome":"defer"}}
-{"name":"terraform destroy help shaped var file remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy -var-file --help"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
 {"name":"relative cleanup after cwd change defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cd build && rm -rf ."}},"want":{"outcome":"defer"}}
 {"name":"absolute temp cleanup after cwd change defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cd /tmp/safe && rm -rf ."}},"want":{"outcome":"defer"}}
 {"name":"absolute root deletion after cwd change remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"cd build && rm -rf /"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
@@ -447,9 +359,6 @@
 {"name":"usr bin time wrapped root deletion remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"/usr/bin/time rm -rf /"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"timeout duration shaped option value is consumed","request":{"tool":"bash","cwd":"/workspace","input":{"command":"timeout --signal rm 5 true -rf /"}},"want":{"outcome":"defer"}}
 {"name":"nice invalid adjustment does not unwrap guessed command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"nice -n rm -rf /"}},"want":{"outcome":"defer","gap_code":"complex_nice_wrapper"}}
-{"name":"compose assigned volumes true remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down --volumes=true"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose assigned volumes one remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v=1"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose assigned volumes false defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down --volumes=false"}},"want":{"outcome":"defer"}}
 {"name":"canonical Bash routes PowerShell deletion on native Windows","request":{"tool":"bash","cwd":"C:/workspace","input":{"command":"Remove-Item -Recurse -Force C:\\workspace"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"canonical Bash routes CMD deletion on native Windows","request":{"tool":"bash","cwd":"C:/workspace","input":{"command":"rmdir /s C:\\workspace"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"canonical Bash routes compound PowerShell deletion on native Windows","request":{"tool":"bash","cwd":"C:/workspace","input":{"command":"Remove-Item -Recurse -Force .; Write-Output done"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
@@ -507,37 +416,16 @@
 {"name":"git push signed true preserves force","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git push --signed=true --force origin main"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
 {"name":"git push recurse only preserves force","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git push --recurse-submodules=only --force origin main"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
 {"name":"git push no repo resets repository operand position","request":{"tool":"bash","cwd":"/workspace","input":{"command":"git push --repo=origin --no-repo +main"}},"want":{"outcome":"defer"}}
-{"name":"compose compatibility preserves volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --compatibility down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"PowerShell compose progress preserves volume deletion","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"docker compose --progress plain down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"CMD compose all resources preserves volume deletion","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"docker compose --all-resources down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose explicit false dry run remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=f down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose explicit true dry run remains non mutating","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --dry-run=t down -v"}},"want":{"outcome":"defer"}}
-{"name":"compose invalid progress remains a gap","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --progress future down -v"}},"want":{"outcome":"defer","gap_code":"unsupported_compose_option"}}
-{"name":"compose empty default globals preserve volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose --ansi= --progress= --project-name= down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose terminator preserves volume deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v --"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose short volume timeout cluster preserves deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -vt1"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose repeated volume cluster true preserves deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -vv=true"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"compose unescaped leading hyphen service remains invalid","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v -web"}},"want":{"outcome":"defer","gap_code":"unsupported_compose_option"}}
-{"name":"multiple PostgreSQL schemas cascade remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP SCHEMA one, two CASCADE'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"PowerShell quoted PostgreSQL schema list remains destructive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"psql -c 'DROP SCHEMA \"one\", two CASCADE'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"CMD PostgreSQL schema list remains destructive","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"psql -c \"DROP SCHEMA one, two CASCADE\""}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_DATABASE"}}
-{"name":"multiple PostgreSQL schemas restrict remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP SCHEMA one, two RESTRICT'"}},"want":{"outcome":"defer"}}
-{"name":"invalid PostgreSQL schema identifier remains ordinary","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP SCHEMA one-two CASCADE'"}},"want":{"outcome":"defer"}}
+{"name":"PowerShell compose volume deletion defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"docker compose --progress plain down -v"}},"want":{"outcome":"defer"}}
+{"name":"CMD compose volume deletion defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"docker compose --all-resources down -v"}},"want":{"outcome":"defer"}}
+{"name":"PowerShell PostgreSQL schema deletion defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"psql -c 'DROP SCHEMA \"one\", two CASCADE'"}},"want":{"outcome":"defer"}}
+{"name":"CMD PostgreSQL schema deletion defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"psql -c \"DROP SCHEMA one, two CASCADE\""}},"want":{"outcome":"defer"}}
 {"name":"find mindepth zero workspace deletion remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"find . -mindepth 0 -delete"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"find mindepth one workspace deletion remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"find . -mindepth 1 -delete"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"find maximum depth workspace deletion remains narrowed","request":{"tool":"bash","cwd":"/workspace","input":{"command":"find . -mindepth 1 -maxdepth 1 -delete"}},"want":{"outcome":"defer","gap_code":"find_command_action"}}
 {"name":"Darwin find signed mindepth one remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"find . -mindepth +1 -delete"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
 {"name":"Darwin find overflowing mindepth remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"find . -mindepth 18446744073709551616 -delete"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
-{"name":"kubectl mixed namespace resource list remains destructive","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace,pod demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"PowerShell kubectl later namespace resource remains destructive","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"kubectl delete 'pod,namespace' demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl resource name tuples include namespace deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete pod/foo namespace/demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl mixed type and tuple remains invalid","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete pod namespace/demo"}},"want":{"outcome":"defer","gap_code":"unsupported_kubectl_resource_type"}}
-{"name":"kubectl boolean cluster preserves namespace deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo -Ai=false"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl verbosity global preserves namespace deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl -v 4 delete namespace demo"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl case variant dry run remains invalid","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=None"}},"want":{"outcome":"defer","gap_code":"unsupported_kubectl_delete_option"}}
-{"name":"kubectl client dry run remains non mutating","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --dry-run=client"}},"want":{"outcome":"defer"}}
-{"name":"kubectl bare cascade preserves namespace deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --cascade"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
-{"name":"kubectl false force assignment preserves namespace deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo --force=f"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_INFRASTRUCTURE"}}
+{"name":"PowerShell kubectl namespace deletion defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"kubectl delete 'pod,namespace' demo"}},"want":{"outcome":"defer"}}
 {"name":"PowerShell bare quoted command name remains malformed","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"'Remove-Item' -Recurse ."}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell"}}
 {"name":"PowerShell doubled quote path remains ambiguous","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Remove-Item -Recurse 'C:/work''space'"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell"}}
 {"name":"PowerShell backtick quote remains ambiguous","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Remove-Item -ErrorVariable \"safe`\" C:/workspace/.git/config"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell"}}
@@ -552,3 +440,25 @@
 {"name":"PowerShell invalid provider variable remains a gap","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Remove-Item -ErrorVariable 'env:ward' .git/config"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell_options"}}
 {"name":"PowerShell suspend action remains binder invalid","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Remove-Item -ErrorAction Suspend .git/config"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell_options"}}
 {"name":"PowerShell literal credential remains host controlled","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"Remove-Item -Credential ward-user .git/config"}},"want":{"outcome":"defer","gap_code":"ambiguous_powershell_options"}}
+{"name":"PowerShell terraform destroy defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"terraform -chdir=infra destroy"}},"want":{"outcome":"defer"}}
+{"name":"CMD terraform apply destroy defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"terraform apply -destroy"}},"want":{"outcome":"defer"}}
+{"name":"CMD kubectl namespace deletion defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"kubectl --context prod delete namespace demo"}},"want":{"outcome":"defer"}}
+{"name":"environment wrapped compose cleanup defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"env MODE=test docker compose down -v"}},"want":{"outcome":"defer"}}
+{"name":"nested shell infrastructure cleanup defers","request":{"tool":"bash","cwd":"/workspace","input":{"command":"bash -lc 'terraform destroy; kubectl delete namespace demo'"}},"want":{"outcome":"defer"}}
+{"name":"nested PowerShell compose cleanup defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"pwsh -Command 'docker compose down -v'"}},"want":{"outcome":"defer"}}
+{"name":"nested CMD compose cleanup defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"cmd /c \"docker compose down -v\""}},"want":{"outcome":"defer"}}
+{"name":"compose cleanup does not hide following git metadata deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker compose down -v && rm -rf .git"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
+{"name":"database command does not hide following hard reset","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'DROP DATABASE app;' ; git reset --hard HEAD"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"terraform command does not hide fallback git metadata deletion","request":{"tool":"bash","cwd":"/workspace","input":{"command":"terraform destroy || rm .git/config"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
+{"name":"kubectl pipeline does not hide hard reset","request":{"tool":"bash","cwd":"/workspace","input":{"command":"kubectl delete namespace demo | git reset --hard HEAD"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"compose cleanup does not override preceding metadata denial","request":{"tool":"bash","cwd":"/workspace","input":{"command":"rm .git/config; docker compose down -v"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
+{"name":"nested environment shell preserves git denial after compose","request":{"tool":"bash","cwd":"/workspace","input":{"command":"env bash -c 'docker compose down -v; git reset --hard HEAD'"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"PowerShell compose cleanup does not hide metadata deletion","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"docker compose down -v; Remove-Item -Recurse .git"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
+{"name":"PowerShell terraform command does not hide hard reset","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"terraform destroy; git reset --hard HEAD"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"CMD compose cleanup does not hide metadata deletion","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"docker compose down -v & rmdir /s .git"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_FILESYSTEM"}}
+{"name":"CMD kubectl command does not hide hard reset","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"kubectl delete namespace demo & git reset --hard HEAD"}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"nested CMD preserves git denial after compose","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"cmd /c \"docker compose down -v & git reset --hard HEAD\""}},"want":{"outcome":"deny","rule_id":"WARD_DESTRUCTIVE_GIT"}}
+{"name":"compose quoted destructive text is not a shell command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"docker --context 'rm -rf .git; git reset --hard HEAD' compose down -v"}},"want":{"outcome":"defer"}}
+{"name":"database quoted destructive text is not a shell command","request":{"tool":"bash","cwd":"/workspace","input":{"command":"psql -c 'rm -rf .git; git reset --hard HEAD'"}},"want":{"outcome":"defer"}}
+{"name":"PowerShell database quoted destructive text defers","request":{"tool":"powershell","cwd":"C:/workspace","input":{"command":"psql -c 'Remove-Item -Recurse .git; git reset --hard HEAD'"}},"want":{"outcome":"defer"}}
+{"name":"CMD database quoted destructive text defers","request":{"tool":"cmd.exe","cwd":"C:/workspace","input":{"command":"psql -c \"rmdir /s .git & git reset --hard HEAD\""}},"want":{"outcome":"defer"}}

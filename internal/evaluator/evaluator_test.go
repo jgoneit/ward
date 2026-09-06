@@ -430,21 +430,6 @@ func TestSecretsInteractiveAndAdditiveShapedCommandsDefer(t *testing.T) {
 	}
 }
 
-func TestSQLStatementSplitterKeepsBackslashEscapedQuote(t *testing.T) {
-	statements, complete := splitLiteralSQLStatementsDialect(`SELECT E'quote \' ; DROP DATABASE prod;'; SELECT 2;`, false)
-	if !complete {
-		t.Fatal("statement splitter rejected complete literal SQL")
-	}
-	if len(statements) != 2 {
-		t.Fatalf("statement count = %d: %#v", len(statements), statements)
-	}
-	for _, statement := range statements {
-		if dropDatabaseSQL.MatchString(statement) || dropSchemaCascadeSQL.MatchString(statement) {
-			t.Fatalf("quoted SQL text became destructive statement: %q", statement)
-		}
-	}
-}
-
 func FuzzEvaluatorIsBoundedDeterministicAndVetoOnly(f *testing.F) {
 	tools := []string{
 		"bash", "powershell", "pwsh", "cmd", "cmd.exe", "apply_patch",

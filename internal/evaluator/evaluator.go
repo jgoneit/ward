@@ -14,8 +14,6 @@ const (
 
 	destructiveFSReason  = "Catastrophic filesystem deletion or relocation is denied."
 	destructiveGitReason = "Destructive version-control operation is denied."
-	destructiveDBReason  = "Explicit destructive database operation is denied."
-	destructiveOpsReason = "Explicit destructive infrastructure operation is denied."
 )
 
 // Evaluator is deterministic and performs no filesystem or network I/O.
@@ -148,10 +146,6 @@ func recoveryForRule(ruleID string) string {
 		return "Use a narrower target or a recoverable filesystem operation."
 	case "WARD_DESTRUCTIVE_GIT":
 		return "Use a non-destructive Git operation or preserve a recoverable ref first."
-	case "WARD_DESTRUCTIVE_DATABASE":
-		return "Use a scoped migration or another reversible database operation."
-	case "WARD_DESTRUCTIVE_INFRASTRUCTURE":
-		return "Use a plan or dry-run and target a narrower recoverable resource."
 	default:
 		return "Use a narrower recoverable operation."
 	}

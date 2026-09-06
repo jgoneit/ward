@@ -5,8 +5,7 @@
 - reviewed high-confidence workspace secret names;
 - repository metadata and Ward control/integration-state paths;
 - filesystem, home, current-work, and repository roots;
-- Git state, databases, schemas, namespaces, and volumes targeted by a small
-  literal destructive-command set.
+- Git state targeted by a small literal destructive-command set.
 
 ## In scope
 
@@ -18,6 +17,7 @@
 ## Outside v0.1
 
 - hosted or specialized tools not delivered to Ward;
+- database/schema deletion and container, cluster, or infrastructure teardown;
 - arbitrary custom secret names outside the minimal native profile;
 - ambiguous scripts, aliases, dynamic expressions, or proving a command safe;
 - kernel, mount, hard-link, symlink race, TOCTOU, and same-user total compromise;

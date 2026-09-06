@@ -83,10 +83,8 @@ func policyMessage(ruleID, recovery string) string {
 // values are replaced by a rule-scoped constant and never reflected verbatim.
 func staticRecovery(ruleID, candidate string) string {
 	catalog := map[string]string{
-		"WARD_DESTRUCTIVE_FILESYSTEM":     "Use a narrower target or a recoverable filesystem operation.",
-		"WARD_DESTRUCTIVE_GIT":            "Use a non-destructive Git operation or preserve a recoverable ref first.",
-		"WARD_DESTRUCTIVE_DATABASE":       "Use a scoped migration or another reversible database operation.",
-		"WARD_DESTRUCTIVE_INFRASTRUCTURE": "Use a plan or dry-run and target a narrower recoverable resource.",
+		"WARD_DESTRUCTIVE_FILESYSTEM": "Use a narrower target or a recoverable filesystem operation.",
+		"WARD_DESTRUCTIVE_GIT":        "Use a non-destructive Git operation or preserve a recoverable ref first.",
 	}
 	if expected, ok := catalog[ruleID]; ok && (candidate == "" || candidate == expected) {
 		return expected

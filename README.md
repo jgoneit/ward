@@ -37,16 +37,14 @@ model-visible bytes, and performs no persistent Hook write.
 - recursive deletion of `/`, the actual user home, the request CWD, the nearest
   Git root, or an ancestor containing one of those boundaries;
 - deletion or relocation of `.git` or Ward control and integration-state paths;
-- `git reset --hard`, forced directory clean, force/mirror/forced-refspec push;
-- literal `DROP DATABASE` and `DROP SCHEMA ... CASCADE`;
-- non-dry-run `terraform destroy`, `terraform apply -destroy`,
-  `kubectl delete namespace`, and `docker compose down -v/--volumes`.
+- `git reset --hard`, forced directory clean, force/mirror/forced-refspec push.
 
 Ordinary file and directory deletion, build/cache cleanup, normal patch
-deletion, `--force-with-lease`, migrations, table or row changes,
-infrastructure planning, interactive shells, secret-reading commands, dynamic
-expressions, and unknown tools defer to the Host. Ambiguity is never promoted
-to a deny.
+deletion, `--force-with-lease`, SQL and infrastructure operations (including
+database/schema deletion and resource teardown), interactive shells,
+secret-reading commands, dynamic expressions, and unknown tools defer to the
+Host in any environment. Ward does not classify environments or prove these
+operations safe. Ambiguity is never promoted to a deny.
 
 ## Codex integration
 
