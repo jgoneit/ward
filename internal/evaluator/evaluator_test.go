@@ -81,34 +81,47 @@ func TestEvaluatorConformanceFixtures(t *testing.T) {
 	}
 }
 
-func TestBoundarySetDiscoversNearestGitRootAndProtectsIt(t *testing.T) {
-	repository := t.TempDir()
-	if err := os.Mkdir(filepath.Join(repository, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	nested := filepath.Join(repository, "a", "b")
-	if err := os.MkdirAll(nested, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	boundaries, err := ResolveBoundarySet(BoundaryOptions{CWD: nested, HomeDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, err := New(boundaries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := request("bash", "rm -rf "+repository)
-	req.CWD = nested
-	decision := active.Evaluate(req)
-	if decision.Outcome != contract.OutcomeDeny || decision.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
-		t.Fatalf("git-root deletion decision = %#v", decision)
-	}
-
-	move := request("bash", fmt.Sprintf("mv %q %q", repository, repository+"-moved"))
-	move.CWD = nested
-	if decision := active.Evaluate(move); decision.Outcome != contract.OutcomeDefer {
-		t.Fatalf("recoverable repository relocation decision = %#v", decision)
+func TestBoundarySetDefersRepositoryCleanupButProtectsDirectMetadata(t *testing.T) {
+	for _, metadata := range []string{"directory", "worktree file"} {
+		t.Run(metadata, func(t *testing.T) {
+			parent := t.TempDir()
+			repository := filepath.Join(parent, "repository")
+			nested := filepath.Join(repository, "a", "b")
+			if err := os.MkdirAll(nested, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			gitPath := filepath.Join(repository, ".git")
+			if metadata == "directory" {
+				if err := os.Mkdir(gitPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(gitPath, []byte("gitdir: ../main/.git/worktrees/test\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			boundaries, err := ResolveBoundarySet(BoundaryOptions{CWD: nested, HomeDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			active, err := New(boundaries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, target := range []string{".", nested, repository, parent, gitPath, filepath.Join(gitPath, "config")} {
+				command := fmt.Sprintf("rm -rf %q", filepath.ToSlash(target))
+				if runtime.GOOS == "windows" {
+					command = fmt.Sprintf("Remove-Item -Recurse %q", filepath.ToSlash(target))
+				}
+				req := request("bash", command)
+				req.CWD = nested
+				want := contract.OutcomeDefer
+				if target == gitPath || target == filepath.Join(gitPath, "config") {
+					want = contract.OutcomeDeny
+				}
+				if got := active.Evaluate(req); got.Outcome != want {
+					t.Fatalf("cleanup target %q decision = %#v, want %s", target, got, want)
+				}
+			}
+		})
 	}
 }
 
@@ -192,7 +205,7 @@ func TestBoundarySetDefaultsToActualOSHome(t *testing.T) {
 	}
 }
 
-func TestBoundarySetProtectsResolvableCanonicalCWDAlias(t *testing.T) {
+func TestBoundarySetDefersCanonicalCWDAliasCleanup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation is not guaranteed for an unprivileged Windows test user")
 	}
@@ -213,12 +226,12 @@ func TestBoundarySetProtectsResolvableCanonicalCWDAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !boundaries.protectsRecursiveDelete(realCWD) {
-		t.Fatalf("canonical CWD alias was not retained in the recursive boundary set")
+	if boundaries.protectsRecursiveDelete(realCWD) {
+		t.Fatal("canonical CWD was retained as a deletion boundary")
 	}
 	req := request("bash", fmt.Sprintf("rm -rf %q", realCWD))
 	req.CWD = aliasCWD
-	if got := active.Evaluate(req); got.Outcome != contract.OutcomeDeny || got.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
+	if got := active.Evaluate(req); got.Outcome != contract.OutcomeDefer {
 		t.Fatalf("canonical CWD alias deletion decision = %#v", got)
 	}
 }
@@ -267,7 +280,7 @@ func TestFindCommandLineSymlinkDereferenceProtectsHome(t *testing.T) {
 	}
 }
 
-func TestCaseInsensitiveExistingAliasesProtectGitAndCWD(t *testing.T) {
+func TestCaseInsensitiveExistingAliasesProtectOnlyGitMetadata(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("case-preserving filesystem aliases are a macOS boundary")
 	}
@@ -294,10 +307,14 @@ func TestCaseInsensitiveExistingAliasesProtectGitAndCWD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, target := range []string{gitAlias, casedRepository} {
+	for _, target := range []string{gitAlias, filepath.Join(gitAlias, "config"), casedRepository} {
 		req := request("bash", fmt.Sprintf("rm -rf %q", target))
 		req.CWD = repository
-		if got := active.Evaluate(req); got.Outcome != contract.OutcomeDeny || got.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
+		want := contract.OutcomeDeny
+		if target == casedRepository {
+			want = contract.OutcomeDefer
+		}
+		if got := active.Evaluate(req); got.Outcome != want {
 			t.Fatalf("case-insensitive alias %q decision = %#v", target, got)
 		}
 	}
@@ -317,7 +334,9 @@ func TestLiteralCWDChangesPreserveCleanupAndCatastrophicBoundaries(t *testing.T)
 	if err := os.Mkdir(filepath.Join(work, "internal"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	boundaries, err := ResolveBoundarySet(BoundaryOptions{CWD: work, HomeDir: filepath.Join(root, "home")})
+	// The fixture work directory stands in for actual HOME, so parser flow
+	// still distinguishes ordinary descendants from a retained boundary.
+	boundaries, err := ResolveBoundarySet(BoundaryOptions{CWD: work, HomeDir: work})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,17 +350,17 @@ func TestLiteralCWDChangesPreserveCleanupAndCatastrophicBoundaries(t *testing.T)
 	}{
 		{"ordinary build cleanup", "cd build && rm -rf .", contract.OutcomeDefer},
 		{"ordinary sequential build cleanup", "cd build; rm -rf .", contract.OutcomeDefer},
-		{"parent workspace deletion", "cd build && rm -rf ..", contract.OutcomeDeny},
-		{"two level workspace deletion", "cd build/sub && rm -rf ../..", contract.OutcomeDeny},
-		{"pushd parent workspace deletion", "pushd build && rm -rf ..", contract.OutcomeDeny},
+		{"parent home deletion", "cd build && rm -rf ..", contract.OutcomeDeny},
+		{"two level home deletion", "cd build/sub && rm -rf ../..", contract.OutcomeDeny},
+		{"pushd parent home deletion", "pushd build && rm -rf ..", contract.OutcomeDeny},
 		{"nested build cleanup", "cd build && bash -lc 'rm -rf .'", contract.OutcomeDefer},
 		{"env chdir build cleanup", "env -C build rm -rf .", contract.OutcomeDefer},
-		{"env chdir workspace deletion", fmt.Sprintf("env --chdir=%s rm -rf .", work), contract.OutcomeDeny},
-		{"skipped and branch keeps workspace cwd", "false && cd build; rm -rf .", contract.OutcomeDeny},
-		{"skipped or branch keeps workspace cwd", "true || cd build; rm -rf .", contract.OutcomeDeny},
-		{"unreachable if branch keeps workspace cwd", "if false; then cd build; fi; rm -rf .", contract.OutcomeDeny},
-		{"failed missing cd keeps workspace cwd", "cd missing; rm -rf .", contract.OutcomeDeny},
-		{"removed cd target keeps workspace cwd", "rm -rf internal; cd internal || true; rm -rf .", contract.OutcomeDeny},
+		{"env chdir home deletion", fmt.Sprintf("env --chdir=%s rm -rf .", work), contract.OutcomeDeny},
+		{"skipped and branch keeps home cwd", "false && cd build; rm -rf .", contract.OutcomeDeny},
+		{"skipped or branch keeps home cwd", "true || cd build; rm -rf .", contract.OutcomeDeny},
+		{"unreachable if branch keeps home cwd", "if false; then cd build; fi; rm -rf .", contract.OutcomeDeny},
+		{"failed missing cd keeps home cwd", "cd missing; rm -rf .", contract.OutcomeDeny},
+		{"removed cd target keeps home cwd", "rm -rf internal; cd internal || true; rm -rf .", contract.OutcomeDeny},
 		{"terminal cd failure branch does not continue", "cd build || exit; rm -rf .", contract.OutcomeDefer},
 		{"created directory cleanup", "mkdir generated && cd generated && rm -rf .", contract.OutcomeDefer},
 		{"command substitution has isolated cwd flow", `echo "$(cd build; rm -rf .)"`, contract.OutcomeDefer},

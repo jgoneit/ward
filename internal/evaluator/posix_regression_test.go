@@ -20,6 +20,9 @@ func TestReviewedGitNegatedOptionPrecedence(t *testing.T) {
 		args []literalArg
 		want bool
 	}{
+		{"worktree add remains host controlled", staticArgs("worktree", "add", "../test-worktree"), false},
+		{"worktree remove remains host controlled", staticArgs("worktree", "remove", "../test-worktree"), false},
+		{"forced worktree remove remains host controlled", staticArgs("worktree", "remove", "--force", "../test-worktree"), false},
 		{"clean final dry run", staticArgs("clean", "-fd", "--no-dry-run", "--dry-run"), false},
 		{"clean final non dry run", staticArgs("clean", "-fd", "--dry-run", "--no-dry-run"), true},
 		{"clean final no force", staticArgs("clean", "-fd", "--no-force"), false},
@@ -158,12 +161,12 @@ func TestLinuxFindSignedMindepthDefersUnsupportedValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unsigned := request("bash", "find . -mindepth 1 -delete")
+	unsigned := request("bash", "find /home/alice -mindepth 1 -delete")
 	if got := active.Evaluate(unsigned); got.Outcome != contract.OutcomeDeny || got.RuleID != "WARD_DESTRUCTIVE_FILESYSTEM" {
 		t.Fatalf("unsigned mindepth decision = %#v", got)
 	}
 
-	signed := request("bash", "find . -mindepth +1 -delete")
+	signed := request("bash", "find /home/alice -mindepth +1 -delete")
 	if got := active.Evaluate(signed); got.Outcome != contract.OutcomeDefer || got.RuleID != "" || got.CoverageGap == nil || got.CoverageGap.Code != "find_command_action" {
 		t.Fatalf("signed mindepth decision = %#v", got)
 	}

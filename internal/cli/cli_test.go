@@ -81,7 +81,8 @@ func TestPreHookDenyDeferAndErrorNeverPersist(t *testing.T) {
 		{name: "terraform teardown", command: "terraform destroy"},
 		{name: "terraform apply teardown", command: "terraform apply -destroy"},
 		{name: "namespace teardown", command: "kubectl delete namespace app"},
-		{name: "deny", command: "rm -rf .", wantDeny: true},
+		{name: "temporary cleanup", command: "rm -rf ."},
+		{name: "deny", command: "rm -rf .git", wantDeny: true},
 		{name: "error", command: "printf ordinary", engineFail: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

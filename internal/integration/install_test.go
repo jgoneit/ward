@@ -3,8 +3,10 @@ package integration
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -104,6 +106,10 @@ func TestUninstallRestoresRollbackOnlySandboxBytesFromV3Journal(t *testing.T) {
 	writeFixtureFile(t, options.Paths.ConfigFile, installedConfig)
 	writeFixtureFile(t, options.Paths.HooksFile, installedHooks)
 	writePrivateJournalFixture(t, options.Paths, journalRaw)
+	makeRecursiveProfileFixture(t, options)
+	if result, err := Install(options); err != nil || !result.ConfigChanged || result.HooksChanged {
+		t.Fatalf("refresh rollback-only journal: %#v, %v", result, err)
+	}
 
 	if _, err := Uninstall(Options{Paths: options.Paths}); err != nil {
 		t.Fatal(err)
@@ -377,5 +383,213 @@ func TestJournalFileTimestampChangesOnlyOnMutation(t *testing.T) {
 	}
 	if !before.ModTime().Equal(after.ModTime()) {
 		t.Fatal("idempotent install rewrote journal")
+	}
+}
+
+// Reconstruct the previous recursive vocabulary only in fixtures. Production
+// refresh renders the current profile and never keeps an old profile mode.
+func makeRecursiveProfileFixture(t *testing.T, options Options) integrationJournal {
+	t.Helper()
+	raw, err := os.ReadFile(options.Paths.journalFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := decodeJournal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProfile := journal.ConfigEdits.ProfileAppend
+	newline := detectNewline(oldProfile)
+	profile := bytes.Replace(oldProfile, []byte("[permissions.ward.filesystem]"+newline), []byte("[permissions.ward.filesystem]"+newline+"glob_scan_max_depth = 16"+newline), 1)
+	for _, rule := range workspaceSecretRules() {
+		profile = bytes.Replace(profile, []byte(rule+newline), []byte(rule+newline+`"**/`+rule[1:]+newline), 1)
+	}
+	config, err := os.ReadFile(options.Paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config = bytes.Replace(config, oldProfile, profile, 1)
+	journal.ConfigEdits.ProfileAppend = profile
+	journal.ConfigDigest = digest(config)
+	raw, err = encodeJournal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, options.Paths.ConfigFile, config)
+	writePrivateJournalFixture(t, options.Paths, raw)
+	return journal
+}
+
+func TestInstallRefreshPreservesUnownedBytesAndRestoration(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		t.Run(fmt.Sprintf("newline-%q", newline), func(t *testing.T) {
+			options := fixtureOptions(t)
+			writeExecutable(t, options.Paths.BinaryPath)
+			original := []byte(strings.ReplaceAll("default_permissions = \"base\" # restore exactly\napproval_policy = \"never\"\n[permissions.base]\nextends = \":workspace\"\n", "\n", newline))
+			writeFixtureFile(t, options.Paths.ConfigFile, original)
+			if _, err := Install(options); err != nil {
+				t.Fatal(err)
+			}
+			previous := makeRecursiveProfileFixture(t, options)
+			// Deliberately mix outer LF and owned CRLF; ownership, not the whole
+			// file's dominant newline, determines how the replacement is rendered.
+			extra := []byte("\n[permissions.ward.workspace_roots]\n\"/user-added-root\" = \"write\"\n[notice]\nvalue = \"preserve\"\n")
+			config, _ := os.ReadFile(options.Paths.ConfigFile)
+			writeFixtureFile(t, options.Paths.ConfigFile, append(config, extra...))
+			before := integrationFileSnapshots(t, options)
+			if report := Doctor(options); report.Healthy || !hasCheck(report, "permissions.profile_current", CheckFail) {
+				t.Fatalf("old recursive profile was not diagnosed: %#v", report)
+			}
+			options.DryRun = true
+			result, err := Install(options)
+			if err != nil || !result.DryRun || !result.ConfigChanged || !result.JournalChanged || result.HooksChanged {
+				t.Fatalf("refresh dry-run: %#v, %v", result, err)
+			}
+			assertIntegrationSnapshots(t, options, before)
+			options.DryRun = false
+			if result, err = Install(options); err != nil || !result.Changed || result.HooksChanged {
+				t.Fatalf("refresh: %#v, %v", result, err)
+			}
+			after := integrationFileSnapshots(t, options)
+			if !bytes.Equal(after[options.Paths.HooksFile], before[options.Paths.HooksFile]) {
+				t.Fatal("refresh rewrote hooks")
+			}
+			journal, err := decodeJournal(after[options.Paths.journalFile()])
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantConfig := bytes.Replace(before[options.Paths.ConfigFile], previous.ConfigEdits.ProfileAppend, journal.ConfigEdits.ProfileAppend, 1)
+			if !bytes.Equal(wantConfig, after[options.Paths.ConfigFile]) || detectNewline(journal.ConfigEdits.ProfileAppend) != newline {
+				t.Fatal("refresh changed bytes outside the owned profile or its newline")
+			}
+			previous.ConfigEdits.ProfileAppend = journal.ConfigEdits.ProfileAppend
+			previous.ConfigDigest = digest(wantConfig)
+			if !reflect.DeepEqual(previous, journal) {
+				t.Fatal("refresh changed journal restoration or ownership fields")
+			}
+			if report := Doctor(options); !report.Healthy {
+				t.Fatalf("refreshed Doctor: %#v", report)
+			}
+			if result, err = Install(options); err != nil || result.Changed {
+				t.Fatalf("repeat refresh: %#v, %v", result, err)
+			}
+			assertIntegrationSnapshots(t, options, after)
+			if _, err := Uninstall(options); err != nil {
+				t.Fatal(err)
+			}
+			restored, _ := os.ReadFile(options.Paths.ConfigFile)
+			if !bytes.Equal(restored, append(original, extra...)) {
+				t.Fatalf("refresh lost uninstall restoration: %q", restored)
+			}
+		})
+	}
+}
+
+func TestInstallRefreshRejectsIntegrityChanges(t *testing.T) {
+	for _, change := range []string{"profile", "selector", "duplicate-profile", "duplicate-selector", "profile-marker", "selector-marker", "hook", "missing-hook", "parent", ":danger-full-access", ":unknown", "disabled-hook"} {
+		t.Run(change, func(t *testing.T) {
+			options := fixtureOptions(t)
+			writeExecutable(t, options.Paths.BinaryPath)
+			writeFixtureFile(t, options.Paths.ConfigFile, []byte("default_permissions = \"base\"\n[permissions.base]\nextends = \":workspace\"\n"))
+			if _, err := Install(options); err != nil {
+				t.Fatal(err)
+			}
+			journal := makeRecursiveProfileFixture(t, options)
+			config, _ := os.ReadFile(options.Paths.ConfigFile)
+			switch change {
+			case "profile":
+				config = bytes.Replace(config, []byte("glob_scan_max_depth = 16"), []byte("glob_scan_max_depth = 15"), 1)
+			case "selector":
+				config = bytes.Replace(config, []byte(`default_permissions = "ward"`), []byte(`default_permissions  = "ward"`), 1)
+			case "duplicate-profile":
+				config = append(config, journal.ConfigEdits.ProfileAppend...)
+			case "duplicate-selector":
+				config = append(append([]byte(nil), journal.ConfigEdits.SelectorReplacement...), config...)
+			case "profile-marker":
+				config = append(config, []byte(profileBegin+"\n")...)
+			case "selector-marker":
+				config = append(config, []byte(selectorEnd+"\n")...)
+			case "parent":
+				config = append(config, []byte("\n[permissions.base.filesystem]\n\"/\" = \"write\"\n")...)
+			case ":danger-full-access", ":unknown":
+				oldProfile := journal.ConfigEdits.ProfileAppend
+				journal.ConfigEdits.ProfileAppend = bytes.Replace(oldProfile, []byte(`extends = "base"`), []byte(`extends = "`+change+`"`), 1)
+				journal.ConfigEdits.ParentProfile = change
+				config = bytes.Replace(config, oldProfile, journal.ConfigEdits.ProfileAppend, 1)
+				journal.ConfigDigest = digest(config)
+				raw, err := encodeJournal(journal)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writePrivateJournalFixture(t, options.Paths, raw)
+			case "disabled-hook":
+				config = append([]byte("[features]\nhooks = false\n"), config...)
+			case "hook":
+				writeFixtureFile(t, options.Paths.HooksFile, []byte(`{"hooks":{}}`))
+			case "missing-hook":
+				if err := os.Remove(options.Paths.HooksFile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFixtureFile(t, options.Paths.ConfigFile, config)
+			before := integrationFileSnapshots(t, options)
+			if _, err := Install(options); !errors.Is(err, ErrConflict) {
+				t.Fatalf("refresh accepted %s: %v", change, err)
+			}
+			assertIntegrationSnapshots(t, options, before)
+		})
+	}
+}
+
+func TestInstallRefreshWriteFailureRestoresBothFiles(t *testing.T) {
+	for _, failedFile := range []string{"journal", "config"} {
+		t.Run(failedFile, func(t *testing.T) {
+			options := fixtureOptions(t)
+			writeExecutable(t, options.Paths.BinaryPath)
+			if _, err := Install(options); err != nil {
+				t.Fatal(err)
+			}
+			makeRecursiveProfileFixture(t, options)
+			before := integrationFileSnapshots(t, options)
+			injected := errors.New("injected refresh failure")
+			path := options.Paths.journalFile()
+			if failedFile == "config" {
+				path = options.Paths.ConfigFile
+			}
+			production := writeAtomically
+			writeAtomically = func(target string, data []byte, mode os.FileMode, metadata platformFileMetadata) error {
+				if target == path {
+					return injected
+				}
+				return production(target, data, mode, metadata)
+			}
+			t.Cleanup(func() { writeAtomically = production })
+			if _, err := Install(options); !errors.Is(err, injected) {
+				t.Fatalf("refresh write failure: %v", err)
+			}
+			assertIntegrationSnapshots(t, options, before)
+		})
+	}
+}
+
+func integrationFileSnapshots(t *testing.T, options Options) map[string][]byte {
+	t.Helper()
+	files := map[string][]byte{}
+	for _, path := range []string{options.Paths.ConfigFile, options.Paths.HooksFile, options.Paths.journalFile()} {
+		raw, exists, err := readOptional(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			files[path] = raw
+		}
+	}
+	return files
+}
+
+func assertIntegrationSnapshots(t *testing.T, options Options, want map[string][]byte) {
+	t.Helper()
+	if !reflect.DeepEqual(integrationFileSnapshots(t, options), want) {
+		t.Fatal("integration bytes changed")
 	}
 }
