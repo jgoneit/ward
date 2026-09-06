@@ -29,6 +29,50 @@ class CheckFailure(Exception):
         self.details = details
 
 
+STATUS_ERROR_CODES = {
+    "ownership_conflict", "service_unavailable", "runtime_unavailable",
+    "collector_unresponsive",
+}
+
+
+def project_collector_status(status, previous_generation):
+    """Project recovery state without identities, dates, paths, or raw errors."""
+    result = {"generation_changed": False}
+    if not isinstance(status, dict):
+        return result
+    for field in ("enabled", "running", "ready"):
+        if type(status.get(field)) is bool:
+            result[field] = status[field]
+    runtime = status.get("runtime")
+    if isinstance(runtime, dict):
+        if type(runtime.get("fresh")) is bool:
+            result["runtime_fresh"] = runtime["fresh"]
+        generation = runtime.get("generation")
+        if (isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{32}", generation)
+                and isinstance(previous_generation, str)
+                and re.fullmatch(r"[0-9a-f]{32}", previous_generation)):
+            result["generation_changed"] = generation != previous_generation
+    code = status.get("error_code")
+    if isinstance(code, str) and code in STATUS_ERROR_CODES:
+        result["error_code"] = code
+    return result
+
+
+def project_windows_task_state(task):
+    """Only bounded Task Scheduler scalars may leave the captured COM reply."""
+    result = {}
+    if not isinstance(task, dict):
+        return result
+    if type(task.get("enabled")) is bool:
+        result["enabled"] = task["enabled"]
+    for field, lower, upper in (("state", 0, 4), ("last_result", -(1 << 31), (1 << 32) - 1),
+                                ("running_instances", 0, 256)):
+        value = task.get(field)
+        if type(value) is int and lower <= value <= upper:
+            result[field] = value
+    return result
+
+
 def require(condition, code):
     if not condition:
         raise CheckFailure(code)
@@ -77,9 +121,7 @@ def run(argv, env, label, *, payload=None, timeout=45, expected=0):
             if (isinstance(status, dict)
                     and status.get("schema") == "ward-diagnostics-status/v1"
                     and isinstance(status.get("error_code"), str)
-                    and status.get("error_code") in {
-                        "ownership_conflict", "service_unavailable", "runtime_unavailable",
-                        "collector_unresponsive"}):
+                    and status.get("error_code") in STATUS_ERROR_CODES):
                 details["status_error_code"] = status["error_code"]
         hresult = re.search(rb"diagnostics service backend failed \(hresult=0x([0-9a-f]{8})\)", result.stderr)
         if hresult:
@@ -296,7 +338,7 @@ try { $task=$folder.GetTask($request.Name) } catch {
   if($_.Exception.GetBaseException().HResult -ne -2147024894){ throw }
 }
 if($null -eq $task){ '{"exists":false}' }else{
-  @{exists=$true;xml=$task.Xml}|ConvertTo-Json -Compress
+  @{exists=$true;xml=$task.Xml;enabled=[bool]$task.Enabled;state=[int]$task.State;last_result=[long]$task.LastTaskResult;running_instances=[int]$task.GetInstances(0).Count}|ConvertTo-Json -Compress
 }
 """
         try:
@@ -305,6 +347,7 @@ if($null -eq $task){ '{"exists":false}' }else{
                            payload=json.dumps({"Name": self.native_id}).encode(), timeout=15)
             require(len(response.stdout) <= 131072, "task_projection_reply_too_large")
             task = json.loads(response.stdout)
+            require(isinstance(task, dict), "task_projection_reply_invalid")
             if task.get("exists") is False:
                 self.record("windows_task_projection", available=True, task_exists=False)
                 return
@@ -319,7 +362,8 @@ if($null -eq $task){ '{"exists":false}' }else{
                 ]),
             )
             self.record("windows_task_projection", available=True, task_exists=True,
-                        dynamic_values_redacted=True, **projection)
+                        dynamic_values_redacted=True,
+                        scheduler_state=project_windows_task_state(task), **projection)
         except (CheckFailure, OSError, ValueError, ET.ParseError) as error:
             code = error.code if isinstance(error, CheckFailure) else type(error).__name__
             self.record("windows_task_projection", available=False, error_code=code)
@@ -397,8 +441,9 @@ if($null -eq $task){ '{"exists":false}' }else{
                     )
         return snapshot
 
-    def require_ready(self):
-        status = self.status()
+    def require_ready(self, status=None):
+        if status is None:
+            status = self.status()
         require(status["enabled"] and status["running"] and status["ready"], "collector_not_ready")
         require(status["runtime"]["fresh"], "heartbeat_not_fresh")
         require(status["runtime"]["write_errors"] == 0, "collector_storage_error")
@@ -447,18 +492,43 @@ if($null -eq $task){ '{"exists":false}' }else{
                 self.env, "crash_fixture_systemd_collector", timeout=10)
         else:
             self.crash_windows_process(before["pid"])
-        # Task Scheduler advertises a one-minute failure restart interval.
-        deadline = time.monotonic() + (105 if self.platform == "win32" else 25)
+        # Include scheduling and process-start margin beyond the one-minute
+        # Task Scheduler failure restart interval.
+        deadline = time.monotonic() + (180 if self.platform == "win32" else 25)
+        last_status = {"generation_changed": False}
+        last_failure = None
+        recovery_codes = {
+            "command_failed", "command_timeout", "command_unavailable",
+            "invalid_management_json", "status_reply_too_large", "collector_not_ready",
+            "heartbeat_not_fresh", "collector_storage_error", "unexpected_log_directory",
+        }
         while time.monotonic() < deadline:
+            last_failure = None
             try:
-                after = self.require_ready()["runtime"]
-                if after["generation"] != before["generation"]:
-                    self.record("native_crash_restart", ready=True, generation_changed=True)
+                response = self.cli("diagnostics", "status", "--json", expected=None)
+                require(len(response.stdout) <= 65536, "status_reply_too_large")
+                try:
+                    status = json.loads(response.stdout)
+                except (ValueError, UnicodeError):
+                    raise CheckFailure("invalid_management_json") from None
+                last_status = project_collector_status(status, before["generation"])
+                require(isinstance(status, dict)
+                        and status.get("schema") == "ward-diagnostics-status/v1"
+                        and all(field in last_status for field in
+                                ("enabled", "running", "ready", "runtime_fresh")),
+                        "invalid_management_json")
+                require(response.returncode == 0, "command_failed")
+                self.require_ready(status)
+                if last_status["generation_changed"]:
+                    self.record("native_crash_restart", ready=True, generation_changed=True,
+                                last_status=last_status)
                     return
-            except CheckFailure:
-                pass
+            except CheckFailure as error:
+                last_failure = (error.code if isinstance(error.code, str) and error.code in recovery_codes
+                                else "unclassified_check_failure")
             time.sleep(0.5)
-        raise CheckFailure("native_crash_restart_not_observed")
+        raise CheckFailure("native_crash_restart_not_observed", last_status=last_status,
+                           last_check_error_code=last_failure)
 
     def crash_windows_process(self, pid):
         from ctypes import wintypes
