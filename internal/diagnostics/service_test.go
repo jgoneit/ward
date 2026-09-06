@@ -103,12 +103,145 @@ func TestScheduledTaskOwnershipRejectsExtraActionsAndElevatedPrincipal(t *testin
 			t.Fatalf("accepted altered %s", replacement[0])
 		}
 	}
-	normalized := strings.ReplaceAll(string(d.Content), "encoding=\"UTF-8\"", "encoding=\"UTF-16\"")
+	normalized := strings.Replace(string(d.Content), `<?xml version="1.0"?>`, `<?xml version="1.0" encoding="UTF-16"?>`, 1)
+	if !strings.Contains(normalized, `encoding="UTF-16"`) {
+		t.Fatal("normalization fixture does not contain a UTF-16 declaration")
+	}
 	normalized = strings.Replace(normalized, "<RegistrationInfo>", "<RegistrationInfo><URI>\\"+d.ID+"</URI><Author>user</Author><Date>2026-09-06</Date>", 1)
 	normalized = strings.Replace(normalized, "version=\"1.2\"", "version=\"1.4\"", 1)
 	if !scheduledTaskMatches([]byte(normalized), d.Content) {
 		t.Fatal("rejected benign Task Scheduler normalization")
 	}
+}
+
+func TestScheduledTaskExportDefaultsRemainStrict(t *testing.T) {
+	paths, _, _ := lifecycleFixture(t)
+	d, err := makeServiceDefinition(paths, "windows", "S-1-5-21-1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := string(d.Content)
+	// These fields were omitted by an actual Windows Task Scheduler export.
+	// Keep this fixture independent of the implementation's defaults table.
+	defaults := []struct{ name, prefix, value, changed string }{
+		{"RunLevel", "", "LeastPrivilege", "HighestAvailable"},
+		{"Enabled", "<LogonTrigger>", "true", "false"},
+		{"AllowHardTerminate", "", "true", "false"},
+		{"StartWhenAvailable", "", "false", "true"},
+		{"RunOnlyIfNetworkAvailable", "", "false", "true"},
+		{"AllowStartOnDemand", "", "true", "false"},
+		{"Hidden", "", "false", "true"},
+		{"RunOnlyIfIdle", "", "false", "true"},
+		{"WakeToRun", "", "false", "true"},
+		{"Priority", "", "7", "8"},
+	}
+	omitted := expected
+	for _, field := range defaults {
+		leaf := "<" + field.name + ">" + field.value + "</" + field.name + ">"
+		from := field.prefix + leaf
+		omitted = replaceTaskFixture(t, omitted, from, field.prefix)
+		t.Run(field.name, func(t *testing.T) {
+			without := replaceTaskFixture(t, expected, from, field.prefix)
+			if !scheduledTaskMatches([]byte(without), d.Content) || !scheduledTaskMatches(d.Content, []byte(without)) {
+				t.Fatal("rejected omission of an exported schema default")
+			}
+			variants := map[string]string{
+				"non_default":       "<" + field.name + ">" + field.changed + "</" + field.name + ">",
+				"attribute":         "<" + field.name + ` marker="changed">` + field.value + "</" + field.name + ">",
+				"child":             "<" + field.name + ">" + field.value + "<Unknown/></" + field.name + ">",
+				"duplicate":         leaf + leaf,
+				"foreign_namespace": "<" + field.name + ` xmlns="urn:foreign">` + field.value + "</" + field.name + ">",
+				"unknown_parent":    "<Unknown>" + leaf + "</Unknown>",
+			}
+			for name, replacement := range variants {
+				t.Run(name, func(t *testing.T) {
+					actual := replaceTaskFixture(t, expected, from, field.prefix+replacement)
+					if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+						t.Fatal("accepted an altered execution or security setting")
+					}
+				})
+			}
+		})
+	}
+	if !scheduledTaskMatches([]byte(omitted), d.Content) || !scheduledTaskMatches(d.Content, []byte(omitted)) {
+		t.Fatal("rejected the export with all observed defaults omitted")
+	}
+}
+
+func TestScheduledTaskMutableEnabledAndMetadataRemainLeafOnly(t *testing.T) {
+	paths, _, _ := lifecycleFixture(t)
+	d, err := makeServiceDefinition(paths, "windows", "S-1-5-21-1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := string(d.Content)
+	// The suffix identifies Settings/Enabled without modifying the logon trigger.
+	const enabled = "<Enabled>true</Enabled><Hidden>false</Hidden>"
+	for name, leaf := range map[string]string{"true": "<Enabled>true</Enabled>", "false": "<Enabled>false</Enabled>", "omitted": ""} {
+		t.Run("enabled_"+name, func(t *testing.T) {
+			actual := replaceTaskFixture(t, expected, enabled, leaf+"<Hidden>false</Hidden>")
+			if !scheduledTaskMatches([]byte(actual), d.Content) || !scheduledTaskMatches(d.Content, []byte(actual)) {
+				t.Fatal("rejected the mutable enable state")
+			}
+		})
+	}
+	for name, leaf := range map[string]string{
+		"invalid":           "<Enabled>yes</Enabled>",
+		"empty":             "<Enabled/>",
+		"attribute":         `<Enabled marker="changed">true</Enabled>`,
+		"child":             "<Enabled>true<Unknown/></Enabled>",
+		"duplicate":         "<Enabled>true</Enabled><Enabled>false</Enabled>",
+		"foreign_namespace": `<Enabled xmlns="urn:foreign">true</Enabled>`,
+		"unknown_parent":    "<Unknown><Enabled>true</Enabled></Unknown>",
+	} {
+		t.Run("enabled_reject_"+name, func(t *testing.T) {
+			actual := replaceTaskFixture(t, expected, enabled, leaf+"<Hidden>false</Hidden>")
+			if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+				t.Fatal("accepted invalid mutable enable metadata")
+			}
+		})
+	}
+	for _, name := range []string{"URI", "Author", "Date"} {
+		t.Run("metadata_"+name, func(t *testing.T) {
+			leaf := "<" + name + ">generated-value</" + name + ">"
+			actual := replaceTaskFixture(t, expected, "<RegistrationInfo>", "<RegistrationInfo>"+leaf)
+			if !scheduledTaskMatches([]byte(actual), d.Content) || !scheduledTaskMatches(d.Content, []byte(actual)) {
+				t.Fatal("rejected generated registration metadata")
+			}
+			for variant, replacement := range map[string]string{
+				"attribute":         "<" + name + ` marker="changed">generated-value</` + name + ">",
+				"child":             "<" + name + "><Exec><Command>other.exe</Command></Exec></" + name + ">",
+				"duplicate":         leaf + leaf,
+				"foreign_namespace": "<" + name + ` xmlns="urn:foreign">generated-value</` + name + ">",
+				"unknown_parent":    "<Unknown>" + leaf + "</Unknown>",
+			} {
+				t.Run(variant, func(t *testing.T) {
+					actual := replaceTaskFixture(t, expected, "<RegistrationInfo>", "<RegistrationInfo>"+replacement)
+					if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+						t.Fatal("accepted altered metadata structure")
+					}
+				})
+			}
+		})
+	}
+	for name, actual := range map[string]string{
+		"foreign_task_namespace":    strings.Replace(expected, `xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"`, `xmlns="urn:foreign"`, 1),
+		"foreign_version_attribute": strings.Replace(expected, `<Task version="1.2"`, `<Task version="1.2" xmlns:other="urn:foreign" other:version="1.2"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+				t.Fatal("accepted altered task namespace or attribute")
+			}
+		})
+	}
+}
+
+func replaceTaskFixture(t *testing.T, source, before, after string) string {
+	t.Helper()
+	if strings.Count(source, before) != 1 {
+		t.Fatalf("task fixture must contain exactly one %q", before)
+	}
+	return strings.Replace(source, before, after, 1)
 }
 
 func TestNativeLinuxInspectionRejectsDropInsAndStaleLoadedDefinition(t *testing.T) {
