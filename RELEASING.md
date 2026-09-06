@@ -41,14 +41,26 @@ No RC or stable release may skip these gates.
   creation, rename, modification, deletion, and small Cargo build/test cleanup.
   Core `defer` and repository checks alone do not prove native `EPERM` resolved.
 - Normal workflows have zero unresolved false deny.
-- Hook requests do not create or change Ward state. Only explicit management
-  commands may update the integration journal, and uninstall removes it after
-  restoring owned Host configuration.
+- Hook processes do not create or change persistent Ward state. An opt-in
+  collector may store the documented diagnostic events separately. Only explicit
+  management commands update the integration journal, and uninstall removes it
+  after restoring owned Host configuration and stopping the owned collector.
 - Hook latency meets the documented p95 targets and the two-second timeout.
 - Twenty real Tasks finish without disabling Ward or asking a human to perform
   ordinary development work in Ward's place.
 - A denial with a safe alternative is recovered by the current Agent without a
   new human prompt.
+- Diagnostics preserve policy stdout/stderr/exit behavior while disabled,
+  enabled, unreachable, saturated, or unable to persist. The event corpus
+  contains no raw sensitive input. Real-process p95 meets the existing limits
+  in disabled, enabled, and unavailable-collector cases on all three platforms.
+- Each supported user-service backend passes non-administrator enable/disable,
+  repeat activation, login restart, crash recovery, conflict, update rollback,
+  and uninstall checks. WSL and systemd user-manager limitations are recorded.
+  Backend fixtures and cross-builds are not actual login-service evidence.
+- A trusted real Codex invocation reaches the candidate Hook and its collector
+  with stable correlation IDs. Synthetic handler/collector tests do not prove
+  real Host dispatch or native permission enforcement.
 
 Only then may `v0.1.0-rc.1` be created.
 
