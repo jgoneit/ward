@@ -44,7 +44,13 @@ $results=@(foreach($case in $cases) {
  try {Start-WardScheduledTask $task} catch {$failed=$true}
  @{Name=$case.Name;Enabled=$task.Enabled;State=$task.State;RunCalls=$task.Calls;Failed=$failed}
 })
-@{Results=$results;StoppedFlags=(Get-WardRestoreRegistrationFlags $false);RunningFlags=(Get-WardRestoreRegistrationFlags $true)}|ConvertTo-Json -Depth 4 -Compress
+$flags=@{
+ disabled_stopped=(Get-WardRestoreRegistrationFlags $false $false)
+ enabled_stopped=(Get-WardRestoreRegistrationFlags $true $false)
+ disabled_running=(Get-WardRestoreRegistrationFlags $false $true)
+ enabled_running=(Get-WardRestoreRegistrationFlags $true $true)
+}
+@{Results=$results;Flags=$flags}|ConvertTo-Json -Depth 4 -Compress
 `
 	program, err := servicePowerShellPath()
 	if err != nil {
@@ -65,8 +71,8 @@ $results=@(foreach($case in $cases) {
 		Failed   bool
 	}
 	var reply struct {
-		Results                    []controlResult
-		StoppedFlags, RunningFlags int
+		Results []controlResult
+		Flags   map[string]int
 	}
 	want := []controlResult{
 		{"already_running", true, 4, 0, false},
@@ -86,9 +92,22 @@ $results=@(foreach($case in $cases) {
 			}
 		})
 	}
-	// Suppress registration-trigger execution when restoring a stopped task,
-	// including an enabled task that was not running before the operation.
-	if reply.StoppedFlags != 38 || reply.RunningFlags != 6 {
-		t.Fatal("restore registration flags do not preserve the previous running state")
+	// Enabled tasks must rearm the delayed registration trigger even when
+	// stopped; suppress it only for a disabled task that was not running.
+	wantFlags := map[string]int{
+		"disabled_stopped": 38,
+		"enabled_stopped":  6,
+		"disabled_running": 6,
+		"enabled_running":  6,
+	}
+	if len(reply.Flags) != len(wantFlags) {
+		t.Fatal("invalid restore registration flag response")
+	}
+	for name, expected := range wantFlags {
+		t.Run(name, func(t *testing.T) {
+			if reply.Flags[name] != expected {
+				t.Fatal("restore registration flags do not preserve the previous enabled and running states")
+			}
+		})
 	}
 }

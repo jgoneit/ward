@@ -303,6 +303,7 @@ class NativeSmoke:
         self.service_attempted = False
         self.initial_absence = False
         self.owned_edit = None
+        self.owned_fault_directory = None
         self.rows = []
         self.failure = None
         self.cleanup_ok = False
@@ -558,6 +559,128 @@ if($null -eq $task){ '{"exists":false}' }else{
         finally:
             kernel.CloseHandle(handle)
 
+    def stop_windows_task_preserving_enabled(self, pid):
+        """Stop only this verified collector, leaving its registration enabled."""
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                     wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)  # query-limited + synchronize
+        require(bool(handle), "windows_collector_process_unavailable")
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buffer))
+            require(kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)),
+                    "windows_collector_identity_unavailable")
+            require(os.path.normcase(buffer.value) == os.path.normcase(str(self.collector)),
+                    "windows_collector_identity_mismatch")
+            script = r"""$ErrorActionPreference='Stop'
+[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
+$request=[Console]::In.ReadToEnd()|ConvertFrom-Json
+$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+$task=$scheduler.GetFolder('\').GetTask($request.Name)
+$definition=$task.Definition
+$principal=$definition.Principal
+$user=$principal.UserId
+if($user -notmatch '^S-1-'){
+ $user=([Security.Principal.NTAccount]::new($user)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+if(-not $task.Enabled -or $user -cne $request.UserID -or $principal.LogonType -ne 3 -or $principal.RunLevel -ne 0){throw 'fixture_identity_mismatch'}
+if($definition.Actions.Count -ne 1){throw 'fixture_action_mismatch'}
+$action=$definition.Actions.Item(1)
+if($action.Type -ne 0 -or $action.Path -cne $request.Command -or $action.Arguments -cne $request.Arguments){throw 'fixture_action_mismatch'}
+$task.Stop(0)
+"""
+            request = {
+                "Name": self.native_id, "UserID": self.user_id, "Command": str(self.collector),
+                "Arguments": subprocess.list2cmdline([
+                    "diagnostics", "serve", "--core-dir", str(self.core),
+                    "--home-dir", str(self.home), "--binary-path", str(self.binary),
+                ]),
+            }
+            run([powershell_path(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                self.env, "stop_exact_fixture_task_preserving_enabled",
+                payload=json.dumps(request).encode(), timeout=15)
+            require(kernel.WaitForSingleObject(handle, 10000) == 0,
+                    "windows_collector_stop_unconfirmed")
+        finally:
+            kernel.CloseHandle(handle)
+
+    def remove_fault_directory(self):
+        if self.owned_fault_directory is None:
+            return
+        path, original = self.owned_fault_directory
+        current = path.lstat()
+        require(stat.S_ISDIR(current.st_mode) and not path.is_symlink()
+                and (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino),
+                "fixture_fault_directory_changed_externally")
+        path.rmdir()  # Only this exact owned directory, and only while empty.
+        self.owned_fault_directory = None
+
+    def restore_stopped_windows_service(self):
+        if self.platform != "win32":
+            return
+        before = self.require_ready()["runtime"]  # Includes strict service ownership and authenticated Probe.
+        self.stop_windows_task_preserving_enabled(before["pid"])
+        stopped = self.status()
+        require(stopped["enabled"] and not stopped["running"] and not stopped["ready"],
+                "windows_enabled_stopped_fixture_unconfirmed")
+        saved = {path.name: path.read_bytes() for path in self.logs.glob("events-*.jsonl")}
+        require(bool(saved), "rollback_fixture_has_no_prior_log")
+        # A valid segment name with the wrong file type fails startup pruning
+        # before a runtime descriptor is published. No production fault flags.
+        suffix = hashlib.sha256(str(self.root).encode()).hexdigest()[:32]
+        fault = self.logs / ("events-20000101T000000.000000000Z-" + suffix + "-000001.jsonl")
+        fault.mkdir(mode=0o700)
+        self.owned_fault_directory = (fault, fault.lstat())
+        result = self.cli("diagnostics", "enable", expected=None)
+        evidence = {
+            "exit_code": result.returncode,
+            "saw_previous_state_restored": b"previous state restored" in result.stderr,
+            "saw_readiness_failure": b"collector readiness failed" in result.stderr,
+            "saw_rollback_failure": b"rollback failed" in result.stderr,
+        }
+        self.record("windows_stopped_restore_enable_result", **evidence)
+        require(result.returncode != 0 and evidence["saw_previous_state_restored"]
+                and evidence["saw_readiness_failure"] and not evidence["saw_rollback_failure"],
+                "windows_stopped_restore_rollback_not_confirmed")
+        restored = self.status()
+        self.record("windows_stopped_restore_immediate_state",
+                    **project_collector_status(restored, before["generation"]))
+        require(restored["enabled"] and not restored["running"] and not restored["ready"],
+                "windows_stopped_restore_started_immediately")
+        require(not (self.control / "runtime.json").exists(),
+                "windows_failed_collector_published_runtime")
+        self.remove_fault_directory()
+        self.record("windows_enabled_stopped_rollback", previous_state_restored=True,
+                    immediate_enabled=True, immediate_running=False,
+                    startup_fault_removed=True)
+        deadline = time.monotonic() + 180
+        last_status = {"generation_changed": False}
+        while time.monotonic() < deadline:
+            # status performs the production authenticated readiness probe.
+            status = self.status()
+            last_status = project_collector_status(status, before["generation"])
+            if status["enabled"] and status["running"] and status["ready"]:
+                self.require_ready(status)
+                require(last_status["generation_changed"], "windows_restored_generation_unchanged")
+                require(all((self.logs / name).read_bytes() == data for name, data in saved.items()),
+                        "windows_stopped_restore_changed_existing_logs")
+                self.record("windows_stopped_restore_delayed_recovery", ready=True,
+                            generation_changed=True, existing_logs_preserved=True,
+                            last_status=last_status)
+                return
+            time.sleep(0.5)
+        raise CheckFailure("windows_stopped_restore_recovery_not_observed", last_status=last_status)
+
     def ownership_conflicts(self):
         original = self.manifest.read_bytes()
         value = json.loads(original)
@@ -665,6 +788,7 @@ if($null -eq $task){ '{"exists":false}' }else{
         require(not self.command_json("diagnostics", "enable")["changed"], "repeat_enable_not_noop")
         self.record("repeat_enable", no_op=True)
         self.synthetic_hook()
+        self.restore_stopped_windows_service()
         self.crash_collector()
         self.ownership_conflicts()
         self.refresh_binary()
@@ -684,6 +808,7 @@ if($null -eq $task){ '{"exists":false}' }else{
     def cleanup(self):
         try:
             self.restore_edit()
+            self.remove_fault_directory()
             if self.service_attempted:
                 # Ward checks ownership and confirms the collector lock after
                 # stopping. On failure preserve the live binary and fixture.

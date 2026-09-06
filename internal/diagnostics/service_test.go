@@ -246,7 +246,7 @@ func TestScheduledTaskRecoveryTriggersRemainStrict(t *testing.T) {
 	const repetition = "<Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>"
 	triggers := []struct{ name, xml string }{
 		{"logon", "<LogonTrigger><Enabled>true</Enabled>" + repetition + "<UserId>S-1-5-21-1000</UserId></LogonTrigger>"},
-		{"registration", "<RegistrationTrigger><Enabled>true</Enabled>" + repetition + "</RegistrationTrigger>"},
+		{"registration", "<RegistrationTrigger><Enabled>true</Enabled>" + repetition + "<Delay>PT1M</Delay></RegistrationTrigger>"},
 	}
 	if strings.Count(expected, repetition) != 2 || !strings.Contains(expected, "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") {
 		t.Fatal("recovery requires two one-minute checks that preserve a running collector")
@@ -285,6 +285,21 @@ func TestScheduledTaskRecoveryTriggersRemainStrict(t *testing.T) {
 	}
 	if !scheduledTaskMatches([]byte(omitted), d.Content) || !scheduledTaskMatches(d.Content, []byte(omitted)) {
 		t.Fatal("rejected both recovery triggers with exact schema defaults omitted")
+	}
+	for name, delay := range map[string]string{
+		"removed": "", "immediate": "<Delay>PT0S</Delay>",
+		"changed":           "<Delay>PT2M</Delay>",
+		"duplicate":         "<Delay>PT1M</Delay><Delay>PT1M</Delay>",
+		"attribute":         `<Delay marker="changed">PT1M</Delay>`,
+		"child":             "<Delay>PT1M<Unknown/></Delay>",
+		"foreign_namespace": `<Delay xmlns="urn:foreign">PT1M</Delay>`,
+	} {
+		t.Run("registration_delay/"+name, func(t *testing.T) {
+			actual := replaceTaskFixture(t, expected, "<Delay>PT1M</Delay>", delay)
+			if scheduledTaskMatches([]byte(actual), d.Content) || scheduledTaskMatches(d.Content, []byte(actual)) {
+				t.Fatal("accepted a changed registration recovery delay")
+			}
+		})
 	}
 }
 
