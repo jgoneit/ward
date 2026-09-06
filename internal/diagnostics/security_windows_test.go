@@ -29,6 +29,25 @@ func TestCollectorLockAssignsCurrentUserOwnerWhenCreated(t *testing.T) {
 	}
 }
 
+func TestManagementLockAssignsCurrentUserOwnerWhenCreated(t *testing.T) {
+	paths := fixturePaths(t)
+	if err := ensurePrivateDirectory(paths.ControlDir); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := acquireManagementLock(paths.ControlDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	path := filepath.Join(paths.ControlDir, "management.lock")
+	if err := currentUserOwnsPath(path); err != nil {
+		t.Fatalf("new management lock owner: %v", err)
+	}
+	if err := securefs.InspectPrivateFile(path); err != nil {
+		t.Fatalf("new management lock DACL: %v", err)
+	}
+}
+
 func TestCollectorLockRejectsChangedDACLWithoutRepair(t *testing.T) {
 	paths := fixturePaths(t)
 	if err := ensurePrivateDirectory(paths.ControlDir); err != nil {
