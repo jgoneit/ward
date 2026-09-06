@@ -10,13 +10,22 @@ import (
 
 func acquireManagementLock(controlDir string) (func(), error) {
 	path := filepath.Join(controlDir, "management.lock")
-	_, err := os.Lstat(path)
+	info, err := os.Lstat(path)
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if exists {
-		if _, err := readPrivateFile(path, 1); err != nil {
+		// Windows byte-range locks also deny reads of the locked byte. Lock
+		// files carry no payload: validate metadata/DACLs without reading so
+		// LockFileEx below can report ordinary contention as a conflict.
+		if !info.Mode().IsRegular() || info.Size() > 1 {
+			return nil, ErrServiceConflict
+		}
+		if err := securefs.InspectPrivateDirectory(controlDir); err != nil {
+			return nil, err
+		}
+		if err := securefs.InspectPrivateFile(path); err != nil {
 			return nil, err
 		}
 	}
