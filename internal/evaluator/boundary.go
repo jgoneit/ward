@@ -29,7 +29,6 @@ type BoundarySet struct {
 	goos      string
 	cwd       string
 	home      string
-	gitRoot   string
 	gitPaths  []string
 	roots     []string
 	protected []string
@@ -42,8 +41,8 @@ type BoundarySet struct {
 func (BoundarySet) String() string   { return "Ward BoundarySet(redacted)" }
 func (BoundarySet) GoString() string { return "evaluator.BoundarySet{redacted}" }
 
-// ResolveBoundarySet validates trusted boundary inputs and discovers the
-// nearest Git root by a bounded parent walk. HomeDir defaults to the actual OS
+// ResolveBoundarySet validates trusted boundary inputs and finds nearby Git
+// metadata aliases by a bounded parent walk. HomeDir defaults to the actual OS
 // home directory; GOOS exists only to make cross-platform conformance tests
 // deterministic and otherwise defaults to runtime.GOOS.
 func ResolveBoundarySet(options BoundaryOptions) (BoundarySet, error) {
@@ -92,39 +91,15 @@ func ResolveBoundarySet(options BoundaryOptions) (BoundarySet, error) {
 		return BoundarySet{}, errors.New("filesystem root could not be resolved")
 	}
 	gitRoot := discoverNearestGitRoot(cwd, goos)
-	protected := make([]string, 0, 6)
-	seenProtected := map[string]struct{}{}
-	for _, candidate := range []string{cwd, home, gitRoot} {
-		for _, alias := range trustedBoundaryAliases(candidate, goos) {
-			if alias == "" {
-				continue
-			}
-			if _, exists := seenProtected[alias]; exists {
-				continue
-			}
-			seenProtected[alias] = struct{}{}
-			protected = append(protected, alias)
-		}
-	}
-	gitPaths := make([]string, 0, 2)
-	seenGitPaths := map[string]struct{}{}
+	protected := trustedBoundaryAliases(home, goos)
+	var gitPaths []string
 	if gitRoot != "" {
-		for _, alias := range trustedBoundaryAliases(path.Join(gitRoot, ".git"), goos) {
-			if alias == "" {
-				continue
-			}
-			if _, exists := seenGitPaths[alias]; exists {
-				continue
-			}
-			seenGitPaths[alias] = struct{}{}
-			gitPaths = append(gitPaths, alias)
-		}
+		gitPaths = trustedBoundaryAliases(path.Join(gitRoot, ".git"), goos)
 	}
 	return BoundarySet{
 		goos:      goos,
 		cwd:       cwd,
 		home:      home,
-		gitRoot:   gitRoot,
 		gitPaths:  gitPaths,
 		roots:     roots,
 		protected: protected,
@@ -343,7 +318,9 @@ func (b BoundarySet) resolveKnownDirectory(base, candidate string) (string, bool
 	if b.goos != runtime.GOOS {
 		return normalized, true
 	}
-	for _, known := range append(append([]string{}, b.protected...), b.roots...) {
+	// The trusted request CWD remains a resolution anchor, not a deletion
+	// boundary. It may be synthetic in same-platform conformance inputs.
+	for _, known := range append(append([]string{b.cwd}, b.protected...), b.roots...) {
 		if sameBoundaryPath(normalized, known, b.goos) {
 			return normalized, true
 		}
@@ -369,9 +346,8 @@ func (b BoundarySet) isAbsoluteCandidate(candidate string) bool {
 
 // protectsCriticalMetadata reports whether a non-recursive delete directly
 // targets Git metadata or Ward's own control boundary.
-// General filesystem roots, HOME, CWD, and repository roots are deliberately
-// excluded here: Ward only vetoes those targets when the operation is known to
-// recurse.
+// Filesystem roots and HOME are excluded here: their deletion is vetoed only
+// when the operation is known to recurse.
 func (b BoundarySet) protectsCriticalMetadata(candidate string) bool {
 	for _, target := range b.candidateAliases(candidate, false) {
 		if containsDotGitComponent(target, b.goos) || b.targetsGitPath(target, false) || b.targetsWardPath(target, false) {
@@ -398,8 +374,8 @@ func (b BoundarySet) protectsCriticalRelocation(candidate string) bool {
 }
 
 // protectsRecursiveDelete reports whether a recursive tree deletion can
-// remove a catastrophic boundary. Descendants of HOME/CWD/repository roots are
-// ordinary cleanup targets and are not protected by this method.
+// remove a catastrophic boundary. Ordinary CWDs and repositories are cleanup
+// targets; only direct Git metadata, HOME, roots and Ward anchors are protected.
 func (b BoundarySet) protectsRecursiveDelete(candidate string) bool {
 	return b.protectsRecursiveDeleteWithAliases(b.candidateAliases(candidate, false), false)
 }
@@ -413,7 +389,7 @@ func (b BoundarySet) protectsRecursiveDeleteWithAliases(targets []string, derefe
 		if target == "/" || b.goos == "windows" && sameBoundaryPath(target, windowsBoundaryRoot(target), b.goos) {
 			return true
 		}
-		if containsDotGitComponent(target, b.goos) || b.overlapsGitPath(target, dereferenceLeaf) || b.overlapsWardPath(target, dereferenceLeaf) {
+		if containsDotGitComponent(target, b.goos) || b.targetsGitPath(target, dereferenceLeaf) || b.overlapsWardPath(target, dereferenceLeaf) {
 			return true
 		}
 		for _, protected := range append(append([]string{}, b.protected...), b.roots...) {
@@ -485,15 +461,6 @@ func (b BoundarySet) overlapsWardPath(target string, dereferenceLeaf bool) bool 
 func (b BoundarySet) targetsWardPath(target string, dereferenceLeaf bool) bool {
 	for _, protected := range b.wardPaths {
 		if b.sameBoundaryObjectForOperation(target, protected, dereferenceLeaf) || b.boundaryObjectContainsForOperation(protected, target, dereferenceLeaf) {
-			return true
-		}
-	}
-	return false
-}
-
-func (b BoundarySet) overlapsGitPath(target string, dereferenceLeaf bool) bool {
-	for _, protected := range b.gitPaths {
-		if b.sameBoundaryObjectForOperation(target, protected, dereferenceLeaf) || b.boundaryObjectContainsForOperation(target, protected, dereferenceLeaf) || b.boundaryObjectContainsForOperation(protected, target, dereferenceLeaf) {
 			return true
 		}
 	}

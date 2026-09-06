@@ -271,11 +271,10 @@ func permissionProfileBlock(newline, profile, parent string, paths Paths) []byte
 	lines := []string{
 		profileBegin,
 		"[permissions." + profile + "]",
-		`description = "Ward catastrophic-action veto with bounded native secret protection."`,
+		`description = "Ward catastrophic-action veto with root-level native secret protection."`,
 		"extends = " + strconv.Quote(parent),
 		"",
 		"[permissions." + profile + ".filesystem]",
-		"glob_scan_max_depth = 16",
 	}
 	for _, directory := range readOnlyBoundaryDirectories(paths) {
 		lines = append(lines, strconv.Quote(directory)+` = "read"`)
@@ -296,27 +295,16 @@ func permissionProfileBlock(newline, profile, parent string, paths Paths) []byte
 
 func workspaceSecretRules() []string {
 	patterns := []string{
-		".env", "**/.env",
-		".env.local", "**/.env.local",
-		".env.development", "**/.env.development", ".env.dev", "**/.env.dev",
-		".env.test", "**/.env.test", ".env.testing", "**/.env.testing",
-		".env.production", "**/.env.production", ".env.prod", "**/.env.prod",
-		".env.staging", "**/.env.staging", ".env.stage", "**/.env.stage",
-		".env.secret", "**/.env.secret", ".env.secrets", "**/.env.secrets",
-		".env.private", "**/.env.private",
-		"*.key.json", "**/*.key.json",
-		"key.json", "**/key.json", "credentials.json", "**/credentials.json",
-		"service-account.json", "**/service-account.json", "service_account.json", "**/service_account.json",
-		"secrets.yml", "**/secrets.yml", "secrets.yaml", "**/secrets.yaml",
-		"credentials.yml", "**/credentials.yml", "credentials.yaml", "**/credentials.yaml",
-		"id_rsa", "**/id_rsa", "id_dsa", "**/id_dsa", "id_ecdsa", "**/id_ecdsa", "id_ed25519", "**/id_ed25519",
-		"private-key.pem", "**/private-key.pem", "private_key.pem", "**/private_key.pem", "privatekey.pem", "**/privatekey.pem",
-		"privkey.pem", "**/privkey.pem",
-		"*.p12", "**/*.p12", "*.pfx", "**/*.pfx",
+		".env", ".env.local", ".env.development", ".env.dev", ".env.test", ".env.testing",
+		".env.production", ".env.prod", ".env.staging", ".env.stage", ".env.secret", ".env.secrets", ".env.private",
+		"*.key.json", "key.json", "credentials.json", "service-account.json", "service_account.json",
+		"secrets.yml", "secrets.yaml", "credentials.yml", "credentials.yaml",
+		"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+		"private-key.pem", "private_key.pem", "privatekey.pem", "privkey.pem", "*.p12", "*.pfx",
 	}
 	for index := 1; index <= 9; index++ {
 		name := fmt.Sprintf("privkey%d.pem", index)
-		patterns = append(patterns, name, "**/"+name)
+		patterns = append(patterns, name)
 	}
 	rules := make([]string, 0, len(patterns))
 	for _, pattern := range patterns {

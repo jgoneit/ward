@@ -105,11 +105,6 @@ func Doctor(options Options) DoctorReport {
 	} else {
 		add("permissions.control_topology", CheckPass, "Ward control files use bounded dedicated anchors outside project relocation authority.")
 	}
-	if options.Paths.HomeWorkspaceTopology {
-		add("permissions.home_workspace_topology", CheckWarn, "HOME is the active workspace; recursive workspace Secret rules may also cover Host credential stores. Use a project subdirectory or another Host profile.")
-	} else {
-		add("permissions.home_workspace_topology", CheckPass, "The active workspace is narrower than HOME credential storage.")
-	}
 	add("permissions.layers", CheckPass, "Other Codex permission layers remain Host authority.")
 	add("hooks.trust", CheckWarn, "Hook definition trust is controlled by Codex and cannot be verified by Ward; confirm it once in the Host.")
 	return report
@@ -184,8 +179,15 @@ func checkConfig(report *DoctorReport, raw []byte, journal integrationJournal, o
 		return
 	}
 	add("permissions.profile", CheckPass, "Ward permission profile block is intact.")
+	ownedBlock := bytes.TrimLeft(profile, "\r\n")
+	currentBlock := permissionProfileBlock(detectNewline(ownedBlock), journal.ProfileName, journal.ConfigEdits.ParentProfile, options.Paths)
+	if !bytes.Equal(ownedBlock, currentBlock) {
+		add("permissions.profile_current", CheckFail, "The owned Ward profile is outdated; run ward codex install --scope user from the trusted Host to refresh it.")
+	} else {
+		add("permissions.profile_current", CheckPass, "The owned Ward profile uses the current root-level secret scope.")
+	}
 	parentNeedle := []byte("extends = " + strconv.Quote(journal.ConfigEdits.ParentProfile))
-	if journal.ConfigEdits.ParentProfile == "" || !bytes.Contains(profile, parentNeedle) {
+	if !validPermissionParent(journal.ConfigEdits.ParentProfile, journal.ProfileName) || !bytes.Contains(profile, parentNeedle) {
 		add("permissions.parent", CheckFail, "Ward profile parent is missing or changed.")
 	} else if !strings.HasPrefix(journal.ConfigEdits.ParentProfile, ":") && !namedPermissionParentSafe(raw, journal.ConfigEdits.ParentProfile) {
 		add("permissions.parent", CheckFail, "Ward profile parent now contains authority Ward cannot safely inherit.")

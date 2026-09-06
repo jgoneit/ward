@@ -321,7 +321,6 @@ func buildDoctorReport(ctx context.Context, cwd string, includeNativeProbe bool)
 		[]string{options.Paths.ConfigFile, options.Paths.HooksFile, options.Paths.BinaryPath},
 		[]string{filepath.Dir(options.Paths.BinaryPath)},
 	)
-	options.Paths.HomeWorkspaceTopology = sameCanonicalPath(cwd, options.Paths.HomeDir)
 	report := integration.Doctor(options)
 	report.Checks = append(report.Checks, doctorPlatformCheck(), doctorSyntheticCheck())
 	if includeNativeProbe {
@@ -335,17 +334,6 @@ func buildDoctorReport(ctx context.Context, cwd string, includeNativeProbe bool)
 		}
 	}
 	return report, nil
-}
-
-func sameCanonicalPath(left, right string) bool {
-	left, right = canonicalExistingPath(left), canonicalExistingPath(right)
-	if left == "" || right == "" {
-		return false
-	}
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(left, right)
-	}
-	return left == right
 }
 
 func sessionDoctorCheckIDs(ctx context.Context, cwd string) []string {
@@ -491,7 +479,7 @@ func doctorSyntheticCheck() integration.Check {
 	}
 	base := contract.Request{Tool: "bash", CWD: "/ward-doctor"}
 	destructive := base
-	destructive.Input.Command = "rm -rf ."
+	destructive.Input.Command = "rm -rf .git"
 	ordinary := base
 	ordinary.Input.Command = "rm build/old.o"
 	destructiveDecision := engine.Evaluate(destructive)
