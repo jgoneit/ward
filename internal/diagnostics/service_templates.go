@@ -103,7 +103,9 @@ func scheduledTaskDefinition(d serviceDefinition) []byte {
 	for i, arg := range d.Args {
 		args[i] = windowsArgument(arg)
 	}
-	return []byte(`<?xml version="1.0" encoding="UTF-8"?>
+	// RegisterTask receives a Unicode BSTR, independent of the UTF-8 JSON
+	// transport. Do not declare a byte encoding for that COM string.
+	return []byte(`<?xml version="1.0"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <RegistrationInfo><Description>Ward local diagnostics collector</Description></RegistrationInfo>
 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>` + xmlText(d.UserID) + `</UserId></LogonTrigger></Triggers>
