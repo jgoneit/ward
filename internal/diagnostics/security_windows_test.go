@@ -1,0 +1,46 @@
+//go:build windows
+
+package diagnostics
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/jgoneit/ward/internal/securefs"
+	"golang.org/x/sys/windows"
+)
+
+func TestCollectorLockRejectsChangedDACLWithoutRepair(t *testing.T) {
+	paths := fixturePaths(t)
+	if err := ensurePrivateDirectory(paths.ControlDir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(paths.ControlDir, "collector.lock")
+	unlock, err := lockCollector(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	everyone, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+		AccessPermissions: windows.ACCESS_MASK(windows.GENERIC_ALL),
+		AccessMode:        windows.SET_ACCESS,
+		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(everyone)},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		t.Fatal(err)
+	}
+	if unlock, err := lockCollector(path); err == nil {
+		unlock()
+		t.Fatal("accepted modified lock DACL")
+	}
+	if err := securefs.InspectPrivateFile(path); err == nil {
+		t.Fatal("modified lock DACL was repaired")
+	}
+}
