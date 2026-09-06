@@ -69,6 +69,18 @@ def run(argv, env, label, *, payload=None, timeout=45, expected=0):
         elif b"diagnostics service response is invalid" in result.stderr:
             code = "service_response_invalid"
         details = {"command": label, "exit_code": result.returncode}
+        if label == "ward diagnostics status --json" and len(result.stdout) <= 65536:
+            try:
+                status = json.loads(result.stdout)
+            except (ValueError, UnicodeError):
+                status = None
+            if (isinstance(status, dict)
+                    and status.get("schema") == "ward-diagnostics-status/v1"
+                    and isinstance(status.get("error_code"), str)
+                    and status.get("error_code") in {
+                        "ownership_conflict", "service_unavailable", "runtime_unavailable",
+                        "collector_unresponsive"}):
+                details["status_error_code"] = status["error_code"]
         hresult = re.search(rb"diagnostics service backend failed \(hresult=0x([0-9a-f]{8})\)", result.stderr)
         if hresult:
             details["hresult"] = "0x" + hresult[1].decode("ascii")
@@ -99,7 +111,8 @@ def powershell_path():
     return str(Path(buffer.value) / "WindowsPowerShell/v1.0/powershell.exe")
 
 
-def project_task_xml(xml_text):
+def project_task_xml(xml_text, *, expected_user_id=None, expected_command=None,
+                     expected_arguments=None):
     """Bounded structural evidence; no dynamic values or raw XML escape."""
     require(len(xml_text) <= 65536 and "<!DOCTYPE" not in xml_text.upper()
             and "<!ENTITY" not in xml_text.upper(), "task_projection_xml_rejected")
@@ -119,8 +132,18 @@ def project_task_xml(xml_text):
                    "AllowStartOnDemand Hidden RunOnlyIfIdle WakeToRun UseUnifiedSchedulingEngine "
                    "DisallowStartOnRemoteAppSession Volatile Exclusive".split())
     durations = {"Duration", "WaitTimeout", "ExecutionTimeLimit", "Interval", "DeleteExpiredTaskAfter"}
-    result = {"element_counts": {}, "settings": {}}
+    namespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+    attribute_shapes = {
+        "Task": {"version"},
+        "Task/Principals/Principal": {"id"},
+        "Task/Actions": {"Context"},
+    }
+    known_attributes = {"version", "id", "Context"}
+    result = {"element_counts": {}, "settings": {}, "attribute_counts": {},
+              "attribute_shape_matches": {}, "all_element_namespaces_match": True}
     root = ET.fromstring(xml_text)
+    result["root_namespace_matches"] = root.tag == "{" + namespace + "}Task"
+    nodes_by_path = {}
     visited = 0
 
     def visit(node, parents):
@@ -131,7 +154,16 @@ def project_task_xml(xml_text):
         name = local if local in known else "Unknown"
         path = parents + [name]
         key = "/".join(path)
+        nodes_by_path.setdefault(key, []).append(node)
         result["element_counts"][key] = result["element_counts"].get(key, 0) + 1
+        result["all_element_namespaces_match"] &= node.tag.startswith("{" + namespace + "}")
+        attributes = result["attribute_counts"].setdefault(key, {})
+        for attribute in node.attrib:
+            label = attribute if attribute in known_attributes else "Unknown"
+            attributes[label] = attributes.get(label, 0) + 1
+        result["attribute_shape_matches"].setdefault(key, []).append(
+            set(node.attrib) == attribute_shapes.get(key, set())
+        )
         if path[:2] == ["Task", "Settings"] and len(node) == 0:
             value = (node.text or "").strip()
             allowed = ((name in booleans and value in {"true", "false"})
@@ -144,6 +176,29 @@ def project_task_xml(xml_text):
             visit(child, path)
 
     visit(root, [])
+    text_expectations = {
+        "principal_user_id": ("Task/Principals/Principal/UserId", expected_user_id),
+        "logon_user_id": ("Task/Triggers/LogonTrigger/UserId", expected_user_id),
+        "principal_logon_type": ("Task/Principals/Principal/LogonType", "InteractiveToken"),
+        "registration_description": ("Task/RegistrationInfo/Description", "Ward local diagnostics collector"),
+        "exec_command": ("Task/Actions/Exec/Command", expected_command),
+        "exec_arguments": ("Task/Actions/Exec/Arguments", expected_arguments),
+    }
+    matches = {}
+    for label, (path, expected) in text_expectations.items():
+        if expected is None:
+            continue
+        nodes = nodes_by_path.get(path, [])
+        matches[label] = (len(nodes) == 1 and len(nodes[0]) == 0
+                          and nodes[0].tag.startswith("{" + namespace + "}")
+                          and nodes[0].text == expected)
+    for label, path, attribute, expected in (
+            ("task_version", "Task", "version", "1.2"),
+            ("principal_id", "Task/Principals/Principal", "id", "CurrentUser"),
+            ("actions_context", "Task/Actions", "Context", "CurrentUser")):
+        nodes = nodes_by_path.get(path, [])
+        matches[label] = len(nodes) == 1 and nodes[0].attrib.get(attribute) == expected
+    result["expected_value_matches"] = matches
     return result
 
 
@@ -201,6 +256,7 @@ class NativeSmoke:
         self.logs = self.core.parent / "diagnostics"
         self.manifest = self.control / "service-owner.json"
         self.native_id = None
+        self.user_id = None
         self.service_file = None
         self.service_attempted = False
         self.initial_absence = False
@@ -254,7 +310,14 @@ if($null -eq $task){ '{"exists":false}' }else{
                 return
             require(task.get("exists") is True and isinstance(task.get("xml"), str),
                     "task_projection_reply_invalid")
-            projection = project_task_xml(task["xml"])
+            projection = project_task_xml(
+                task["xml"], expected_user_id=self.user_id,
+                expected_command=str(self.collector),
+                expected_arguments=subprocess.list2cmdline([
+                    "diagnostics", "serve", "--core-dir", str(self.core),
+                    "--home-dir", str(self.home), "--binary-path", str(self.binary),
+                ]),
+            )
             self.record("windows_task_projection", available=True, task_exists=True,
                         dynamic_values_redacted=True, **projection)
         except (CheckFailure, OSError, ValueError, ET.ParseError) as error:
@@ -272,6 +335,7 @@ if($null -eq $task){ '{"exists":false}' }else{
             require(user_id.startswith("S-1-"), "invalid_current_windows_sid")
         else:
             user_id = str(os.getuid())
+        self.user_id = user_id
         value = hashlib.sha256((user_id + "\0" + str(self.binary)).encode()).hexdigest()[:24]
         if self.platform == "darwin":
             self.native_id = "io.github.jgoneit.ward.diagnostics." + value
