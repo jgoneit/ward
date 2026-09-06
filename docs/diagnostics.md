@@ -42,8 +42,10 @@ login; the logon trigger starts it after later logins. This supplements Task
 Scheduler's failure retries, which did not recover a terminated collector in
 native testing. Recovery can leave a gap of a minute or longer under scheduler
 load. Disabling the task stops repetition before process and file cleanup.
-Rollback suppresses registration-trigger execution when restoring a previously
-stopped task.
+The registration trigger starts after a one-minute delay; initial enable still
+starts the collector immediately. Rollback re-arms that delay for an enabled
+but stopped task, so recovery resumes in the same login session. A disabled,
+stopped task remains inactive after rollback.
 
 Linux requires an available systemd user manager and `busctl` with JSON output.
 The unit directory is `${XDG_CONFIG_HOME:-~/.config}/systemd/user`; preflight
