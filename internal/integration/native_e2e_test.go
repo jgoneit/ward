@@ -59,18 +59,19 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 		".env.example", ".env.sample", ".env.template", ".env.dist", ".env.customer", ".env.customer.local", "server.pem", "private-notes.pem", "private-certificate.pem",
 		"private-key-notes.pem", "private_key_notes.pem", "privatekey-notes.pem", "deployment.yml", "deployment-secret.yml", "service-account-prod.json", "config.key",
 	}
-	for _, name := range append(append([]string(nil), protected...), public...) {
-		path := filepath.Join(workspace, "nested", name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
+	deepDirectory := filepath.Join(workspace, "a", "b", "c", "d", "e", "f", "g", "h", "i", "j")
+	fixtures := make([]string, 0)
+	for _, name := range protected {
+		for _, directory := range []string{workspace, filepath.Join(workspace, "nested"), deepDirectory} {
+			fixtures = append(fixtures, filepath.Join(directory, name))
 		}
-		if err := os.WriteFile(path, []byte("WARD_FIXTURE\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	}
+	for _, name := range public {
+		fixtures = append(fixtures, filepath.Join(workspace, name))
 	}
 	homeAuth := filepath.Join(home, ".config", "gh", "hosts.yml")
-	deepSecret := filepath.Join(workspace, "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", ".env.production")
-	for _, path := range []string{homeAuth, deepSecret, options.Paths.journalFile()} {
+	fixtures = append(fixtures, homeAuth, options.Paths.journalFile())
+	for _, path := range fixtures {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -78,53 +79,76 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
-	runIn := func(activeWorkspace, path string, write bool) ([]byte, error) {
+	run := func(path, operation string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		args := []string{"sandbox", "-P", DefaultProfileName, "-C", activeWorkspace}
+		args := []string{"sandbox", "-P", DefaultProfileName, "-C", workspace}
 		if runtime.GOOS == "windows" {
-			script := `Get-Content -LiteralPath $args[0] | Out-Null`
-			if write {
-				script += `; Set-Content -LiteralPath $args[0] -Value 'WARD_PUBLIC'`
-			}
+			script := map[string]string{
+				"read":        `Get-Content -LiteralPath $args[0] | Out-Null`,
+				"write":       `Set-Content -LiteralPath $args[0] -Value 'WARD_PUBLIC'`,
+				"cleanup":     `Get-Content -LiteralPath $args[0] | Out-Null; Set-Content -LiteralPath $args[0] -Value 'WARD_PUBLIC'; Move-Item -LiteralPath $args[0] -Destination ($args[0] + '.renamed'); Remove-Item -LiteralPath ($args[0] + '.renamed')`,
+				"directories": `New-Item -ItemType Directory -Path 'empty' | Out-Null; Move-Item -LiteralPath 'empty' -Destination 'renamed'; Remove-Item -LiteralPath 'renamed'; New-Item -ItemType Directory -Path 'temporary/child' -Force | Out-Null; Set-Content -LiteralPath 'temporary/child/ordinary.txt' -Value 'created'; Add-Content -LiteralPath 'temporary/child/ordinary.txt' -Value 'modified'; Move-Item -LiteralPath 'temporary' -Destination 'temporary-renamed'; Remove-Item -LiteralPath 'temporary-renamed', 'nested', 'a' -Recurse -Force`,
+			}[operation]
+			script = `$ErrorActionPreference = 'Stop'; ` + script
 			args = append(args, "powershell.exe", "-NoProfile", "-Command", script, path)
 		} else {
-			script := `cat "$1" >/dev/null`
-			if write {
-				script += ` && printf 'WARD_PUBLIC\n' > "$1"`
-			}
+			script := map[string]string{
+				"read":        `cat "$1" >/dev/null`,
+				"write":       `printf 'WARD_PUBLIC\n' > "$1"`,
+				"cleanup":     `cat "$1" >/dev/null && printf 'WARD_PUBLIC\n' > "$1" && mv "$1" "$1.renamed" && rm "$1.renamed"`,
+				"directories": `mkdir empty && mv empty renamed && rmdir renamed && mkdir -p temporary/child && printf 'created\n' > temporary/child/ordinary.txt && printf 'modified\n' >> temporary/child/ordinary.txt && mv temporary temporary-renamed && rm -rf temporary-renamed nested a`,
+			}[operation]
 			args = append(args, "/bin/sh", "-c", script, "ward-native-probe", path)
 		}
 		command := exec.CommandContext(ctx, codexPath, args...)
 		command.Env = isolatedCodexEnvironment(home, codexHome)
 		return command.CombinedOutput()
 	}
-	run := func(path string, write bool) ([]byte, error) { return runIn(workspace, path, write) }
-
+	if output, err := run(filepath.Join(workspace, public[0]), "read"); err != nil {
+		t.Fatalf("native sandbox positive preflight failed; permission probes were not run: %v: %s", err, output)
+	}
 	for _, name := range protected {
-		t.Run("deny workspace "+name, func(t *testing.T) {
-			path := filepath.Join(workspace, "nested", name)
-			if output, err := run(path, false); err == nil {
-				t.Fatalf("native profile allowed reviewed secret: %s", output)
-			}
-		})
+		operations := []string{"read"}
+		// Codex glob denies do not guarantee write denial; check writes for literal rules.
+		if !strings.HasSuffix(name, ".key.json") && !strings.HasSuffix(name, ".p12") && !strings.HasSuffix(name, ".pfx") {
+			operations = append(operations, "write")
+		}
+		for _, operation := range operations {
+			t.Run("deny root "+operation+" "+name, func(t *testing.T) {
+				if output, err := run(filepath.Join(workspace, name), operation); err == nil {
+					t.Fatalf("native profile allowed reviewed root secret %s: %s", operation, output)
+				}
+			})
+		}
+		for _, directory := range []string{filepath.Join(workspace, "nested"), deepDirectory} {
+			t.Run("allow nested cleanup "+filepath.Base(directory)+" "+name, func(t *testing.T) {
+				if output, err := run(filepath.Join(directory, name), "cleanup"); err != nil {
+					t.Fatalf("native profile blocked nested fixture lifecycle: %v: %s", err, output)
+				}
+			})
+		}
 	}
 	for _, name := range public {
 		t.Run("allow public "+name, func(t *testing.T) {
-			path := filepath.Join(workspace, "nested", name)
-			if output, err := run(path, true); err != nil {
+			path := filepath.Join(workspace, name)
+			if output, err := run(path, "cleanup"); err != nil {
 				t.Fatalf("native profile blocked public/generic fixture: %v: %s", err, output)
 			}
 		})
 	}
-	t.Run("deny deep reviewed secret within scan bound", func(t *testing.T) {
-		if output, err := run(deepSecret, false); err == nil {
-			t.Fatalf("native profile allowed a deep reviewed secret: %s", output)
+	t.Run("allow empty and nested directory lifecycle", func(t *testing.T) {
+		if output, err := run("", "directories"); err != nil {
+			t.Fatalf("native profile blocked temporary directory lifecycle: %v: %s", err, output)
+		}
+		for _, removed := range []string{"empty", "renamed", "temporary", "temporary-renamed", "nested", "a"} {
+			if _, err := os.Lstat(filepath.Join(workspace, removed)); !os.IsNotExist(err) {
+				t.Fatalf("temporary directory was not removed: %s: %v", removed, err)
+			}
 		}
 	})
 	t.Run("leave HOME auth store to Host", func(t *testing.T) {
-		if output, err := run(homeAuth, false); err != nil {
+		if output, err := run(homeAuth, "read"); err != nil {
 			t.Fatalf("Ward added a HOME auth-store deny: %v: %s", err, output)
 		}
 	})
@@ -132,7 +156,7 @@ func TestCodexNativePermissionProfile(t *testing.T) {
 		"config": options.Paths.ConfigFile, "hooks": options.Paths.HooksFile, "state": options.Paths.journalFile(),
 	} {
 		t.Run("deny Ward "+name, func(t *testing.T) {
-			if output, err := run(path, false); err == nil {
+			if output, err := run(path, "read"); err == nil {
 				t.Fatalf("native profile allowed Ward control/state read: %s", output)
 			}
 		})

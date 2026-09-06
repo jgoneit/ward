@@ -48,18 +48,18 @@ chmod 0755 "$WARD_E2E_MANAGED_BIN"
 printf '%s\n' 'approval_policy = "never"' 'model = "gpt-test"' > "$WARD_E2E_CODEX_DIR/config.toml"
 cp "$WARD_E2E_CODEX_DIR/config.toml" "$WARD_E2E_TMP/config.original.toml"
 
-# Reviewed workspace secrets: the native permission profile must deny these.
+# Reviewed secrets at each workspace root must be denied.
 printf '%s\n' 'WARD_SECRET_CANARY_7d10f7' > "$WARD_E2E_WORKSPACE/.env"
-printf '%s\n' 'WARD_LOCAL_CANARY_2b98e1' > "$WARD_E2E_WORKSPACE/nested/.env.local"
+printf '%s\n' 'WARD_LOCAL_CANARY_2b98e1' > "$WARD_E2E_WORKSPACE/.env.local"
 printf '%s\n' 'WARD_KEY_JSON_CANARY_95d4bd' > "$WARD_E2E_WORKSPACE/app.key.json"
-printf '%s\n' 'WARD_CREDENTIALS_CANARY_7f8d21' > "$WARD_E2E_WORKSPACE/nested/credentials.json"
+printf '%s\n' 'WARD_CREDENTIALS_CANARY_7f8d21' > "$WARD_E2E_WORKSPACE/credentials.json"
 printf '%s\n' 'WARD_SERVICE_CANARY_6259a1' > "$WARD_E2E_WORKSPACE/service-account.json"
-printf '%s\n' 'WARD_YAML_CANARY_f04052' > "$WARD_E2E_WORKSPACE/nested/secrets.yml"
+printf '%s\n' 'WARD_YAML_CANARY_f04052' > "$WARD_E2E_WORKSPACE/secrets.yml"
 printf '%s\n' 'WARD_SSH_CANARY_a44071' > "$WARD_E2E_WORKSPACE/id_ed25519"
 printf '%s\n' 'WARD_KEY_CANARY_f8aa11' > "$WARD_E2E_WORKSPACE/private-key.pem"
 printf '%s\n' 'WARD_NUMBERED_KEY_CANARY_2f0b77' > "$WARD_E2E_WORKSPACE/privkey1.pem"
-printf '%s\n' 'WARD_P12_CANARY_3f277a' > "$WARD_E2E_WORKSPACE/nested/client.p12"
-printf '%s\n' 'WARD_DEEP_CANARY_b7f441' > "$WARD_E2E_DEEP/.env.production"
+printf '%s\n' 'WARD_P12_CANARY_3f277a' > "$WARD_E2E_WORKSPACE/client.p12"
+printf '%s\n' 'WARD_PRODUCTION_CANARY_b7f441' > "$WARD_E2E_WORKSPACE/.env.production"
 
 # Public and ordinary workspace fixtures must remain usable.
 printf '%s\n' 'PUBLIC_TEMPLATE=1' > "$WARD_E2E_WORKSPACE/.env.example"
@@ -116,29 +116,41 @@ sandbox() {
   ward_env "$WARD_E2E_CODEX" sandbox -P ward -C "$WARD_E2E_WORKSPACE" "$@"
 }
 
-# Keep the bounded expansion depth exercised without claiming unbounded
-# protection on platforms that pre-expand deny globs.
+# A sandbox startup failure must not count as a successful secret denial.
+sandbox /bin/sh -c 'cat ordinary.txt >/dev/null'
+
+# The same fake filenames are denied at the root and usable below it.
 for protected in \
   .env \
-  nested/.env.local \
+  .env.production \
+  .env.local \
   app.key.json \
-  nested/credentials.json \
+  credentials.json \
   service-account.json \
-  nested/secrets.yml \
+  secrets.yml \
   id_ed25519 \
   private-key.pem \
   privkey1.pem \
-  nested/client.p12; do
+  client.p12; do
   if sandbox /bin/sh -c 'cat "$1"' sh "$protected" >/dev/null 2>&1; then
     printf 'Ward E2E: reviewed workspace Secret escaped: %s\n' "$protected" >&2
     exit 1
   fi
+  # Codex glob denies do not guarantee write denial; check writes for literal rules.
+  case "$protected" in
+    *.key.json|*.p12|*.pfx) ;;
+    *)
+      if sandbox /bin/sh -c 'printf "tampered\n" > "$1"' sh "$protected" >/dev/null 2>&1; then
+        printf 'Ward E2E: reviewed root Secret write escaped: %s\n' "$protected" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  for directory in nested "$WARD_E2E_DEEP_REL"; do
+    cp "$WARD_E2E_WORKSPACE/$protected" "$WARD_E2E_WORKSPACE/$directory/$protected"
+    sandbox /bin/sh -c 'cat "$1" >/dev/null && printf "updated\n" > "$1" && mv "$1" "$1.renamed" && rm "$1.renamed"' sh "$directory/$protected"
+  done
 done
-
-if sandbox /bin/sh -c 'cat "$1"' sh "$WARD_E2E_DEEP_REL/.env.production" >/dev/null 2>&1; then
-  printf '%s\n' 'Ward E2E: depth-10 reviewed workspace Secret escaped' >&2
-  exit 1
-fi
 
 for ordinary in \
   .env.example \
@@ -152,6 +164,12 @@ for ordinary in \
   fixtures/user-credential.json \
   .npmrc; do
   sandbox /bin/sh -c 'cat "$1" >/dev/null && printf "updated\n" > "$1"' sh "$ordinary"
+done
+
+# Exercise creation, rename, modification, and both empty and recursive removal.
+sandbox /bin/sh -c 'mkdir empty && mv empty renamed && rmdir renamed && mkdir -p temporary/child && printf "created\n" > temporary/child/ordinary.txt && printf "modified\n" >> temporary/child/ordinary.txt && mv temporary temporary-renamed && rm -rf temporary-renamed nested d1'
+for removed in empty renamed temporary temporary-renamed nested d1; do
+  test ! -e "$WARD_E2E_WORKSPACE/$removed"
 done
 
 for auth_file in \
@@ -201,7 +219,7 @@ test ! -s "$WARD_E2E_TMP/safe.stderr"
 test "$WARD_E2E_BEFORE" = "$(state_snapshot)"
 
 # A catastrophic request is denied without recording the attempt.
-DENY_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf ."}}'
+DENY_PAYLOAD='{"cwd":"'"$WARD_E2E_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf .git"}}'
 printf '%s' "$DENY_PAYLOAD" | ward_env "$WARD_E2E_MANAGED_BIN" hook codex-pre-tool-use >"$WARD_E2E_TMP/deny.stdout" 2>"$WARD_E2E_TMP/deny.stderr"
 grep -F '"permissionDecision":"deny"' "$WARD_E2E_TMP/deny.stdout" >/dev/null
 test "$(wc -l < "$WARD_E2E_TMP/deny.stdout" | tr -d '[:space:]')" = 1

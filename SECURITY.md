@@ -11,11 +11,11 @@ Hooks cover only requests the Host delivers through the trusted definition.
 - Supported literal high-confidence destructive requests are denied; everything
   else, including evaluator errors, is left to the Host.
 - Hook evaluation writes no persistent Ward data for deny, defer, or error.
-- Public templates and generic certificate/config files remain usable. HOME
-  authentication stores remain usable for ordinary project workspaces;
-  HOME-as-workspace is unsupported and produces a topology warning.
-- Recursive workspace secret-name coverage is bounded to 16 directory levels
-  on platforms where Codex pre-expands deny globs.
+- Native secret rules cover only reviewed names immediately below each Host
+  workspace root on all platforms. Nested secrets are intentionally outside
+  this boundary; Ward does not discover or register them.
+- Native glob rules deny reads; Ward does not claim write protection for
+  wildcard-matched secret names. Exact filename write denials are tested separately.
 
 Hook absence, timeout, trust rejection, session profile changes, hosted tools,
 ambiguous command construction, filesystem races, and same-user replacement of

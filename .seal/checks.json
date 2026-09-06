@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {"name": "go-test", "argv": ["go", "test", "./..."], "required": true, "timeout_seconds": 300},
+    {"name": "go-vet", "argv": ["go", "vet", "./..."], "required": true, "timeout_seconds": 120},
+    {"name": "go-build", "argv": ["go", "build", "-o", "bin/ward", "./cmd/ward"], "required": true, "timeout_seconds": 300},
+    {"name": "plugin", "argv": ["python3", "scripts/validate-plugin.py"], "required": true, "timeout_seconds": 60}
+  ]
+}

@@ -152,6 +152,8 @@ func TestWindowsNativeProfileUsesLiteralControlPaths(t *testing.T) {
 func assertMinimalProfile(t *testing.T, profile []byte) {
 	t.Helper()
 	for _, broad := range []string{
+		`**/`,
+		`glob_scan_max_depth`,
 		`"~/.aws/credentials" = "deny"`,
 		`"*.key" = "deny"`,
 		`"**/*.pem" = "deny"`,
@@ -166,11 +168,13 @@ func assertMinimalProfile(t *testing.T, profile []byte) {
 	}
 	for _, required := range []string{
 		`".env" = "deny"`,
-		`"**/.env.production" = "deny"`,
-		`"**/*.key.json" = "deny"`,
-		`"**/service-account.json" = "deny"`,
-		`"**/id_ed25519" = "deny"`,
-		`"**/privkey9.pem" = "deny"`,
+		`".env.production" = "deny"`,
+		`"*.key.json" = "deny"`,
+		`"*.p12" = "deny"`,
+		`"*.pfx" = "deny"`,
+		`"service-account.json" = "deny"`,
+		`"id_ed25519" = "deny"`,
+		`"privkey9.pem" = "deny"`,
 	} {
 		if !strings.Contains(string(profile), required) {
 			t.Errorf("reviewed secret rule missing %q", required)

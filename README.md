@@ -34,17 +34,22 @@ model-visible bytes, and performs no persistent Hook write.
 
 ## What v0.1 denies
 
-- recursive deletion of `/`, the actual user home, the request CWD, the nearest
-  Git root, or an ancestor containing one of those boundaries;
-- deletion or relocation of `.git` or Ward control and integration-state paths;
+- recursive deletion of a filesystem root, the actual user home, or an
+  ancestor containing the actual home;
+- direct deletion or relocation of `.git`, its internal paths and physical aliases;
+- deletion or relocation of Ward control and integration-state paths or their
+  containing directories;
 - `git reset --hard`, forced directory clean, force/mirror/forced-refspec push.
 
-Ordinary file and directory deletion, build/cache cleanup, normal patch
-deletion, `--force-with-lease`, SQL and infrastructure operations (including
-database/schema deletion and resource teardown), interactive shells,
-secret-reading commands, dynamic expressions, and unknown tools defer to the
+Ordinary file and directory deletion, temporary CWD and repository cleanup,
+worktree creation/removal, normal patch deletion, `--force-with-lease`, SQL and
+infrastructure operations (including database/schema deletion and resource
+teardown), interactive shells, secret-reading commands, dynamic expressions,
+and unknown tools defer to the
 Host in any environment. Ward does not classify environments or prove these
 operations safe. Ambiguity is never promoted to a deny.
+
+Parent-removal options still deny when they reach HOME or a filesystem root.
 
 ## Codex integration
 
@@ -75,38 +80,36 @@ See [Codex Hooks](https://learn.chatgpt.com/docs/hooks) and
 
 ## Native secret boundary
 
-The `ward` permission profile protects a deliberately small
-workspace-relative set:
+The `ward` permission profile protects a deliberately small set immediately
+below each Host-effective workspace root on every supported platform:
 
 - `.env` and reviewed local/development/test/production/staging/secret suffixes;
 - `*.key.json` and exact key, credentials, and service-account JSON basenames;
 - exact `secrets` and `credentials` YAML basenames;
 - canonical SSH/private-key basenames and reviewed private-key PEM basenames;
-- `*.p12` and `*.pfx`;
-- Ward control and private integration state.
+- `*.p12` and `*.pfx`.
+
+These rules deny reads. Wildcard matches do not guarantee write protection:
+Codex 0.147.0 on macOS permits overwriting `*.key.json`, `*.p12`, and `*.pfx`
+in both the previous recursive and current root-only profiles. Exact filename
+write denials are checked separately. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 Public templates (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`),
-arbitrary custom `.env.*` suffixes, generic PEM/YAML/key names, and HOME
-credential stores remain usable when the active workspace is a normal project
-subdirectory. Opening HOME itself as the workspace is unsupported in v0.1
-because workspace-relative recursive rules can overlap those Host stores.
-Doctor and SessionStart report `permissions.home_workspace_topology` instead of
-claiming coverage.
-
-On Linux/WSL/native Windows, Codex pre-expands recursive deny globs. Ward sets
-`glob_scan_max_depth = 16`; reviewed names at greater depth are outside the v0.1
-native claim. The platform E2E corpus exercises a depth-10 secret and a custom
-dotenv counterexample.
+arbitrary custom `.env.*` suffixes, and generic PEM/YAML/key names remain outside
+this set. Nested files, including the same secret names and HOME credential
+stores in subdirectories, are deliberately outside Ward's native secret
+boundary. Ward does not discover or register them automatically. A nested
+directory explicitly added as a Host workspace root receives the same direct
+root rules.
 
 The installer preserves `approval_policy`. It accepts only the current Codex
 permission-profile configuration, inherits a safe modern parent, and stops on
 unsupported authority instead of guessing or rewriting it. With no active
 profile the parent is `:workspace`.
 
-Ward protects dedicated control/state anchors and reports a SessionStart health
-warning when the active project topology can relocate them. Opening the user
-home itself as a writable workspace remains an unsupported, explicitly warned
-boundary rather than a reason to freeze the entire home directory.
+Ward separately protects dedicated control/state anchors and reports a
+SessionStart health warning when the active project topology can relocate them.
+It does not freeze the entire home directory.
 
 ## Build and install from source
 
@@ -234,6 +237,10 @@ Doctor JSON follows the retained
 [`ward-doctor/v1`](contracts/ward-doctor-v1.schema.json) contract. The safe
 PreToolUse process budget is p95 50 ms on POSIX and 100 ms on Windows, below
 the two-second Hook timeout.
+
+Install also refreshes an intact journal-owned profile; Doctor flags an older
+recursive profile as unhealthy. Dry-run writes nothing; an up-to-date rerun is a
+no-op. See the [ownership contract](docs/codex-integration.md#installation-ownership).
 
 Malformed input delivered to `codex-pre-tool-use` is silent, makes no Ward
 permission decision, and exits `0`. Malformed SessionStart input emits one

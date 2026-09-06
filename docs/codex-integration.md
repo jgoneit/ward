@@ -36,8 +36,14 @@ The CLI owns only:
 
 Fresh install requires the current Codex permission-profile configuration.
 Ward preserves unrelated Host bytes, refuses unsupported authority, and keeps
-rerun and uninstall idempotent. It does not import or translate older Ward
-installations.
+rerun and uninstall idempotent. Explicit `ward codex install --scope user`
+refreshes only the intact journal-owned profile and journal record. Profile,
+selector, Hooks, control paths, and parent must pass integrity checks; modified
+or duplicate managed areas, unowned installs, and different journal schemas are
+conflicts. Refresh preserves user-added roots, unrelated bytes, line endings,
+Hooks, and uninstall restoration data. Dry-run writes nothing; current profiles
+are a no-op. Handled write errors restore originals. Doctor flags an older
+recursive profile as unhealthy.
 
 `approval_policy` is never edited. A named active permission profile is a safe
 parent only when it directly extends `:workspace` or `:read-only`, has no
@@ -82,12 +88,13 @@ an already-authorized Host path or trusted local terminal. The Plugin reports
 - Plugin presence does not prove Core activation.
 - Hook absence, timeout, trust rejection, session profile overrides, and
   unobserved hosted tools remain Host coverage gaps.
-- The minimal native profile does not claim arbitrary `.env.<custom>`, generic
-  PEM/YAML/key names, or HOME authentication stores. HOME stores remain usable
-  only when the active workspace is narrower than HOME; HOME-as-workspace is an
-  explicitly warned unsupported topology.
-- Linux/WSL/native Windows recursive deny expansion is bounded to 16 levels;
-  deeper reviewed names are outside the v0.1 native claim.
+- Native secret rules apply only to direct children of each Host-effective
+  workspace root. Nested secrets, arbitrary `.env.<custom>`, generic PEM/YAML/key
+  names, and HOME authentication stores in subdirectories are outside this
+  boundary. There is no recursive secret scan or automatic registration.
+- Native glob `deny` rules provide read denial, not a write-protection guarantee.
+  macOS Codex 0.147.0 permits overwriting wildcard matches in both the previous
+  recursive and current root-only profiles; exact filename write denials remain tested.
 - If the current workspace can relocate a Ward control/state anchor, Doctor
   reports a project-scoped health warning instead of making the entire home or
   project tree read-only.
@@ -95,6 +102,6 @@ an already-authorized Host path or trusted local terminal. The Plugin reports
   races.
 - The Host may retain original tool input in its own transcript even though
   Ward stores no Hook request or result.
-- Repository scripts prove handler behavior and native profile behavior in
-  isolation. Actual Codex Hook dispatch/trust remains a separate RC gate until
-  a real Host session demonstrates it.
+- Repository scripts test handlers and profiles in isolation. Refresh does not
+  change a session's loaded permissions; real Hook dispatch and native cleanup
+  need a fresh Host session with verified effective permissions.

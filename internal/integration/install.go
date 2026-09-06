@@ -34,8 +34,8 @@ type integrationJournal struct {
 	ConfigDigest                string      `json:"config_digest"`
 }
 
-// Install merges Ward into explicitly supplied user-scope paths. Existing
-// development-version journals are intentionally unsupported.
+// Install merges Ward into explicitly supplied user-scope paths and refreshes
+// intact journal-owned v3 profiles.
 func Install(options Options) (Result, error) {
 	result := baseResult(options)
 	if err := validateInstallEnvironment(options); err != nil {
@@ -54,11 +54,55 @@ func Install(options Options) (Result, error) {
 		if journal.BinaryPath != filepath.Clean(options.Paths.BinaryPath) || journal.ProfileName != DefaultProfileName {
 			return result, fmt.Errorf("%w: existing journal belongs to a different Ward integration", ErrConflict)
 		}
-		report := Doctor(Options{Paths: options.Paths})
-		if !report.Healthy {
-			return result, fmt.Errorf("%w: existing Ward installation is unhealthy", ErrConflict)
+		// Profile currency is repairable by this explicit install. Every other
+		// health failure remains an integrity conflict, including unsafe parents,
+		// modified managed bytes, and missing or duplicate Hook handlers.
+		for _, check := range Doctor(Options{Paths: options.Paths}).Checks {
+			if check.Status == CheckFail && check.ID != "permissions.profile_current" {
+				return result, fmt.Errorf("%w: existing Ward installation failed %s", ErrConflict, check.ID)
+			}
 		}
-		return result, nil
+		configBefore, _, err := readOptional(options.Paths.ConfigFile)
+		if err != nil {
+			return result, err
+		}
+		// Reuse exact ownership checks without removing the profile or restoring
+		// selectors. User-added Ward workspace roots must stay in place.
+		unowned, _, err := uninstallConfig(configBefore, journal.ConfigEdits)
+		if err != nil {
+			return result, err
+		}
+		if hasWardMarkers(unowned) {
+			return result, fmt.Errorf("%w: duplicate Ward management markers", ErrConflict)
+		}
+		oldProfile := journal.ConfigEdits.ProfileAppend
+		body := bytes.TrimLeft(oldProfile, "\r\n")
+		prefix := oldProfile[:len(oldProfile)-len(body)]
+		profile := permissionProfileBlock(detectNewline(body), journal.ProfileName, journal.ConfigEdits.ParentProfile, options.Paths)
+		profile = append(append([]byte(nil), prefix...), profile...)
+		if bytes.Equal(profile, oldProfile) {
+			return result, nil
+		}
+		configAfter := bytes.Replace(configBefore, oldProfile, profile, 1)
+		journal.ConfigEdits.ProfileAppend = profile
+		journal.ConfigDigest = digest(configAfter)
+		candidate := DoctorReport{Healthy: true}
+		checkConfig(&candidate, configAfter, journal, options)
+		if !candidate.Healthy {
+			return result, fmt.Errorf("%w: refreshed Ward profile is invalid", ErrConflict)
+		}
+		journalAfter, err := encodeJournal(journal)
+		if err != nil {
+			return result, err
+		}
+		result.ConfigChanged, result.JournalChanged, result.Changed = true, true, true
+		if options.DryRun {
+			return result, nil
+		}
+		return result, applyMutations([]fileMutation{
+			{Path: journalPath, Data: journalAfter, Present: true, Mode: 0o600, Label: "Ward integration journal"},
+			{Path: options.Paths.ConfigFile, Data: configAfter, Present: true, Mode: existingMode(options.Paths.ConfigFile, 0o600), Label: "Codex config"},
+		}, journalPath)
 	}
 
 	hooksBefore, hooksExists, err := readOptional(options.Paths.HooksFile)

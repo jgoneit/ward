@@ -26,7 +26,7 @@ $wardOldGHConfigDir = $env:GH_CONFIG_DIR
 
 function Invoke-WardSandbox {
     param([string]$Script)
-    $arguments = @('sandbox', '-P', 'ward', '-C', $wardE2EWorkspace, 'powershell', '-NoProfile', '-Command', $Script)
+    $arguments = @('sandbox', '-P', 'ward', '-C', $wardE2EWorkspace, 'powershell', '-NoProfile', '-Command', "`$ErrorActionPreference = 'Stop'; $Script")
     & $CodexBinary @arguments
     return $LASTEXITCODE
 }
@@ -66,16 +66,16 @@ try {
 
     $protectedFixtures = @{
         '.env' = 'WARD_SECRET_CANARY_7d10f7'
-        'nested\.env.local' = 'WARD_LOCAL_CANARY_2b98e1'
+        '.env.local' = 'WARD_LOCAL_CANARY_2b98e1'
         'app.key.json' = 'WARD_KEY_JSON_CANARY_95d4bd'
-        'nested\credentials.json' = 'WARD_CREDENTIALS_CANARY_7f8d21'
+        'credentials.json' = 'WARD_CREDENTIALS_CANARY_7f8d21'
         'service-account.json' = 'WARD_SERVICE_CANARY_6259a1'
-        'nested\secrets.yml' = 'WARD_YAML_CANARY_f04052'
+        'secrets.yml' = 'WARD_YAML_CANARY_f04052'
         'id_ed25519' = 'WARD_SSH_CANARY_a44071'
         'private-key.pem' = 'WARD_KEY_CANARY_f8aa11'
         'privkey1.pem' = 'WARD_NUMBERED_KEY_CANARY_2f0b77'
-        'nested\client.p12' = 'WARD_P12_CANARY_3f277a'
-        "$wardE2EDeepRelative\.env.production" = 'WARD_DEEP_CANARY_b7f441'
+        'client.p12' = 'WARD_P12_CANARY_3f277a'
+        '.env.production' = 'WARD_DEEP_CANARY_b7f441'
     }
     foreach ($entry in $protectedFixtures.GetEnumerator()) {
         Set-Content -Encoding utf8NoBOM (Join-Path $wardE2EWorkspace $entry.Key) $entry.Value
@@ -133,16 +133,36 @@ try {
     if ($hooksText -notmatch '"SessionStart"' -or $hooksText -notmatch '"PreToolUse"') { throw 'Ward E2E: ambient hooks are incomplete' }
     if ($hooksText -match '"PermissionRequest"|"PostToolUse"|"matcher"\s*:\s*"\*"') { throw 'Ward E2E: unexpected or wildcard hook was installed' }
 
+    $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath 'ordinary.txt' | Out-Null"
+    if ($exitCode -ne 0) { throw 'Ward E2E: native sandbox positive preflight failed; permission probes were not run' }
+
     foreach ($relativePath in $protectedFixtures.Keys) {
         $escaped = $relativePath.Replace("'", "''")
         $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath '$escaped' | Out-Null"
         if ($exitCode -eq 0) { throw "Ward E2E: reviewed workspace Secret escaped: $relativePath" }
+        # Codex glob denies do not guarantee write denial; check writes for literal rules.
+        if ($relativePath -notlike '*.key.json' -and $relativePath -notlike '*.p12' -and $relativePath -notlike '*.pfx') {
+            $exitCode = Invoke-WardSandbox "Set-Content -LiteralPath '$escaped' -Value 'tampered'"
+            if ($exitCode -eq 0) { throw "Ward E2E: reviewed root Secret write escaped: $relativePath" }
+        }
+        foreach ($directory in @('nested', $wardE2EDeepRelative)) {
+            $nestedPath = Join-Path $directory $relativePath
+            Copy-Item -LiteralPath (Join-Path $wardE2EWorkspace $relativePath) -Destination (Join-Path $wardE2EWorkspace $nestedPath)
+            $nested = $nestedPath.Replace("'", "''")
+            $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath '$nested' | Out-Null; Set-Content -LiteralPath '$nested' -Value 'updated'; Move-Item -LiteralPath '$nested' -Destination '$nested.renamed'; Remove-Item -LiteralPath '$nested.renamed'"
+            if ($exitCode -ne 0) { throw "Ward E2E: nested fixture lifecycle failed: $nestedPath" }
+        }
     }
 
     foreach ($relativePath in $ordinaryFixtures.Keys) {
         $escaped = $relativePath.Replace("'", "''")
         $exitCode = Invoke-WardSandbox "Get-Content -LiteralPath '$escaped' | Out-Null; Set-Content -LiteralPath '$escaped' -Value 'updated'"
         if ($exitCode -ne 0) { throw "Ward E2E: ordinary workspace operation failed: $relativePath" }
+    }
+    $exitCode = Invoke-WardSandbox "New-Item -ItemType Directory -Path 'empty' | Out-Null; Move-Item -LiteralPath 'empty' -Destination 'renamed'; Remove-Item -LiteralPath 'renamed'; New-Item -ItemType Directory -Path 'temporary\child' -Force | Out-Null; Set-Content -LiteralPath 'temporary\child\ordinary.txt' -Value 'created'; Add-Content -LiteralPath 'temporary\child\ordinary.txt' -Value 'modified'; Move-Item -LiteralPath 'temporary' -Destination 'temporary-renamed'; Remove-Item -LiteralPath 'temporary-renamed', 'nested', 'd1' -Recurse -Force"
+    if ($exitCode -ne 0) { throw 'Ward E2E: temporary directory lifecycle failed' }
+    foreach ($removed in @('empty', 'renamed', 'temporary', 'temporary-renamed', 'nested', 'd1')) {
+        if (Test-Path -LiteralPath (Join-Path $wardE2EWorkspace $removed)) { throw "Ward E2E: temporary directory remains: $removed" }
     }
     foreach ($authPath in $authFixtures.Keys) {
         $escaped = $authPath.Replace("'", "''")
@@ -170,7 +190,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $safeOutput.Count -ne 0 -or (Get-Item $safeError).Length -ne 0) { throw 'Ward E2E: safe matched request was not a silent defer' }
     if ($before -ne (Get-WardStateSnapshot)) { throw 'Ward E2E: safe defer changed persistent Ward state' }
 
-    $denyPayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Remove-Item -Recurse -Force .; Write-Output done"}}'
+    $denyPayload = '{"cwd":"' + ($wardE2EWorkspace -replace '\\', '\\\\') + '","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Remove-Item -Recurse -Force .git; Write-Output done"}}'
     $denyError = Join-Path $wardE2ETemp 'deny.stderr'
     $denyOutput = @($denyPayload | & $wardE2EManagedBin hook codex-pre-tool-use 2> $denyError)
     if ($LASTEXITCODE -ne 0 -or $denyOutput.Count -ne 1 -or ($denyOutput -join '') -notmatch '"permissionDecision"\s*:\s*"deny"' -or (Get-Item $denyError).Length -ne 0) { throw 'Ward E2E: catastrophic request was not denied cleanly' }

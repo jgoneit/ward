@@ -267,31 +267,31 @@ func TestPowerShellLineCommentsPreserveLiteralStatements(t *testing.T) {
 	}{
 		{
 			name:    "destructive prefix",
-			command: `Remove-Item -Recurse C:\workspace # cleanup`,
+			command: `Remove-Item -Recurse C:/Users/Example # cleanup`,
 			outcome: contract.OutcomeDeny,
 			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
 		},
 		{
 			name:    "destructive prefix before CRLF",
-			command: "Remove-Item -Recurse C:\\workspace # cleanup\r\nWrite-Output safe",
+			command: "Remove-Item -Recurse C:/Users/Example # cleanup\r\nWrite-Output safe",
 			outcome: contract.OutcomeDeny,
 			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
 		},
 		{
 			name:    "comment before destructive statement",
-			command: "# reviewed\r\nRemove-Item -Recurse C:\\workspace",
+			command: "# reviewed\r\nRemove-Item -Recurse C:/Users/Example",
 			outcome: contract.OutcomeDeny,
 			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
 		},
 		{
 			name:    "quoted target before comment",
-			command: `Remove-Item -Recurse 'C:\workspace'# cleanup`,
+			command: `Remove-Item -Recurse 'C:/Users/Example'# cleanup`,
 			outcome: contract.OutcomeDeny,
 			ruleID:  "WARD_DESTRUCTIVE_FILESYSTEM",
 		},
 		{
 			name:    "comment contents are ignored",
-			command: "Write-Output safe # ignored; Remove-Item C:/workspace/.git/config ` $env:WARD_PATH",
+			command: "Write-Output safe # ignored; Remove-Item C:/Users/Example/.git/config ` $env:WARD_PATH",
 			outcome: contract.OutcomeDefer,
 		},
 		{
@@ -306,7 +306,7 @@ func TestPowerShellLineCommentsPreserveLiteralStatements(t *testing.T) {
 		},
 		{
 			name:    "target hash stays literal",
-			command: `Remove-Item -Recurse C:\workspace#cleanup`,
+			command: `Remove-Item -Recurse C:/Users/Example#cleanup`,
 			outcome: contract.OutcomeDefer,
 		},
 		{
