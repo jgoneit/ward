@@ -14,6 +14,7 @@ $testCodexHome = Join-Path $testHome '.codex'
 $testInstallDir = Join-Path $testCodexHome 'ward\bin'
 $testBinary = Join-Path $testInstallDir 'ward.exe'
 $testStateHome = Join-Path $testTemp 'state'
+$testWardStateHome = Join-Path $testStateHome 'Ward'
 $testConfig = Join-Path $testCodexHome 'config.toml'
 $testHooks = Join-Path $testCodexHome 'hooks.json'
 $testJournal = Join-Path $testStateHome 'Ward\state\core\integration-journal.json'
@@ -32,7 +33,7 @@ function Assert-NoPersistentState {
     if (Test-Path -LiteralPath $testJournal) {
         throw "Ward binary-only uninstall test: $Description created an integration journal"
     }
-    if (Test-Path -LiteralPath $testStateHome) {
+    if (Test-Path -LiteralPath $testWardStateHome) {
         throw "Ward binary-only uninstall test: $Description created persistent state"
     }
 }
@@ -90,14 +91,34 @@ function Write-TaskQueryFixture {
 }
 
 function Get-TestPersistentFiles {
-    $records = @(foreach ($directory in @($testHome, $testStateHome)) {
+    # PowerShell can initialize OS/runtime caches in the isolated profile.
+    # Assert exact bytes throughout Ward/Codex paths, not unrelated OS caches.
+    $records = @{}
+    foreach ($directory in @($testCodexHome, $testWardStateHome)) {
         if (Test-Path -LiteralPath $directory) {
             Get-ChildItem -LiteralPath $directory -File -Recurse -Force | ForEach-Object {
-                $_.FullName + ':' + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
+                $relative = $_.FullName.Substring($testTemp.Length).TrimStart([char[]]'\/')
+                $records[$relative] = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
             }
         }
+    }
+    return $records
+}
+
+function Assert-TestPersistentFilesUnchanged {
+    param([string]$Description, [hashtable]$Before)
+
+    $after = Get-TestPersistentFiles
+    $names = @(@($Before.Keys) + @($after.Keys) | Sort-Object -Unique)
+    $changed = @(foreach ($name in $names) {
+        if (-not $Before.ContainsKey($name) -or -not $after.ContainsKey($name) -or $Before[$name] -cne $after[$name]) {
+            $name
+        }
     })
-    return ($records | Sort-Object) -join "`n"
+    if ($changed.Count -gt 0) {
+        # Never print file contents, which may include a synthetic canary.
+        throw "Ward binary-only uninstall test: $Description changed persistent paths: $($changed -join ', ')"
+    }
 }
 
 function Assert-DiagnosticArtifactOutcome {
@@ -113,9 +134,7 @@ function Assert-DiagnosticArtifactOutcome {
     if ($caseExit -ne $expectedExit -or ($caseOutput -join "`n") -notmatch $expectedMessage) {
         throw "Ward binary-only uninstall test: $Description returned $caseExit, expected $expectedExit`: $($caseOutput -join [Environment]::NewLine)"
     }
-    if ($before -cne (Get-TestPersistentFiles)) {
-        throw "Ward binary-only uninstall test: $Description changed persistent files"
-    }
+    Assert-TestPersistentFilesUnchanged $Description $before
     if ((Test-Path -LiteralPath $testBinary) -or (Test-Path -LiteralPath $testJournal)) {
         throw "Ward binary-only uninstall test: $Description created Core or integration journal"
     }
@@ -133,9 +152,7 @@ function Assert-TaskQueryOutcome {
     if ($caseExit -ne $expectedExit -or ($caseOutput -join "`n") -notmatch $Message) {
         throw "Ward binary-only uninstall test: $Description returned $caseExit, expected $expectedExit`: $($caseOutput -join [Environment]::NewLine)"
     }
-    if ($before -cne (Get-TestPersistentFiles)) {
-        throw "Ward binary-only uninstall test: $Description changed persistent files"
-    }
+    Assert-TestPersistentFilesUnchanged $Description $before
 }
 
 try {
@@ -173,7 +190,7 @@ try {
     }
     if (Test-Path -LiteralPath $testHooks) { throw 'Ward binary-only uninstall test: hooks.json was created' }
     if (Test-Path -LiteralPath $testJournal) { throw 'Ward binary-only uninstall test: integration journal was created' }
-    if (Test-Path -LiteralPath $testStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
+    if (Test-Path -LiteralPath $testWardStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
 
     $legacyHooksBytes = $utf8NoBom.GetBytes('{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"ward.exe hook codex-post-tool-use","timeout":10}]}]}}')
     [System.IO.File]::WriteAllBytes($testHooks, $legacyHooksBytes)
