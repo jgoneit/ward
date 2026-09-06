@@ -115,9 +115,24 @@ func scheduledTaskDefinition(d serviceDefinition) []byte {
 </Task>`)
 }
 
-// Task Scheduler normalizes whitespace, element order, the root version and
-// registration metadata. Every execution/security setting still participates
-// in ownership comparison; extra actions, triggers and unknown settings fail.
+// Task Scheduler also omits these exact schema defaults when exporting a task.
+// Only leaf nodes at their schema location can be equivalent to omission.
+var scheduledTaskDefaults = map[string]string{
+	"Task/Principals/Principal/RunLevel":      "LeastPrivilege",
+	"Task/Triggers/LogonTrigger/Enabled":      "true",
+	"Task/Settings/AllowHardTerminate":        "true",
+	"Task/Settings/StartWhenAvailable":        "false",
+	"Task/Settings/RunOnlyIfNetworkAvailable": "false",
+	"Task/Settings/AllowStartOnDemand":        "true",
+	"Task/Settings/Hidden":                    "false",
+	"Task/Settings/RunOnlyIfIdle":             "false",
+	"Task/Settings/WakeToRun":                 "false",
+	"Task/Settings/Priority":                  "7",
+}
+
+// Task Scheduler normalizes whitespace, element order, the root version,
+// registration metadata and default-valued settings. Non-default execution or
+// security settings, extra actions, triggers and unknown settings still fail.
 func canonicalTaskXML(data []byte) (string, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	// COM already decoded task XML into a Unicode string; PowerShell JSON
@@ -128,10 +143,20 @@ func canonicalTaskXML(data []byte) (string, error) {
 		}
 		return nil, io.ErrUnexpectedEOF
 	}
+	const taskNamespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+	normalizedPaths := make(map[string]bool)
 	var walk func(xml.StartElement, string) (string, error)
 	walk = func(start xml.StartElement, parent string) (string, error) {
+		if start.Name.Space != taskNamespace {
+			return "", io.ErrUnexpectedEOF
+		}
 		name := start.Name.Local
+		path := name
+		if parent != "" {
+			path = parent + "/" + name
+		}
 		var children []string
+		hasChildren := false
 		var text strings.Builder
 		for {
 			token, err := decoder.Token()
@@ -140,7 +165,8 @@ func canonicalTaskXML(data []byte) (string, error) {
 			}
 			switch t := token.(type) {
 			case xml.StartElement:
-				child, err := walk(t, name)
+				hasChildren = true
+				child, err := walk(t, path)
 				if err != nil {
 					return "", err
 				}
@@ -150,22 +176,28 @@ func canonicalTaskXML(data []byte) (string, error) {
 			case xml.CharData:
 				text.Write(t)
 			case xml.EndElement:
-				if parent == "RegistrationInfo" && (name == "URI" || name == "Author" || name == "Date") {
-					return "", nil
-				}
-				if parent == "Settings" && name == "Enabled" {
-					return "", nil
-				}
 				sort.Strings(children)
 				attrs := []string{}
 				for _, a := range start.Attr {
-					if a.Name.Local == "xmlns" || a.Name.Space == "xmlns" || (name == "Task" && a.Name.Local == "version") {
+					if (a.Name.Space == "" && a.Name.Local == "xmlns") || a.Name.Space == "xmlns" || (path == "Task" && a.Name.Space == "" && a.Name.Local == "version") {
 						continue
 					}
-					attrs = append(attrs, a.Name.Local+"="+a.Value)
+					attrs = append(attrs, "{"+a.Name.Space+"}"+a.Name.Local+"="+a.Value)
 				}
 				sort.Strings(attrs)
 				value := text.String()
+				defaultValue, hasDefault := scheduledTaskDefaults[path]
+				mutableEnabled := path == "Task/Settings/Enabled"
+				metadata := parent == "Task/RegistrationInfo" && (name == "URI" || name == "Author" || name == "Date")
+				if hasDefault || mutableEnabled || metadata {
+					if normalizedPaths[path] {
+						return "", io.ErrUnexpectedEOF
+					}
+					normalizedPaths[path] = true
+					if !hasChildren && len(attrs) == 0 && (metadata || (hasDefault && value == defaultValue) || (mutableEnabled && (value == "true" || value == "false"))) {
+						return "", nil
+					}
+				}
 				if len(children) > 0 || strings.TrimSpace(value) == "" {
 					value = strings.TrimSpace(value)
 				}
