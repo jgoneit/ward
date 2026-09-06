@@ -478,6 +478,11 @@ func TestManagementLockExcludesConcurrentMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if unlock != nil {
+			unlock()
+		}
+	})
 	if other, err := acquireManagementLock(paths.ControlDir); !errors.Is(err, ErrServiceConflict) {
 		if other != nil {
 			other()
@@ -485,6 +490,7 @@ func TestManagementLockExcludesConcurrentMutation(t *testing.T) {
 		t.Fatalf("second lock=%v", err)
 	}
 	unlock()
+	unlock = nil
 	other, err := acquireManagementLock(paths.ControlDir)
 	if err != nil {
 		t.Fatal(err)

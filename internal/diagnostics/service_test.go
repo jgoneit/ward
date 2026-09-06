@@ -13,6 +13,19 @@ import (
 	"testing"
 )
 
+func TestWindowsBackendFailureReportsOnlyHRESULT(t *testing.T) {
+	n := nativeService{platform: "windows", run: func(context.Context, string, []string, []byte) ([]byte, error) {
+		return []byte(`{"BackendHResult":-2147024891,"Message":"private-backend-canary"}`), nil
+	}}
+	result, err := n.windowsRequest(context.Background(), windowsServiceRequest{Action: "install"})
+	if err == nil || err.Error() != "diagnostics service backend failed (hresult=0x80070005)" {
+		t.Fatalf("error=%v", err)
+	}
+	if result != (windowsServiceReply{}) {
+		t.Fatalf("failure returned service state: %+v", result)
+	}
+}
+
 func TestServiceDefinitionsUseUserLoginAndDedicatedCopy(t *testing.T) {
 	paths, _, _ := lifecycleFixture(t)
 	for _, platform := range []string{"darwin", "linux", "windows"} {
