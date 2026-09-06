@@ -38,6 +38,33 @@ if (Test-Path -LiteralPath $binary) {
     Remove-Item -LiteralPath $binary
     Write-Output "removed $binary"
 } else {
+    # Core verifies ownership and termination. Never remove service artifacts
+    # with a fallback parser or claim absence while a collector survives.
+    $diagnosticArtifacts = @((Join-Path $InstallDir 'ward-diagnostics.exe'))
+    if (-not $env:LOCALAPPDATA -or -not [System.IO.Path]::IsPathRooted($env:LOCALAPPDATA)) {
+        throw 'Ward uninstaller: LOCALAPPDATA must be absolute to inspect diagnostics'
+    }
+    $diagnosticState = Join-Path $env:LOCALAPPDATA 'Ward\state\core\diagnostics'
+    foreach ($name in @('service-owner.json', 'runtime.json', 'heartbeat.json')) {
+        $diagnosticArtifacts += Join-Path $diagnosticState $name
+    }
+    foreach ($artifact in $diagnosticArtifacts) {
+        if (Test-Path -LiteralPath $artifact) {
+            throw 'Ward uninstaller: Core binary is missing while diagnostics artifacts remain; reinstall the same version, then retry'
+        }
+    }
+    $diagnosticTasks = & "$env:SystemRoot\System32\schtasks.exe" /Query /FO CSV /NH 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Ward uninstaller: cannot confirm diagnostics task absence; reinstall Core, then retry' }
+    $diagnosticSID = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $diagnosticHash = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $diagnosticIdentity = [System.Text.Encoding]::UTF8.GetBytes($diagnosticSID + [char]0 + $binary)
+        $diagnosticSuffix = ([System.BitConverter]::ToString($diagnosticHash.ComputeHash($diagnosticIdentity))).Replace('-', '').ToLowerInvariant().Substring(0, 24)
+    } finally { $diagnosticHash.Dispose() }
+    $diagnosticTaskPattern = '"\\WardDiagnostics-' + $diagnosticSuffix + '"'
+    if (($diagnosticTasks -join "`n") -match $diagnosticTaskPattern) {
+        throw 'Ward uninstaller: Core binary is missing while diagnostics task references remain; reinstall the same version, then retry'
+    }
     $wardRefs = $false
     if (Test-Path -LiteralPath $hooksFile) {
         $hooksItem = Get-Item -Force -LiteralPath $hooksFile

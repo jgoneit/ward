@@ -52,6 +52,36 @@ if [ -e "$binary" ] || [ -L "$binary" ]; then
   rm -f "$binary"
   printf 'removed %s\n' "$binary"
 else
+	# Core is the ownership-aware service remover. A missing Core must not
+	# turn a surviving collector into a falsely successful uninstall.
+	diagnostic_state=${XDG_STATE_HOME:-"$HOME/.local/state"}/ward/core/diagnostics
+	diagnostic_config=${XDG_CONFIG_HOME:-"$HOME/.config"}
+	case "$diagnostic_state" in
+	  /*) ;;
+	  *) printf '%s\n' 'Ward uninstaller: XDG_STATE_HOME must be absolute' >&2; exit 2 ;;
+	esac
+	case "$diagnostic_config" in
+	  /*) ;;
+	  *) printf '%s\n' 'Ward uninstaller: XDG_CONFIG_HOME must be absolute' >&2; exit 2 ;;
+	esac
+	case "$(uname -s)" in
+	  Darwin) diagnostic_hash=$(printf '%s\000%s' "$(id -u)" "$binary" | /usr/bin/shasum -a 256) ;;
+	  Linux) diagnostic_hash=$(printf '%s\000%s' "$(id -u)" "$binary" | sha256sum) ;;
+	  *) printf '%s\n' 'Ward uninstaller: cannot inspect diagnostics on this platform' >&2; exit 2 ;;
+	esac
+	diagnostic_suffix=$(printf '%.24s' "$diagnostic_hash")
+	for diagnostic_artifact in \
+		"$install_dir/ward-diagnostics" \
+		"$diagnostic_state/service-owner.json" \
+		"$diagnostic_state/runtime.json" \
+		"$diagnostic_state/heartbeat.json" \
+		"$HOME/Library/LaunchAgents/io.github.jgoneit.ward.diagnostics.$diagnostic_suffix.plist" \
+		"$diagnostic_config/systemd/user/ward-diagnostics-$diagnostic_suffix.service"; do
+		if [ -e "$diagnostic_artifact" ] || [ -L "$diagnostic_artifact" ]; then
+			printf '%s\n' 'Ward uninstaller: Core binary is missing while diagnostics artifacts remain; reinstall the same version, then retry' >&2
+			exit 1
+		fi
+	done
 	ward_refs=0
 	if [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; then
 		ward_refs=1

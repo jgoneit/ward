@@ -18,6 +18,7 @@ import (
 
 	"github.com/jgoneit/ward/internal/adapters/codex"
 	"github.com/jgoneit/ward/internal/contract"
+	"github.com/jgoneit/ward/internal/diagnostics"
 	"github.com/jgoneit/ward/internal/evaluator"
 	"github.com/jgoneit/ward/internal/integration"
 	wardpaths "github.com/jgoneit/ward/internal/paths"
@@ -56,6 +57,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runCodex(args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout, stderr)
+	case "diagnostics":
+		return runDiagnostics(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		writeUsage(stdout)
 		return exitOK
@@ -80,29 +83,49 @@ func runHook(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		fmt.Fprintln(stderr, "ward hook: unsupported hook name")
 		return exitUsage
 	}
+	started := time.Now()
+	event := diagnostics.Event{Schema: diagnostics.EventSchema, Version: version.Version, Tool: "unknown", Stage: "read", Outcome: "not_evaluated"}
+	var raw []byte
+	defer func() {
+		event.DurationUS = time.Since(started).Microseconds()
+		emitPreDiagnostic(raw, event)
+	}()
 	raw, err := io.ReadAll(io.LimitReader(stdin, maxInputBytes+1))
 	if err != nil || len(raw) > maxInputBytes {
+		event.ErrorCode = "input_read"
+		if len(raw) > maxInputBytes {
+			event.ErrorCode = "input_too_large"
+		}
 		return exitOK
 	}
 	request, err := codex.DecodePreToolUse(raw)
 	if err != nil {
+		event.Stage, event.ErrorCode = "decode", "payload_invalid"
 		return exitOK
 	}
+	event.Tool, event.Stage = request.Tool, "engine"
 
 	engine, engineErr := evaluatorForRequest(request)
 	decision := contract.ErrorDecision("engine_init", "Ward evaluator initialization failed.")
 	if engineErr == nil {
 		decision = engine.Evaluate(request)
+		event.Stage = "evaluate"
+	}
+	event.Outcome, event.RuleID, event.ErrorCode = string(decision.Outcome), decision.RuleID, decision.ErrorCode
+	if decision.CoverageGap != nil {
+		event.GapCode = decision.CoverageGap.Code
 	}
 	if decision.Outcome == contract.OutcomeDefer {
 		return exitOK
 	}
 	output, err := codex.Output(decision)
 	if err != nil {
+		event.Stage, event.ErrorCode = "output", "output_encode"
 		return exitOK
 	}
 	if len(output) > 0 {
 		if _, err := stdout.Write(append(output, '\n')); err != nil {
+			event.Stage, event.ErrorCode = "output", "output_write"
 			return exitRuntime
 		}
 	}
@@ -205,7 +228,21 @@ func runCodex(args []string, stdout, stderr io.Writer) int {
 			result, err = integration.Install(options)
 		}
 	} else {
-		result, err = integration.Uninstall(options)
+		// Detect existing integration conflicts before stopping diagnostics. The
+		// collector must be gone before an outer uninstaller removes Core.
+		preflight := options
+		preflight.DryRun = true
+		_, err = integration.Uninstall(preflight)
+		if err == nil {
+			_, err = disableDiagnosticCollector(diagnostics.NewPaths(options.Paths.StateDir, options.Paths.BinaryPath, options.Paths.HomeDir), *dryRun)
+			if err != nil {
+				fmt.Fprintf(stderr, "ward codex: diagnostics shutdown failed: %v\n", err)
+				return exitRuntime
+			}
+		}
+		if err == nil {
+			result, err = integration.Uninstall(options)
+		}
 	}
 	if err != nil {
 		if errors.Is(err, integration.ErrUnsupportedSandbox) {
@@ -542,5 +579,8 @@ func writeJSON(writer io.Writer, value any) error {
 }
 
 func writeUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: ward <hook|codex|doctor> [options]")
+	fmt.Fprintln(writer, "usage: ward <hook|codex|doctor|diagnostics> [options]")
+	fmt.Fprintln(writer, "       ward diagnostics enable|disable [--dry-run]")
+	fmt.Fprintln(writer, "       ward diagnostics status [--json]")
+	fmt.Fprintln(writer, "       ward diagnostics serve")
 }
