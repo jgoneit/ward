@@ -5,11 +5,60 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      native_diagnostics:
+        description: "Exercise real per-user diagnostic services on Ubuntu and Windows"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  native-diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_diagnostics
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build native candidates with distinct hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          go build -o "$RUNNER_TEMP/ward-native${suffix}" ./cmd/ward
+          go build -ldflags=-buildid=ward-diagnostics-native-refresh -o "$RUNNER_TEMP/ward-native-refresh${suffix}" ./cmd/ward
+      - name: Exercise native user service lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          python scripts/test-native-diagnostics.py \
+            --candidate "$RUNNER_TEMP/ward-native${suffix}" \
+            --updated-candidate "$RUNNER_TEMP/ward-native-refresh${suffix}" \
+            --report "$RUNNER_TEMP/ward-native-diagnostics.json"
+      - name: Preserve native result including unsupported environments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-diagnostics-${{ runner.os }}
+          path: ${{ runner.temp }}/ward-native-diagnostics.json
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     strategy:
       fail-fast: false
