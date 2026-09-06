@@ -159,7 +159,7 @@ def project_task_xml(xml_text, *, expected_user_id=None, expected_command=None,
     require(len(xml_text) <= 65536 and "<!DOCTYPE" not in xml_text.upper()
             and "<!ENTITY" not in xml_text.upper(), "task_projection_xml_rejected")
     known = set("Task RegistrationInfo Description URI Author Date Version Source Documentation "
-                "Triggers LogonTrigger Enabled UserId Delay StartBoundary EndBoundary Repetition "
+                "Triggers LogonTrigger RegistrationTrigger Enabled UserId Delay StartBoundary EndBoundary Repetition "
                 "Interval Duration StopAtDurationEnd Principals Principal GroupId LogonType "
                 "RunLevel DisplayName ProcessTokenSidType RequiredPrivileges Privilege Settings "
                 "MultipleInstancesPolicy DisallowStartIfOnBatteries StopIfGoingOnBatteries "
@@ -493,7 +493,7 @@ if($null -eq $task){ '{"exists":false}' }else{
         else:
             self.crash_windows_process(before["pid"])
         # Include scheduling and process-start margin beyond the one-minute
-        # Task Scheduler failure restart interval.
+        # Task Scheduler recovery interval.
         deadline = time.monotonic() + (180 if self.platform == "win32" else 25)
         last_status = {"generation_changed": False}
         last_failure = None
