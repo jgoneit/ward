@@ -19,7 +19,8 @@ Ward succeeds only when both statements are true:
 Ward has no user-selected runtime modes. A Core installation owns:
 
 - a synchronous destructive-action veto for supported tool paths;
-- a native profile for reviewed high-confidence workspace secret names.
+- a native profile for reviewed high-confidence secret names directly below
+  each Host workspace root and for Ward control state.
 
 Hook evaluation is runtime-stateless. A deny, defer, or evaluator error does not
 create or update persistent Ward state.

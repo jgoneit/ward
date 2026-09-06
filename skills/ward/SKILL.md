@@ -50,15 +50,16 @@ request weaker permissions. Report `PASS`, `FAIL`, and `Not run` separately.
 - `error`: Ward emits no permission decision and defers to the Host. It emits no
   output and performs no persistent Hook write.
 
-The native profile protects a bounded set of high-confidence workspace secret
-names plus Ward control state. It intentionally does not claim every custom
-`.env.*` suffix, generic PEM/YAML, or HOME credential store. Recursive native
-coverage is bounded to 16 levels where Codex pre-expands globs, and HOME itself
-as the workspace is unsupported because workspace rules can overlap Host
-credential stores. Surface `permissions.home_workspace_topology` without
-suggesting weaker permissions. Hosted or unknown
-tools that the Host does not send through Ward remain outside the Hook
-boundary.
+The native profile protects reviewed secret names immediately below each Host
+workspace root, plus Ward control state. Nested secrets, custom `.env.*`
+suffixes, generic PEM/YAML, and HOME credential stores in subdirectories are
+outside this boundary. Ward does not discover or register nested secrets.
+Native glob rules deny reads; do not claim write protection for wildcard secret
+names. Exact filename write denials are checked separately.
+Temporary CWD and repository cleanup defer unless a retained protected boundary
+matches. Direct `.git` paths and aliases, actual HOME, filesystem roots, Ward
+control paths, and destructive Git commands remain protected. Hosted or unknown
+tools not delivered to Ward remain outside the Hook boundary.
 
 Treat `hooks.trust` as unverified until the Host has trusted the exact Hook
 definition. Never describe installation or Plugin presence alone as active
@@ -70,6 +71,10 @@ Never install or uninstall during a diagnostic or explanation request. Perform
 those mutations only when the user explicitly requests them. Show a dry run
 when supported, preserve `approval_policy` exactly, and stop on unsupported
 Host permission configuration instead of rewriting it.
+
+Install refreshes intact journal-owned profiles; it rejects modified or
+duplicate managed areas. After applying it, verify permissions and actual cleanup
+in a fresh Host session. Core `defer` does not prove native `EPERM` is resolved.
 
 Ward must never output `permissionDecision: allow` or `ask`, create a separate
 approval step, or suggest disabling Ward to finish ordinary development work.
