@@ -492,10 +492,11 @@ const windowsTaskControlHelpers = `function Start-WardScheduledTask($task) {
   }
  }
 }
-function Get-WardRestoreRegistrationFlags($wasRunning) {
- if($wasRunning){return 6}
+function Get-WardRestoreRegistrationFlags($wasEnabled,$wasRunning) {
+ if($wasEnabled -or $wasRunning){return 6}
  # TASK_CREATE_OR_UPDATE | TASK_IGNORE_REGISTRATION_TRIGGERS (0x20).
- # Restoring an enabled but stopped task must not start it as a side effect.
+ # A disabled, stopped task must remain inactive. Enabled tasks re-arm their
+ # delayed registration trigger, preserving recovery in this login session.
  return 38
 }
 `
@@ -519,7 +520,7 @@ switch($inputData.Action){
  'start' { if($null -eq $task){throw 'absent'}; Start-WardScheduledTask $task; '{}'; break }
  'stop' { if($null -ne $task){$task.Enabled=$false; $task.Stop(0)}; '{}'; break }
  'remove' { if($null -ne $task){$folder.DeleteTask($inputData.Name,0)}; '{}'; break }
- 'restore' { $definition=$scheduler.NewTask(0); $definition.XmlText=$inputData.XML; $definition.Settings.Enabled=$inputData.Enabled; $flags=Get-WardRestoreRegistrationFlags $inputData.Running; $restored=$folder.RegisterTaskDefinition($inputData.Name,$definition,$flags,$inputData.UserID,$null,3,$null); if($inputData.Running){Start-WardScheduledTask $restored; $restored.Enabled=$inputData.Enabled}; '{}'; break }
+ 'restore' { $definition=$scheduler.NewTask(0); $definition.XmlText=$inputData.XML; $definition.Settings.Enabled=$inputData.Enabled; $flags=Get-WardRestoreRegistrationFlags $inputData.Enabled $inputData.Running; $restored=$folder.RegisterTaskDefinition($inputData.Name,$definition,$flags,$inputData.UserID,$null,3,$null); if($inputData.Running){Start-WardScheduledTask $restored; $restored.Enabled=$inputData.Enabled}; '{}'; break }
  default { throw 'unsupported action' }
 }
 } catch {
