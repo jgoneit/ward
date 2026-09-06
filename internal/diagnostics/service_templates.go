@@ -103,12 +103,16 @@ func scheduledTaskDefinition(d serviceDefinition) []byte {
 	for i, arg := range d.Args {
 		args[i] = windowsArgument(arg)
 	}
+	// A registration trigger starts recovery checks immediately after enable;
+	// the user logon trigger resumes them for each later interactive session.
+	// IgnoreNew keeps each check from replacing an already running collector.
+	repetition := `<Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>`
 	// RegisterTask receives a Unicode BSTR, independent of the UTF-8 JSON
 	// transport. Do not declare a byte encoding for that COM string.
 	return []byte(`<?xml version="1.0"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <RegistrationInfo><Description>Ward local diagnostics collector</Description></RegistrationInfo>
-<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>` + xmlText(d.UserID) + `</UserId></LogonTrigger></Triggers>
+<Triggers><LogonTrigger><Enabled>true</Enabled>` + repetition + `<UserId>` + xmlText(d.UserID) + `</UserId></LogonTrigger><RegistrationTrigger><Enabled>true</Enabled>` + repetition + `</RegistrationTrigger></Triggers>
 <Principals><Principal id="CurrentUser"><UserId>` + xmlText(d.UserID) + `</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
 <Actions Context="CurrentUser"><Exec><Command>` + xmlText(d.Binary) + `</Command><Arguments>` + xmlText(strings.Join(args, " ")) + `</Arguments></Exec></Actions>
@@ -118,16 +122,19 @@ func scheduledTaskDefinition(d serviceDefinition) []byte {
 // Task Scheduler also omits these exact schema defaults when exporting a task.
 // Only leaf nodes at their schema location can be equivalent to omission.
 var scheduledTaskDefaults = map[string]string{
-	"Task/Principals/Principal/RunLevel":      "LeastPrivilege",
-	"Task/Triggers/LogonTrigger/Enabled":      "true",
-	"Task/Settings/AllowHardTerminate":        "true",
-	"Task/Settings/StartWhenAvailable":        "false",
-	"Task/Settings/RunOnlyIfNetworkAvailable": "false",
-	"Task/Settings/AllowStartOnDemand":        "true",
-	"Task/Settings/Hidden":                    "false",
-	"Task/Settings/RunOnlyIfIdle":             "false",
-	"Task/Settings/WakeToRun":                 "false",
-	"Task/Settings/Priority":                  "7",
+	"Task/Principals/Principal/RunLevel":                             "LeastPrivilege",
+	"Task/Triggers/LogonTrigger/Enabled":                             "true",
+	"Task/Triggers/RegistrationTrigger/Enabled":                      "true",
+	"Task/Triggers/LogonTrigger/Repetition/StopAtDurationEnd":        "false",
+	"Task/Triggers/RegistrationTrigger/Repetition/StopAtDurationEnd": "false",
+	"Task/Settings/AllowHardTerminate":                               "true",
+	"Task/Settings/StartWhenAvailable":                               "false",
+	"Task/Settings/RunOnlyIfNetworkAvailable":                        "false",
+	"Task/Settings/AllowStartOnDemand":                               "true",
+	"Task/Settings/Hidden":                                           "false",
+	"Task/Settings/RunOnlyIfIdle":                                    "false",
+	"Task/Settings/WakeToRun":                                        "false",
+	"Task/Settings/Priority":                                         "7",
 }
 
 // Task Scheduler normalizes whitespace, element order, the root version,

@@ -483,7 +483,24 @@ const windowsTaskUserNormalization = `function Normalize-WardTaskUser($xmlText,$
 }
 `
 
-const windowsServiceScript = windowsTaskUserNormalization + `$ErrorActionPreference='Stop'
+const windowsTaskControlHelpers = `function Start-WardScheduledTask($task) {
+ $task.Enabled=$true
+ if($task.State -ne 4 -and $task.State -ne 2){
+  try {$null=$task.Run($null)} catch {
+   # A registration trigger may have started the same owned task meanwhile.
+   if($task.State -ne 4 -and $task.State -ne 2){throw}
+  }
+ }
+}
+function Get-WardRestoreRegistrationFlags($wasRunning) {
+ if($wasRunning){return 6}
+ # TASK_CREATE_OR_UPDATE | TASK_IGNORE_REGISTRATION_TRIGGERS (0x20).
+ # Restoring an enabled but stopped task must not start it as a side effect.
+ return 38
+}
+`
+
+const windowsServiceScript = windowsTaskUserNormalization + windowsTaskControlHelpers + `$ErrorActionPreference='Stop'
 $utf8=[System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding=$utf8
 [Console]::OutputEncoding=$utf8
@@ -499,10 +516,10 @@ try { $task=$folder.GetTask($inputData.Name) } catch { if($_.Exception.GetBaseEx
 switch($inputData.Action){
  'inspect' { if($null -eq $task){ '{"Exists":false}' }else{ @{Exists=$true;Enabled=$task.Enabled;Running=($task.State -eq 4 -or $task.State -eq 2);XML=(Normalize-WardTaskUser $task.Xml $inputData.UserID)}|ConvertTo-Json -Compress }; break }
  'install' { $null=$folder.RegisterTask($inputData.Name,$inputData.XML,6,$inputData.UserID,$null,3,$null); '{}'; break }
- 'start' { if($null -eq $task){throw 'absent'}; $task.Enabled=$true; $null=$task.Run($null); '{}'; break }
+ 'start' { if($null -eq $task){throw 'absent'}; Start-WardScheduledTask $task; '{}'; break }
  'stop' { if($null -ne $task){$task.Enabled=$false; $task.Stop(0)}; '{}'; break }
  'remove' { if($null -ne $task){$folder.DeleteTask($inputData.Name,0)}; '{}'; break }
- 'restore' { $definition=$scheduler.NewTask(0); $definition.XmlText=$inputData.XML; $definition.Settings.Enabled=$inputData.Enabled; $restored=$folder.RegisterTaskDefinition($inputData.Name,$definition,6,$inputData.UserID,$null,3,$null); if($inputData.Running){$restored.Enabled=$true; $null=$restored.Run($null); $restored.Enabled=$inputData.Enabled}; '{}'; break }
+ 'restore' { $definition=$scheduler.NewTask(0); $definition.XmlText=$inputData.XML; $definition.Settings.Enabled=$inputData.Enabled; $flags=Get-WardRestoreRegistrationFlags $inputData.Running; $restored=$folder.RegisterTaskDefinition($inputData.Name,$definition,$flags,$inputData.UserID,$null,3,$null); if($inputData.Running){Start-WardScheduledTask $restored; $restored.Enabled=$inputData.Enabled}; '{}'; break }
  default { throw 'unsupported action' }
 }
 } catch {
