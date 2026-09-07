@@ -69,7 +69,11 @@ func canonicalInstallationBinary(binaryPath string) (string, error) {
 		return "", ErrServiceConflict
 	}
 	canonical, err := filepath.EvalSymlinks(absolute)
-	if err != nil || inspectRegularOwnedFile(canonical) != nil {
+	if err != nil {
+		return "", ErrServiceConflict
+	}
+	info, err := os.Lstat(canonical)
+	if err != nil || !info.Mode().IsRegular() {
 		return "", ErrServiceConflict
 	}
 	return canonical, nil
@@ -93,7 +97,7 @@ func validateInstallation(paths Paths, binary string) error {
 
 func encodeInstallation(paths Paths) ([]byte, error) {
 	binary, err := canonicalInstallationBinary(paths.BinaryPath)
-	if err != nil || validateInstallation(paths, binary) != nil {
+	if err != nil || inspectRegularOwnedFile(binary) != nil || validateInstallation(paths, binary) != nil {
 		return nil, ErrServiceConflict
 	}
 	data, err := json.Marshal(installation{installationSchema, paths.BinaryPath, paths.CoreDir, paths.HomeDir})
@@ -138,6 +142,12 @@ func readInstallation(binaryPath string, cheap bool) (Paths, []byte, error) {
 		return Paths{}, nil, os.ErrNotExist
 	}
 	if err != nil {
+		return Paths{}, nil, ErrServiceConflict
+	}
+	// An installation that never enabled diagnostics must not acquire new
+	// executable-ownership requirements merely to uninstall ordinary Core.
+	// Existing locators still require an owned executable before adoption.
+	if err := inspectRegularOwnedFile(binary); err != nil {
 		return Paths{}, nil, ErrServiceConflict
 	}
 	var saved installation
