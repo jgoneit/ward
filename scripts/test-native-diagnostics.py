@@ -276,6 +276,7 @@ class NativeSmoke:
         suffix = ".exe" if self.platform == "win32" else ""
         self.binary = self.bin_dir / ("ward" + suffix)
         self.collector = self.bin_dir / ("ward-diagnostics" + suffix)
+        self.installation = self.bin_dir / ".ward-diagnostics/installation.json"
         shutil.copyfile(args.candidate, self.binary)
         self.binary.chmod(0o700)
         # No command ever reads or updates the real Codex configuration.
@@ -307,6 +308,9 @@ class NativeSmoke:
         self.rows = []
         self.failure = None
         self.cleanup_ok = False
+        self.initial_env = dict(self.env)
+        self.drift_root = self.root / "environment-drift"
+        self.locator_bytes = None
 
     def record(self, step, **details):
         row = {"step": step, **details}
@@ -450,6 +454,68 @@ if($null -eq $task){ '{"exists":false}' }else{
         require(status["runtime"]["write_errors"] == 0, "collector_storage_error")
         require(Path(status["log_dir"]) == self.logs, "unexpected_log_directory")
         return status
+
+    def verify_installation(self):
+        require(self.installation.is_file() and not self.installation.is_symlink()
+                and not self.installation.parent.is_symlink(), "installation_locator_missing")
+        raw = self.installation.read_bytes()
+        require(len(raw) <= 16384, "installation_locator_too_large")
+        locator = json.loads(raw)
+        expected_home = Path(self.initial_env[
+            "USERPROFILE" if self.platform == "win32" else "HOME"
+        ]).resolve()
+        require(isinstance(locator, dict)
+                and set(locator) == {"schema", "binary_path", "core_dir", "home_dir"}
+                and locator["schema"] == "ward-diagnostics-installation/v1",
+                "installation_locator_schema_changed")
+        require(Path(locator["binary_path"]) == self.binary
+                and Path(locator["core_dir"]) == self.core
+                and Path(locator["home_dir"]) == expected_home,
+                "installation_locator_paths_changed")
+        if self.platform != "win32":
+            require(stat.S_IMODE(self.installation.stat().st_mode) == 0o600
+                    and stat.S_IMODE(self.installation.parent.stat().st_mode) == 0o700,
+                    "installation_locator_permissions_changed")
+        owner = json.loads(self.manifest.read_bytes())
+        require(owner.get("schema") == "ward-diagnostics-service-owner/v2",
+                "installation_ownership_schema_changed")
+        require(owner.get("installation_digest") == hashlib.sha256(raw).hexdigest(),
+                "installation_ownership_binding_changed")
+        self.locator_bytes = raw
+        self.record("fixed_installation_locator", stored_paths_match=True,
+                    ownership_schema_v2=True, ownership_digest_matches=True)
+
+    def use_drifted_environment(self):
+        overrides = {
+            "HOME": self.drift_root / "home", "USERPROFILE": self.drift_root / "home",
+            "CODEX_HOME": self.drift_root / "home/.codex",
+            "XDG_STATE_HOME": self.drift_root / "state",
+            "XDG_CONFIG_HOME": self.drift_root / "config",
+            "LOCALAPPDATA": self.drift_root / "localappdata",
+            "APPDATA": self.drift_root / "appdata",
+        }
+        for directory in overrides.values():
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.env.update({key: str(value) for key, value in overrides.items()})
+        self.require_ready()
+        require(not self.command_json("diagnostics", "enable")["changed"],
+                "environment_drift_enable_not_noop")
+        require(self.installation.read_bytes() == self.locator_bytes,
+                "environment_drift_rewrote_locator")
+        self.record("environment_drift_status_enable", stored_paths_used=True,
+                    collector_ready=True, repeat_enable_no_op=True, locator_unchanged=True)
+
+    def require_drifted_paths_unused(self):
+        # OS caches may appear in LOCALAPPDATA; only Ward state and the exact
+        # derived registration paths belong to this assertion.
+        for path in (
+                self.drift_root / "state/ward", self.drift_root / "localappdata/Ward",
+                self.drift_root / "home/.local/state/ward",
+                self.drift_root / "home/.codex/ward",
+                self.drift_root / "config/systemd/user" / str(self.native_id),
+                self.drift_root / "home/Library/LaunchAgents" / (str(self.native_id) + ".plist")):
+            require(not path.exists() and not path.is_symlink(),
+                    "environment_drift_created_ward_artifacts")
 
     def synthetic_hook(self):
         marker = "native-service-smoke-call"
@@ -733,7 +799,7 @@ $task.Stop(0)
         require(not result["enabled"], "disable_left_enabled")
         status = self.status()
         require(not status["enabled"] and not status["running"], "disable_left_running")
-        for path in (self.collector, self.manifest, self.control / "runtime.json",
+        for path in (self.collector, self.manifest, self.installation, self.control / "runtime.json",
                      self.control / "heartbeat.json"):
             require(not path.exists(), "disable_left_owned_artifact")
         self.require_native_absent()
@@ -785,8 +851,10 @@ $task.Stop(0)
         require(enabled["enabled"] and enabled["changed"], "enable_result_invalid")
         require(Path(enabled["collector_binary"]) == self.collector, "unexpected_collector_path")
         self.record("native_enable", backend=status["backend"], ready=True, heartbeat_fresh=True)
+        self.verify_installation()
         require(not self.command_json("diagnostics", "enable")["changed"], "repeat_enable_not_noop")
         self.record("repeat_enable", no_op=True)
+        self.use_drifted_environment()
         self.synthetic_hook()
         self.restore_stopped_windows_service()
         self.crash_collector()
@@ -800,6 +868,10 @@ $task.Stop(0)
         require(not self.command_json("diagnostics", "disable")["changed"], "repeat_disable_not_noop")
         self.record("native_disable", stopped=True, registration_removed=True,
                     artifacts_removed=True, logs_preserved=True, repeat_no_op=True)
+        self.require_drifted_paths_unused()
+        self.record("environment_drift_disable", original_service_removed=True,
+                    locator_removed=True, alternate_ward_paths_absent=True)
+        self.env = dict(self.initial_env)
         self.command_json("diagnostics", "enable")
         self.require_ready()
         self.disable_and_check()

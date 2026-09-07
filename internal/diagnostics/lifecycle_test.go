@@ -21,6 +21,7 @@ type fakeServiceBackend struct {
 	fail         string
 	afterStop    func()
 	beforeRemove func()
+	afterInspect func()
 }
 
 var errInjectedService = errors.New("injected service failure")
@@ -35,7 +36,11 @@ func (f *fakeServiceBackend) call(name string) error {
 }
 func (f *fakeServiceBackend) preflight(context.Context) error { return f.call("preflight") }
 func (f *fakeServiceBackend) inspect(context.Context, serviceDefinition) (serviceState, error) {
-	return f.state, f.call("inspect")
+	err := f.call("inspect")
+	if f.afterInspect != nil {
+		f.afterInspect()
+	}
+	return f.state, err
 }
 func (f *fakeServiceBackend) install(context.Context, serviceDefinition) error {
 	if err := f.call("install"); err != nil {
@@ -260,7 +265,7 @@ func TestLifecycleRoundTripRetainsLogsAndNoopDoesNotRestart(t *testing.T) {
 	if err != nil || result.Changed || !result.Enabled {
 		t.Fatalf("repeat=%+v %v", result, err)
 	}
-	if !reflect.DeepEqual(backend.calls, []string{"preflight", "inspect"}) {
+	if !reflect.DeepEqual(backend.calls, []string{"preflight", "inspect", "preflight", "inspect"}) {
 		t.Fatalf("repeat calls=%v", backend.calls)
 	}
 	status, err := m.status(paths)

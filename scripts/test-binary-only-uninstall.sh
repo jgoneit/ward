@@ -217,6 +217,7 @@ esac
 WARD_TEST_DIAGNOSTIC_SUFFIX=$(printf '%.24s' "$WARD_TEST_DIAGNOSTIC_HASH")
 WARD_TEST_OTHER_SUFFIX=000000000000000000000000
 test "$WARD_TEST_DIAGNOSTIC_SUFFIX" != "$WARD_TEST_OTHER_SUFFIX"
+assert_diagnostics_case installation-locator refuse "$WARD_TEST_INSTALL_DIR/.ward-diagnostics/installation.json"
 assert_diagnostics_case collector-copy refuse "$WARD_TEST_INSTALL_DIR/ward-diagnostics"
 assert_diagnostics_case ownership-manifest refuse "$WARD_TEST_DIAGNOSTIC_STATE/service-owner.json"
 assert_diagnostics_case runtime-descriptor refuse "$WARD_TEST_DIAGNOSTIC_STATE/runtime.json"

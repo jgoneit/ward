@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -57,11 +58,14 @@ type diagnosticProcessResult struct {
 	exit           int
 }
 
-func runDiagnosticProcess(t *testing.T, payload []byte, workerMode string) diagnosticProcessResult {
+func runDiagnosticProcess(t *testing.T, payload []byte, workerMode string, isolatedBinary ...string) diagnosticProcessResult {
 	t.Helper()
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(isolatedBinary) == 1 {
+		binary = isolatedBinary[0]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -84,6 +88,32 @@ func runDiagnosticProcess(t *testing.T, payload []byte, workerMode string) diagn
 	return diagnosticProcessResult{out.String(), errOut.String(), code}
 }
 
+func copyDiagnosticProcessBinary(t *testing.T, root string) string {
+	t.Helper()
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "diagnostic-process-bin")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, filepath.Base(source))
+	if err := os.WriteFile(binary, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if err := securefs.SecurePrivateFile(binary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return binary
+}
+
 func TestPreDiagnosticProcessExitDoesNotWaitForWorker(t *testing.T) {
 	root, _ := isolatedUserEnvironment(t)
 	payload := mustHookPayload(t, filepath.Join(root, "project"), "printf ordinary")
@@ -102,10 +132,7 @@ func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binary, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	binary := copyDiagnosticProcessBinary(t, root)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +157,7 @@ func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 	}
 	baseline := make([]diagnosticProcessResult, len(payloads))
 	for index, payload := range payloads {
-		baseline[index] = runDiagnosticProcess(t, payload, "default")
+		baseline[index] = runDiagnosticProcess(t, payload, "default", binary)
 	}
 	if baseline[0] != (diagnosticProcessResult{}) || baseline[2] != (diagnosticProcessResult{}) || !strings.Contains(baseline[1].stdout, "deny") {
 		t.Fatalf("unexpected initial policy results: %+v", baseline)
@@ -138,6 +165,7 @@ func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 	if _, err := os.Stat(filepath.Dir(core)); !os.IsNotExist(err) {
 		t.Fatalf("absent collector created persistent state: %v", err)
 	}
+	paths, _ = writeDiagnosticLocator(t, paths)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- diagnostics.Serve(ctx, paths) }()
@@ -151,8 +179,12 @@ func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 		}
 	})
 	waitDiagnosticCollector(t, paths, 0)
+	// The actual child executable's locator must retain its original state
+	// even when the invocation inherits a different ambient state directory.
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "drift-state"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(root, "drift-localappdata"))
 	for index, payload := range payloads {
-		if result := runDiagnosticProcess(t, payload, "drain"); result != baseline[index] {
+		if result := runDiagnosticProcess(t, payload, "drain", binary); result != baseline[index] {
 			t.Fatalf("enabled collector changed policy result %d: got=%+v want=%+v", index, result, baseline[index])
 		}
 	}
@@ -215,12 +247,71 @@ func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 	}
 	before := diagnosticProcessFiles(t, root)
 	for index, payload := range payloads {
-		if result := runDiagnosticProcess(t, payload, "default"); result != baseline[index] {
+		if result := runDiagnosticProcess(t, payload, "default", binary); result != baseline[index] {
 			t.Fatalf("unavailable collector changed policy result %d: got=%+v want=%+v", index, result, baseline[index])
 		}
 	}
 	if after := diagnosticProcessFiles(t, root); !reflect.DeepEqual(before, after) {
 		t.Fatal("Hook wrote persistent state with an unavailable collector")
+	}
+}
+
+func TestPreDiagnosticProcessCannotFallBackToAmbientCollector(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		name := "absent_locator"
+		if invalid {
+			name = "invalid_locator"
+		}
+		t.Run(name, func(t *testing.T) {
+			root, _ := isolatedUserEnvironment(t)
+			binary := copyDiagnosticProcessBinary(t, root)
+			core, err := wardpaths.DefaultStateDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			home, err := os.UserHomeDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths := diagnostics.NewPaths(core, binary, home)
+			locator := filepath.Join(filepath.Dir(binary), ".ward-diagnostics", "installation.json")
+			if invalid {
+				paths, locator = writeDiagnosticLocator(t, paths)
+				if err := os.WriteFile(locator, []byte(`{"schema":"invalid","core_dir":"relative"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- diagnostics.Serve(ctx, paths) }()
+			t.Cleanup(func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Errorf("ambient collector shutdown: %v", err)
+				}
+			})
+			waitDiagnosticCollector(t, paths, 0)
+			payload := mustHookPayload(t, filepath.Join(root, "project"), "printf locator-no-fallback-canary")
+			if result := runDiagnosticProcess(t, payload, "drain", binary); result != (diagnosticProcessResult{}) {
+				t.Fatalf("locator failure changed policy output: %+v", result)
+			}
+			// The drained sender has returned. Give any erroneously sent UDP
+			// packet time to reach the intentionally live ambient collector.
+			time.Sleep(100 * time.Millisecond)
+			probeCtx, stop := context.WithTimeout(context.Background(), time.Second)
+			status, err := diagnostics.Probe(probeCtx, paths)
+			stop()
+			if err != nil || status.Received != 0 {
+				t.Fatalf("missing/invalid locator fell back to ambient state: received=%d err=%v", status.Received, err)
+			}
+			if !invalid {
+				if _, err := os.Lstat(filepath.Dir(locator)); !os.IsNotExist(err) {
+					t.Fatalf("Hook created its absent locator directory: %v", err)
+				}
+			} else if raw, err := os.ReadFile(locator); err != nil || string(raw) != `{"schema":"invalid","core_dir":"relative"}` {
+				t.Fatal("Hook changed an invalid locator")
+			}
+		})
 	}
 }
 

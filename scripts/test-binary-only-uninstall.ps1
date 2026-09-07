@@ -233,6 +233,7 @@ try {
     Assert-ConfigOutcome 'non-Ward near matches' ($nearMisses + "`n") $false
 
     $diagnosticState = Join-Path $testStateHome 'Ward\state\core\diagnostics'
+    Assert-DiagnosticArtifactOutcome 'installation locator' (Join-Path $testInstallDir '.ward-diagnostics\installation.json') $true
     Assert-DiagnosticArtifactOutcome 'collector copy' (Join-Path $testInstallDir 'ward-diagnostics.exe') $true
     Assert-DiagnosticArtifactOutcome 'ownership manifest' (Join-Path $diagnosticState 'service-owner.json') $true
     Assert-DiagnosticArtifactOutcome 'runtime descriptor' (Join-Path $diagnosticState 'runtime.json') $true

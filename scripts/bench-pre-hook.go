@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -49,19 +51,45 @@ func benchmark() error {
 	if _, err := os.Stat(absoluteBinary); err != nil {
 		return fmt.Errorf("Ward binary is unavailable: %w", err)
 	}
+	source, err := os.ReadFile(absoluteBinary)
+	if err != nil {
+		return err
+	}
 
 	root, err := os.MkdirTemp("", "ward-pre-benchmark-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
 	home := filepath.Join(root, "home")
 	project := filepath.Join(home, "project")
 	codexHome := filepath.Join(home, ".codex")
 	stateHome := filepath.Join(root, "state")
 	configHome := filepath.Join(root, "config")
-	for _, directory := range []string{project, codexHome, stateHome, configHome} {
+	binDir := filepath.Join(root, "bin")
+	for _, directory := range []string{root, home, project, codexHome, stateHome, configHome, binDir} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
+			return err
+		}
+		if err := securefs.SecurePrivateDirectory(directory); err != nil {
+			return err
+		}
+	}
+	// The fixed locator belongs beside the executing binary. Never publish a
+	// benchmark locator beside the caller's candidate or installed executable.
+	absoluteBinary = filepath.Join(binDir, "ward")
+	if runtime.GOOS == "windows" {
+		absoluteBinary += ".exe"
+	}
+	if err := os.WriteFile(absoluteBinary, source, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		if err := securefs.SecurePrivateFile(absoluteBinary); err != nil {
 			return err
 		}
 	}
@@ -128,6 +156,10 @@ func benchmark() error {
 			return fmt.Errorf("absent collector: safe defer created persistent state at %s", candidate)
 		}
 	}
+	locatorDir := filepath.Join(binDir, ".ward-diagnostics")
+	if _, err := os.Lstat(locatorDir); err == nil || !os.IsNotExist(err) {
+		return fmt.Errorf("absent collector: Hook processes created a diagnostics locator")
+	}
 	if *absentOnly {
 		fmt.Println("Collector transport modes were not measured (-absent-only).")
 		return nil
@@ -137,6 +169,54 @@ func benchmark() error {
 		core = filepath.Join(stateHome, "Ward", "state", "core")
 	}
 	paths := diagnostics.NewPaths(core, absoluteBinary, home)
+	// Direct Serve intentionally does not publish installation ownership. This
+	// private, temporary fixture explicitly opts the Hook into its collector.
+	if err := os.Mkdir(locatorDir, 0o700); err != nil {
+		return err
+	}
+	if err := securefs.SecurePrivateDirectory(locatorDir); err != nil {
+		return err
+	}
+	locator, err := json.Marshal(map[string]string{
+		"schema": "ward-diagnostics-installation/v1", "binary_path": absoluteBinary,
+		"core_dir": core, "home_dir": home,
+	})
+	if err != nil {
+		return err
+	}
+	locatorPath := filepath.Join(locatorDir, "installation.json")
+	if err := os.WriteFile(locatorPath, locator, 0o600); err != nil {
+		return err
+	}
+	if err := securefs.SecurePrivateFile(locatorPath); err != nil {
+		return err
+	}
+	for _, directory := range []string{filepath.Dir(core), core, paths.ControlDir} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			return err
+		}
+		if err := securefs.SecurePrivateDirectory(directory); err != nil {
+			return err
+		}
+	}
+	locatorDigest, binaryDigest := sha256.Sum256(locator), sha256.Sum256(source)
+	owner, err := json.Marshal(map[string]string{
+		"schema": "ward-diagnostics-service-owner/v2", "service_id": "ward-pre-benchmark",
+		"backend": "benchmark", "service_path": "", "collector_version": "benchmark",
+		"service_digest":      hex.EncodeToString(binaryDigest[:]),
+		"collector_digest":    hex.EncodeToString(binaryDigest[:]),
+		"installation_digest": hex.EncodeToString(locatorDigest[:]),
+	})
+	if err != nil {
+		return err
+	}
+	ownerPath := filepath.Join(paths.ControlDir, "service-owner.json")
+	if err := os.WriteFile(ownerPath, owner, 0o600); err != nil {
+		return err
+	}
+	if err := securefs.SecurePrivateFile(ownerPath); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- diagnostics.Serve(ctx, paths) }()

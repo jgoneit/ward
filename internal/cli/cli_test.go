@@ -14,6 +14,7 @@ import (
 
 	"github.com/jgoneit/ward/internal/integration"
 	wardpaths "github.com/jgoneit/ward/internal/paths"
+	"github.com/jgoneit/ward/internal/securefs"
 )
 
 func TestVersion(t *testing.T) {
@@ -359,6 +360,11 @@ func isolatedUserEnvironment(t *testing.T) (root, codexHome string) {
 	}
 	if err := os.WriteFile(managedBinary, []byte("ward test executable"), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if err := securefs.SecurePrivateFile(managedBinary); err != nil {
+			t.Fatal(err)
+		}
 	}
 	previousExecutablePath := executablePath
 	executablePath = func() (string, error) { return managedBinary, nil }
