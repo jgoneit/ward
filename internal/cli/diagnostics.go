@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/jgoneit/ward/internal/diagnostics"
-	wardpaths "github.com/jgoneit/ward/internal/paths"
 )
 
 const diagnosticBudget = 5 * time.Millisecond
@@ -49,24 +48,38 @@ func sendPreDiagnostic(ctx context.Context, raw []byte, event diagnostics.Event)
 	if ctx.Err() != nil {
 		return
 	}
-	core, err := wardpaths.DefaultStateDir()
-	if err != nil {
-		return
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
 	binary, err := os.Executable()
 	if err != nil {
+		return
+	}
+	paths, present, err := diagnostics.ResolveInstallation(binary, true)
+	if err != nil || !present || ctx.Err() != nil {
 		return
 	}
 	if event.Stage != "read" {
 		event.SessionID, event.TurnID, event.ToolUseID = diagnosticIDs(raw)
 	}
 	if ctx.Err() == nil {
-		diagnostics.SendBestEffort(ctx, diagnostics.NewPaths(core, binary, home), event)
+		diagnostics.SendBestEffort(ctx, paths, event)
 	}
+}
+
+// Management can inspect/migrate a legacy installation only when its fixed
+// locator is absent. An invalid locator must never select ambient state.
+func diagnosticManagementPaths() (diagnostics.Paths, error) {
+	binary, err := executablePath()
+	if err != nil {
+		return diagnostics.Paths{}, err
+	}
+	paths, present, err := diagnostics.ResolveInstallation(binary, false)
+	if err != nil || present {
+		return paths, err
+	}
+	options, err := integrationOptions(true)
+	if err != nil {
+		return diagnostics.Paths{}, err
+	}
+	return diagnostics.NewPaths(options.Paths.StateDir, options.Paths.BinaryPath, options.Paths.HomeDir), nil
 }
 
 func diagnosticIDs(raw []byte) (session, turn, tool *string) {
@@ -145,12 +158,12 @@ func runDiagnostics(ctx context.Context, args []string, stdout, stderr io.Writer
 		}
 		paths = diagnostics.NewPaths(core, binary, home)
 	} else {
-		options, err := integrationOptions(true)
+		var err error
+		paths, err = diagnosticManagementPaths()
 		if err != nil {
 			fmt.Fprintln(stderr, "ward diagnostics: path_resolution_failed")
 			return exitRuntime
 		}
-		paths = diagnostics.NewPaths(options.Paths.StateDir, options.Paths.BinaryPath, options.Paths.HomeDir)
 	}
 	if action == "serve" {
 		serviceCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -168,7 +181,7 @@ func runDiagnostics(ctx context.Context, args []string, stdout, stderr io.Writer
 				return exitRuntime
 			}
 		} else {
-			fmt.Fprintf(stdout, "enabled=%t running=%t ready=%t backend=%s update_available=%t\nlogs=%s\n", report.Enabled, report.Running, report.Ready, report.Backend, report.UpdateAvailable, report.LogDir)
+			fmt.Fprintf(stdout, "enabled=%t running=%t ready=%t backend=%s update_available=%t migration_required=%t\nlogs=%s\n", report.Enabled, report.Running, report.Ready, report.Backend, report.UpdateAvailable, report.MigrationRequired, report.LogDir)
 			fmt.Fprintf(stdout, "heartbeat=%s fresh=%t received=%d dropped=%d write_errors=%d\n", report.Runtime.HeartbeatAt.UTC().Format(time.RFC3339), report.Runtime.Fresh, report.Runtime.Received, report.Runtime.Dropped, report.Runtime.WriteErrors)
 			if report.Runtime.LastError != "" {
 				fmt.Fprintf(stdout, "storage_diagnostic=%s\n", report.Runtime.LastError)

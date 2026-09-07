@@ -234,7 +234,14 @@ func runCodex(args []string, stdout, stderr io.Writer) int {
 		preflight.DryRun = true
 		_, err = integration.Uninstall(preflight)
 		if err == nil {
-			_, err = disableDiagnosticCollector(diagnostics.NewPaths(options.Paths.StateDir, options.Paths.BinaryPath, options.Paths.HomeDir), *dryRun)
+			paths, present, resolveErr := diagnostics.ResolveInstallation(options.Paths.BinaryPath, false)
+			if resolveErr == nil && !present {
+				paths = diagnostics.NewPaths(options.Paths.StateDir, options.Paths.BinaryPath, options.Paths.HomeDir)
+			}
+			err = resolveErr
+			if err == nil {
+				_, err = disableDiagnosticCollector(paths, *dryRun)
+			}
 			if err != nil {
 				fmt.Fprintf(stderr, "ward codex: diagnostics shutdown failed: %v\n", err)
 				return exitRuntime

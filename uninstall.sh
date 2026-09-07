@@ -54,6 +54,12 @@ if [ -e "$binary" ] || [ -L "$binary" ]; then
 else
 	# Core is the ownership-aware service remover. A missing Core must not
 	# turn a surviving collector into a falsely successful uninstall.
+	# Detect the fixed locator without parsing paths or deleting owned state.
+	diagnostic_locator="$install_dir/.ward-diagnostics/installation.json"
+	if [ -e "$diagnostic_locator" ] || [ -L "$diagnostic_locator" ]; then
+		printf '%s\n' 'Ward uninstaller: Core binary is missing while diagnostics artifacts remain; reinstall the same version, then retry' >&2
+		exit 1
+	fi
 	diagnostic_state=${XDG_STATE_HOME:-"$HOME/.local/state"}/ward/core/diagnostics
 	diagnostic_config=${XDG_CONFIG_HOME:-"$HOME/.config"}
 	case "$diagnostic_state" in

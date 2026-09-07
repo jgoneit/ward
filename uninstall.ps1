@@ -40,6 +40,11 @@ if (Test-Path -LiteralPath $binary) {
 } else {
     # Core verifies ownership and termination. Never remove service artifacts
     # with a fallback parser or claim absence while a collector survives.
+    # Detect the fixed locator without parsing paths or deleting owned state.
+    $diagnosticLocator = Join-Path $InstallDir '.ward-diagnostics\installation.json'
+    if (Test-Path -LiteralPath $diagnosticLocator) {
+        throw 'Ward uninstaller: Core binary is missing while diagnostics artifacts remain; reinstall the same version, then retry'
+    }
     $diagnosticArtifacts = @((Join-Path $InstallDir 'ward-diagnostics.exe'))
     if (-not $env:LOCALAPPDATA -or -not [System.IO.Path]::IsPathRooted($env:LOCALAPPDATA)) {
         throw 'Ward uninstaller: LOCALAPPDATA must be absolute to inspect diagnostics'

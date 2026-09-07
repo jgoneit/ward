@@ -17,7 +17,11 @@ import (
 	"github.com/jgoneit/ward/internal/version"
 )
 
-const ownershipFileName = "service-owner.json"
+const (
+	ownershipFileName = "service-owner.json"
+	ownershipSchemaV1 = "ward-diagnostics-service-owner/v1"
+	ownershipSchemaV2 = "ward-diagnostics-service-owner/v2"
+)
 
 type ManagementResult struct {
 	Schema          string `json:"schema"`
@@ -30,27 +34,29 @@ type ManagementResult struct {
 }
 
 type StatusReport struct {
-	Schema           string        `json:"schema"`
-	Enabled          bool          `json:"enabled"`
-	Running          bool          `json:"running"`
-	Ready            bool          `json:"ready"`
-	Backend          string        `json:"backend"`
-	CollectorVersion string        `json:"collector_version,omitempty"`
-	CoreVersion      string        `json:"core_version"`
-	UpdateAvailable  bool          `json:"update_available"`
-	Runtime          RuntimeStatus `json:"runtime"`
-	LogDir           string        `json:"log_dir"`
-	ErrorCode        string        `json:"error_code,omitempty"`
+	Schema            string        `json:"schema"`
+	Enabled           bool          `json:"enabled"`
+	Running           bool          `json:"running"`
+	Ready             bool          `json:"ready"`
+	Backend           string        `json:"backend"`
+	CollectorVersion  string        `json:"collector_version,omitempty"`
+	CoreVersion       string        `json:"core_version"`
+	UpdateAvailable   bool          `json:"update_available"`
+	MigrationRequired bool          `json:"migration_required"`
+	Runtime           RuntimeStatus `json:"runtime"`
+	LogDir            string        `json:"log_dir"`
+	ErrorCode         string        `json:"error_code,omitempty"`
 }
 
 type ownershipManifest struct {
-	Schema           string `json:"schema"`
-	ServiceID        string `json:"service_id"`
-	Backend          string `json:"backend"`
-	ServiceDigest    string `json:"service_digest"`
-	ServicePath      string `json:"service_path"`
-	CollectorDigest  string `json:"collector_digest"`
-	CollectorVersion string `json:"collector_version"`
+	Schema             string `json:"schema"`
+	ServiceID          string `json:"service_id"`
+	Backend            string `json:"backend"`
+	ServiceDigest      string `json:"service_digest"`
+	ServicePath        string `json:"service_path"`
+	CollectorDigest    string `json:"collector_digest"`
+	CollectorVersion   string `json:"collector_version"`
+	InstallationDigest string `json:"installation_digest,omitempty"`
 }
 
 type lifecycleManager struct {
@@ -58,6 +64,8 @@ type lifecycleManager struct {
 	definition  serviceDefinition
 	probe       func(context.Context, Paths) (RuntimeStatus, error)
 	stopTimeout time.Duration
+	// Injectable atomic publication for failure tests; nil uses the private writer.
+	publishInstallation func(string, []byte) error
 }
 
 func managerFor(paths Paths) (lifecycleManager, error) {
@@ -68,7 +76,7 @@ func managerFor(paths Paths) (lifecycleManager, error) {
 	if err != nil {
 		return lifecycleManager{}, err
 	}
-	d, err := makeServiceDefinition(paths, n.platform, n.userID, os.Getenv("XDG_CONFIG_HOME"))
+	d, err := ownedServiceDefinition(paths, n.platform, n.userID, os.Getenv("XDG_CONFIG_HOME"))
 	if err != nil {
 		return lifecycleManager{}, err
 	}
@@ -79,6 +87,10 @@ func managerFor(paths Paths) (lifecycleManager, error) {
 }
 
 func Enable(paths Paths, dryRun bool) (ManagementResult, error) {
+	paths, err := resolveManagementPaths(paths)
+	if err != nil {
+		return ManagementResult{}, err
+	}
 	m, err := managerFor(paths)
 	if err != nil {
 		return ManagementResult{}, err
@@ -87,6 +99,10 @@ func Enable(paths Paths, dryRun bool) (ManagementResult, error) {
 }
 
 func Disable(paths Paths, dryRun bool) (ManagementResult, error) {
+	paths, err := resolveManagementPaths(paths)
+	if err != nil {
+		return ManagementResult{}, err
+	}
 	m, err := managerFor(paths)
 	if err != nil {
 		return ManagementResult{}, err
@@ -95,6 +111,10 @@ func Disable(paths Paths, dryRun bool) (ManagementResult, error) {
 }
 
 func Status(paths Paths) (StatusReport, error) {
+	paths, err := resolveManagementPaths(paths)
+	if err != nil {
+		return StatusReport{Schema: "ward-diagnostics-status/v1", ErrorCode: "ownership_conflict"}, err
+	}
 	m, err := managerFor(paths)
 	if err != nil {
 		return StatusReport{Schema: "ward-diagnostics-status/v1", ErrorCode: "service_unavailable"}, err
@@ -112,7 +132,10 @@ func digestBytes(data []byte) string {
 	return hex.EncodeToString(value[:])
 }
 
-func (m lifecycleManager) verifyMutableArtifacts(paths Paths, expectedCopy, expectedManifest []byte) error {
+func (m lifecycleManager) verifyMutableArtifacts(paths Paths, expectedCopy, expectedManifest []byte, installation *installationChange) error {
+	if err := installation.verify(); err != nil {
+		return err
+	}
 	for _, item := range []struct {
 		path       string
 		expected   []byte
@@ -157,7 +180,7 @@ func readCollectorBinary(path string) ([]byte, error) {
 	return data, nil
 }
 
-func (m lifecycleManager) readManifest(paths Paths) (*ownershipManifest, []byte, error) {
+func readOwnershipManifest(paths Paths) (*ownershipManifest, []byte, error) {
 	raw, err := readPrivateFile(filepath.Join(paths.ControlDir, ownershipFileName), 16384)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil, nil
@@ -166,22 +189,72 @@ func (m lifecycleManager) readManifest(paths Paths) (*ownershipManifest, []byte,
 		return nil, nil, err
 	}
 	var manifest ownershipManifest
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil {
+	if strictJSON(raw, &manifest) != nil {
 		return nil, nil, ErrServiceConflict
 	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
+	if (manifest.Schema != ownershipSchemaV1 && manifest.Schema != ownershipSchemaV2) || !validDigest(manifest.CollectorDigest) || !validDigest(manifest.ServiceDigest) {
 		return nil, nil, ErrServiceConflict
 	}
-	if manifest.Schema != "ward-diagnostics-service-owner/v1" || manifest.ServiceID != m.definition.ID || manifest.Backend != m.definition.Backend || manifest.ServicePath != m.definition.Path || manifest.ServiceDigest != digestBytes(m.definition.Content) || len(manifest.CollectorDigest) != 64 {
+	if manifest.Schema == ownershipSchemaV1 && manifest.InstallationDigest != "" || manifest.Schema == ownershipSchemaV2 && !validDigest(manifest.InstallationDigest) {
+		return nil, nil, ErrServiceConflict
+	}
+	return &manifest, raw, nil
+}
+
+func validDigest(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
+}
+
+// Recover the registered Linux unit directory before consulting the current
+// environment or the manager's UnitPath. The manifest remains an assertion:
+// identity, structure, digest and actual FragmentPath are still verified.
+func ownedServiceDefinition(paths Paths, platform, userID, configHome string) (serviceDefinition, error) {
+	manifest, _, err := readOwnershipManifest(paths)
+	if err != nil {
+		return serviceDefinition{}, err
+	}
+	if manifest != nil && platform == "linux" {
+		path := manifest.ServicePath
+		unitDir := filepath.Dir(path)
+		systemdDir := filepath.Dir(unitDir)
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(unitDir) != "user" || filepath.Base(systemdDir) != "systemd" {
+			return serviceDefinition{}, ErrServiceConflict
+		}
+		configHome = filepath.Dir(systemdDir)
+	}
+	d, err := makeServiceDefinition(paths, platform, userID, configHome)
+	if err != nil {
+		return d, err
+	}
+	if manifest != nil && (manifest.ServiceID != d.ID || manifest.Backend != d.Backend || manifest.ServicePath != d.Path || manifest.ServiceDigest != digestBytes(d.Content)) {
+		return d, ErrServiceConflict
+	}
+	return d, nil
+}
+
+func (m lifecycleManager) readManifest(paths Paths) (*ownershipManifest, []byte, error) {
+	manifest, raw, err := readOwnershipManifest(paths)
+	if err != nil || manifest == nil {
+		return manifest, raw, err
+	}
+	if manifest.ServiceID != m.definition.ID || manifest.Backend != m.definition.Backend || manifest.ServicePath != m.definition.Path || manifest.ServiceDigest != digestBytes(m.definition.Content) {
+		return nil, nil, ErrServiceConflict
+	}
+	storedPaths, installation, installationErr := readInstallation(paths.BinaryPath, false)
+	if manifest.Schema == ownershipSchemaV2 {
+		if installationErr != nil || storedPaths != paths || digestBytes(installation) != manifest.InstallationDigest {
+			return nil, nil, ErrServiceConflict
+		}
+	} else if !errors.Is(installationErr, os.ErrNotExist) {
+		// A v1 installation never published a locator; do not adopt an orphan.
 		return nil, nil, ErrServiceConflict
 	}
 	copy, err := readCollectorBinary(m.definition.Binary)
 	if err != nil || digestBytes(copy) != manifest.CollectorDigest {
 		return nil, nil, ErrServiceConflict
 	}
-	return &manifest, raw, nil
+	return manifest, raw, nil
 }
 
 func (m lifecycleManager) inspectOwned(ctx context.Context, paths Paths) (*ownershipManifest, []byte, serviceState, error) {
@@ -194,6 +267,9 @@ func (m lifecycleManager) inspectOwned(ctx context.Context, paths Paths) (*owner
 		return nil, nil, state, err
 	}
 	if manifest == nil {
+		if _, err := os.Lstat(installationPath(paths)); !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, state, ErrServiceConflict
+		}
 		if state.Exists || state.Enabled || state.Running {
 			return nil, nil, state, ErrServiceConflict
 		}
@@ -207,7 +283,7 @@ func (m lifecycleManager) inspectOwned(ctx context.Context, paths Paths) (*owner
 	return manifest, raw, state, nil
 }
 
-func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementResult, err error) {
+func (m lifecycleManager) enableCore(paths Paths, dryRun bool) (result ManagementResult, err error) {
 	result = m.result(paths, dryRun)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -223,7 +299,7 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 		return result, err
 	}
 	sourceDigest := digestBytes(source)
-	if manifest != nil && manifest.CollectorDigest == sourceDigest && state.Enabled && state.Running {
+	if manifest != nil && manifest.Schema == ownershipSchemaV2 && manifest.CollectorDigest == sourceDigest && state.Enabled && state.Running {
 		probeCtx, stop := context.WithTimeout(ctx, time.Second)
 		_, probeErr := m.probe(probeCtx, paths)
 		stop()
@@ -262,6 +338,14 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 	if err != nil {
 		return result, err
 	}
+	installation, err := snapshotInstallation(paths, manifest)
+	if err != nil {
+		return result, err
+	}
+	newInstallation, err := encodeInstallation(paths)
+	if err != nil {
+		return result, err
+	}
 	changedService := false
 	expectedRuntime := oldRuntime
 	expectedCopy, expectedManifest := previousCopy, oldManifest
@@ -278,7 +362,7 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 		result.Enabled = false
 		rollbackCtx, done := context.WithTimeout(context.Background(), 15*time.Second)
 		defer done()
-		if rollbackErr := m.rollback(rollbackCtx, paths, previousCopy, oldManifest, manifest != nil, changedService, state, expectedRuntime, expectedCopy, expectedManifest, &collectorRelease); rollbackErr != nil {
+		if rollbackErr := m.rollback(rollbackCtx, paths, previousCopy, oldManifest, manifest != nil, changedService, state, expectedRuntime, expectedCopy, expectedManifest, &collectorRelease, installation); rollbackErr != nil {
 			err = fmt.Errorf("diagnostics operation failed; rollback failed: %w", rollbackErr)
 		} else if manifest != nil {
 			err = fmt.Errorf("diagnostics operation failed; previous state restored: %w", err)
@@ -286,6 +370,28 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 			err = fmt.Errorf("diagnostics operation failed; newly created artifacts removed: %w", err)
 		}
 	}()
+	newManifest := ownershipManifest{Schema: ownershipSchemaV2, ServiceID: m.definition.ID, Backend: m.definition.Backend, ServiceDigest: digestBytes(m.definition.Content), ServicePath: m.definition.Path, CollectorDigest: sourceDigest, CollectorVersion: version.Version, InstallationDigest: digestBytes(newInstallation)}
+	raw, _ := json.MarshalIndent(newManifest, "", "  ")
+	raw = append(raw, '\n')
+	if manifest != nil && manifest.CollectorDigest == sourceDigest && state.Enabled && state.Running {
+		probeCtx, stop := context.WithTimeout(ctx, time.Second)
+		_, probeErr := m.probe(probeCtx, paths)
+		stop()
+		if probeErr == nil {
+			if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
+				return result, err
+			}
+			if err = writePrivateFileAtomic(filepath.Join(paths.ControlDir, ownershipFileName), raw); err != nil {
+				return result, err
+			}
+			expectedManifest = raw
+			if err = m.publishLocator(installation, newInstallation); err != nil {
+				return result, err
+			}
+			result.Enabled = true
+			return result, nil
+		}
+	}
 	changedService = true
 	collectorRelease, err = m.stopAndLock(ctx, paths)
 	if err != nil {
@@ -295,20 +401,18 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 		return result, err
 	}
 	expectedRuntime = RuntimeStatus{}
-	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest); err != nil {
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
 		return result, err
 	}
 	if err = writeCollectorBinary(m.definition.Binary, source); err != nil {
 		return result, err
 	}
 	expectedCopy = source
-	newManifest := ownershipManifest{Schema: "ward-diagnostics-service-owner/v1", ServiceID: m.definition.ID, Backend: m.definition.Backend, ServiceDigest: digestBytes(m.definition.Content), ServicePath: m.definition.Path, CollectorDigest: sourceDigest, CollectorVersion: version.Version}
-	raw, _ := json.MarshalIndent(newManifest, "", "  ")
 	// Keep ownership available before the OS is asked to start a collector.
-	if err = writePrivateFileAtomic(filepath.Join(paths.ControlDir, ownershipFileName), append(raw, '\n')); err != nil {
+	if err = writePrivateFileAtomic(filepath.Join(paths.ControlDir, ownershipFileName), raw); err != nil {
 		return result, err
 	}
-	expectedManifest = append(raw, '\n')
+	expectedManifest = raw
 	collectorRelease()
 	collectorRelease = nil
 	if err = m.backend.install(ctx, m.definition); err != nil {
@@ -317,14 +421,21 @@ func (m lifecycleManager) enable(paths Paths, dryRun bool) (result ManagementRes
 	if err = m.backend.start(ctx, m.definition); err != nil {
 		return result, fmt.Errorf("diagnostics service start failed: %w", err)
 	}
-	if err = m.waitReady(ctx, paths); err != nil {
+	expectedRuntime, err = m.waitReadyRuntime(ctx, paths)
+	if err != nil {
+		return result, err
+	}
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
+		return result, err
+	}
+	if err = m.publishLocator(installation, newInstallation); err != nil {
 		return result, err
 	}
 	result.Enabled = true
 	return result, nil
 }
 
-func (m lifecycleManager) disable(paths Paths, dryRun bool) (result ManagementResult, err error) {
+func (m lifecycleManager) disableCore(paths Paths, dryRun bool) (result ManagementResult, err error) {
 	result = m.result(paths, dryRun)
 	if absent, err := m.artifactsAbsent(paths); err != nil {
 		return result, err
@@ -367,6 +478,10 @@ func (m lifecycleManager) disable(paths Paths, dryRun bool) (result ManagementRe
 	if err != nil {
 		return result, err
 	}
+	installation, err := snapshotInstallation(paths, manifest)
+	if err != nil {
+		return result, err
+	}
 	var collectorRelease func()
 	expectedRuntime := runtimeBefore
 	expectedCopy, expectedManifest := copy, oldManifest
@@ -379,7 +494,7 @@ func (m lifecycleManager) disable(paths Paths, dryRun bool) (result ManagementRe
 		if err != nil {
 			rollbackCtx, done := context.WithTimeout(context.Background(), 15*time.Second)
 			defer done()
-			if rollbackErr := m.rollback(rollbackCtx, paths, copy, oldManifest, true, true, state, expectedRuntime, expectedCopy, expectedManifest, &collectorRelease); rollbackErr != nil {
+			if rollbackErr := m.rollback(rollbackCtx, paths, copy, oldManifest, true, true, state, expectedRuntime, expectedCopy, expectedManifest, &collectorRelease, installation); rollbackErr != nil {
 				err = fmt.Errorf("diagnostics removal failed; rollback failed: %w", rollbackErr)
 			} else {
 				err = fmt.Errorf("diagnostics removal failed; previous state restored: %w", err)
@@ -394,34 +509,49 @@ func (m lifecycleManager) disable(paths Paths, dryRun bool) (result ManagementRe
 		return result, err
 	}
 	expectedRuntime = RuntimeStatus{}
-	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest); err != nil {
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
 		return result, err
 	}
 	if err = m.backend.remove(ctx, m.definition); err != nil {
 		return result, err
 	}
-	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest); err != nil {
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
 		return result, err
 	}
 	if err = os.Remove(m.definition.Binary); err != nil {
 		return result, err
 	}
 	expectedCopy = nil
-	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest); err != nil {
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
 		return result, err
 	}
 	if err = os.Remove(filepath.Join(paths.ControlDir, ownershipFileName)); err != nil {
 		return result, err
 	}
+	expectedManifest = nil
+	if err = m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
+		return result, err
+	}
+	if installation.expected != nil {
+		if err = os.Remove(installation.path); err != nil {
+			return result, err
+		}
+		installation.expected = nil
+	}
 	return result, nil
 }
 
-func (m lifecycleManager) rollback(ctx context.Context, paths Paths, copy, manifest []byte, restore, changedService bool, previous serviceState, expectedRuntime RuntimeStatus, expectedCopy, expectedManifest []byte, held *func()) error {
-	if !changedService {
-		return nil
-	}
-	if err := m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest); err != nil {
+func (m lifecycleManager) rollback(ctx context.Context, paths Paths, copy, manifest []byte, restore, changedService bool, previous serviceState, expectedRuntime RuntimeStatus, expectedCopy, expectedManifest []byte, held *func(), installation *installationChange) error {
+	if err := m.verifyMutableArtifacts(paths, expectedCopy, expectedManifest, installation); err != nil {
 		return err
+	}
+	if !changedService {
+		if !bytes.Equal(manifest, expectedManifest) {
+			if err := writePrivateFileAtomic(filepath.Join(paths.ControlDir, ownershipFileName), manifest); err != nil {
+				return err
+			}
+		}
+		return installation.restore()
 	}
 	var err error
 	if *held == nil {
@@ -443,6 +573,9 @@ func (m lifecycleManager) rollback(ctx context.Context, paths Paths, copy, manif
 			return err
 		}
 		if err := writePrivateFileAtomic(filepath.Join(paths.ControlDir, ownershipFileName), manifest); err != nil {
+			return err
+		}
+		if err := installation.restore(); err != nil {
 			return err
 		}
 		(*held)()
@@ -467,22 +600,27 @@ func (m lifecycleManager) rollback(ctx context.Context, paths Paths, copy, manif
 			return err
 		}
 	}
-	return nil
+	return installation.restore()
 }
 
 func (m lifecycleManager) waitReady(ctx context.Context, paths Paths) error {
+	_, err := m.waitReadyRuntime(ctx, paths)
+	return err
+}
+
+func (m lifecycleManager) waitReadyRuntime(ctx context.Context, paths Paths) (RuntimeStatus, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	for {
 		attempt, stop := context.WithTimeout(ctx, 200*time.Millisecond)
-		_, err := m.probe(attempt, paths)
+		ready, err := m.probe(attempt, paths)
 		stop()
 		if err == nil {
-			return nil
+			return ready, nil
 		}
 		select {
 		case <-ctx.Done():
-			return errors.New("diagnostics collector readiness failed")
+			return RuntimeStatus{}, errors.New("diagnostics collector readiness failed")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -600,6 +738,11 @@ func writeOwnedArtifactAtomic(path string, data []byte, mode os.FileMode) error 
 }
 
 func (m lifecycleManager) status(paths Paths) (StatusReport, error) {
+	var err error
+	m, paths, err = m.resolve(paths)
+	if err != nil {
+		return StatusReport{Schema: "ward-diagnostics-status/v1", ErrorCode: "ownership_conflict"}, err
+	}
 	report := StatusReport{Schema: "ward-diagnostics-status/v1", Backend: m.definition.Backend, CoreVersion: version.Version, LogDir: paths.LogDir}
 	if absent, err := m.artifactsAbsent(paths); err != nil {
 		report.ErrorCode = "ownership_conflict"
@@ -622,6 +765,7 @@ func (m lifecycleManager) status(paths Paths) (StatusReport, error) {
 		return report, nil
 	}
 	report.Enabled, report.Running, report.CollectorVersion = state.Enabled, state.Running, manifest.CollectorVersion
+	report.MigrationRequired = manifest.Schema == ownershipSchemaV1
 	if data, err := readCollectorBinary(paths.BinaryPath); err == nil {
 		report.UpdateAvailable = digestBytes(data) != manifest.CollectorDigest
 	}
@@ -647,7 +791,7 @@ func (m lifecycleManager) status(paths Paths) (StatusReport, error) {
 // in a headless shell with no user service manager. Retained advisory lock
 // files and retained logs are not evidence of an enabled registration.
 func (m lifecycleManager) artifactsAbsent(paths Paths) (bool, error) {
-	checks := []string{filepath.Join(paths.ControlDir, ownershipFileName), runtimePath(paths), heartbeatPath(paths), m.definition.Binary}
+	checks := []string{installationPath(paths), filepath.Join(paths.ControlDir, ownershipFileName), runtimePath(paths), heartbeatPath(paths), m.definition.Binary}
 	if m.definition.Path != "" {
 		checks = append(checks, m.definition.Path)
 	}
