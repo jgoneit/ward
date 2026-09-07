@@ -403,3 +403,28 @@ func TestInstallationExecutableAliasResolvesCanonicalBinding(t *testing.T) {
 		t.Fatal("encoded a noncanonical executable identity")
 	}
 }
+
+func TestAbsentInstallationDoesNotImposeCollectorBinaryOwnership(t *testing.T) {
+	paths := installationFixture(t)
+	raw, err := encodeInstallation(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A hard-linked executable is rejected by diagnostic ownership checks on
+	// every platform without needing to change its owner with admin privileges.
+	// Windows binary-only uninstall separately covers an elevated-token owner.
+	if err := os.Link(paths.BinaryPath, paths.BinaryPath+"-link"); err != nil {
+		t.Fatal(err)
+	}
+	for _, cheap := range []bool{false, true} {
+		if _, present, err := ResolveInstallation(paths.BinaryPath, cheap); err != nil || present {
+			t.Fatalf("absent locator imposed executable ownership: cheap=%t present=%t err=%v", cheap, present, err)
+		}
+	}
+	writeInstallationFixture(t, paths, raw)
+	bindInstallationFixture(t, paths, raw)
+	requireInstallationConflict(t, paths.BinaryPath)
+	if _, err := encodeInstallation(paths); !errors.Is(err, ErrServiceConflict) {
+		t.Fatal("new diagnostic installation accepted an unowned executable")
+	}
+}
