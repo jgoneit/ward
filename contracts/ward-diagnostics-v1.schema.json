@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jgoneit/ward/contracts/ward-diagnostics-v1.schema.json",
+  "title": "Ward local diagnostic record v1",
+  "description": "A collector receipt of a Ward PreToolUse result. Not a Host enforcement outcome, complete coverage record, or security audit proof.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "received_at",
+    "collector_generation",
+    "sequence",
+    "event"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ward-diagnostic-record/v1"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "collector_generation": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event": {
+      "$ref": "#/$defs/event"
+    }
+  },
+  "$defs": {
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "ward_version",
+        "tool",
+        "stage",
+        "outcome",
+        "duration_us",
+        "session_id",
+        "turn_id",
+        "tool_use_id"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ward-diagnostic-event/v1"
+        },
+        "ward_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9.+_-]{1,128}$"
+        },
+        "tool": {
+          "enum": [
+            "unknown",
+            "bash",
+            "powershell",
+            "pwsh",
+            "cmd",
+            "cmd.exe",
+            "apply_patch",
+            "delete_file",
+            "move_file",
+            "mcp__filesystem__delete_file",
+            "mcp__filesystem__move_file"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "read",
+            "decode",
+            "engine",
+            "evaluate",
+            "output"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "deny",
+            "defer",
+            "error",
+            "not_evaluated"
+          ]
+        },
+        "rule_id": {
+          "enum": [
+            "",
+            "WARD_DESTRUCTIVE_FILESYSTEM",
+            "WARD_DESTRUCTIVE_GIT"
+          ]
+        },
+        "error_code": {
+          "enum": [
+            "",
+            "input_read",
+            "input_too_large",
+            "payload_invalid",
+            "engine_init",
+            "evaluator_unavailable",
+            "invalid_request",
+            "boundary_mismatch",
+            "output_encode",
+            "output_write"
+          ]
+        },
+        "gap_code": {
+          "enum": [
+            "",
+            "nested_shell_limit",
+            "ambiguous_powershell",
+            "ambiguous_cmd",
+            "empty_windows_command",
+            "ambiguous_powershell_options",
+            "shell_parse_error",
+            "shell_function",
+            "inline_shell_input",
+            "dynamic_shell_word",
+            "dynamic_interpreter_payload",
+            "interpreter_payload",
+            "opaque_command_dispatch",
+            "unresolved_home_target",
+            "find_command_action",
+            "dynamic_global_option",
+            "unsupported_git_global_option",
+            "unsupported_global_option",
+            "dynamic_find_path",
+            "dynamic_path",
+            "complex_find_options",
+            "dynamic_wrapper",
+            "complex_env_wrapper",
+            "complex_command_wrapper",
+            "builtin_dispatch",
+            "nohup_stdin_semantics",
+            "complex_nohup_wrapper",
+            "complex_timeout_wrapper",
+            "complex_nice_wrapper",
+            "complex_setsid_wrapper",
+            "complex_time_wrapper",
+            "complex_sudo_wrapper",
+            "dynamic_move_operand",
+            "complex_move_operands",
+            "missing_command",
+            "missing_structured_path",
+            "missing_structured_move_roles",
+            "malformed_patch_path",
+            "dynamic_patch_path",
+            "unrecognized_patch"
+          ]
+        },
+        "duration_us": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400000000
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        },
+        "tool_use_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        }
+      }
+    }
+  }
+}

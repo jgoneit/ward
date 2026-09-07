@@ -6,13 +6,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$uninstaller = Join-Path $repoRoot 'uninstall.ps1'
+$uninstallerSource = Join-Path $repoRoot 'uninstall.ps1'
 $testTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('ward-binary-only-uninstall-' + [guid]::NewGuid())
+$uninstaller = Join-Path $testTemp 'uninstall-fixture.ps1'
 $testHome = Join-Path $testTemp 'home'
 $testCodexHome = Join-Path $testHome '.codex'
 $testInstallDir = Join-Path $testCodexHome 'ward\bin'
 $testBinary = Join-Path $testInstallDir 'ward.exe'
 $testStateHome = Join-Path $testTemp 'state'
+$testWardStateHome = Join-Path $testStateHome 'Ward'
 $testConfig = Join-Path $testCodexHome 'config.toml'
 $testHooks = Join-Path $testCodexHome 'hooks.json'
 $testJournal = Join-Path $testStateHome 'Ward\state\core\integration-journal.json'
@@ -31,7 +33,7 @@ function Assert-NoPersistentState {
     if (Test-Path -LiteralPath $testJournal) {
         throw "Ward binary-only uninstall test: $Description created an integration journal"
     }
-    if (Test-Path -LiteralPath $testStateHome) {
+    if (Test-Path -LiteralPath $testWardStateHome) {
         throw "Ward binary-only uninstall test: $Description created persistent state"
     }
 }
@@ -73,6 +75,86 @@ function Assert-ConfigOutcome {
     Assert-NoPersistentState $Description
 }
 
+function Write-TaskQueryFixture {
+    param([AllowEmptyCollection()][string[]]$Rows = @(), [int]$ExitCode = 0)
+
+    # Replace only the external read in a temporary script copy. All production
+    # artifact and task-name detection remains intact, while tests neither
+    # register tasks nor depend on unrelated tasks in the real user session.
+    $queryStatement = '$diagnosticTasks = & "$env:SystemRoot\System32\schtasks.exe" /Query /FO CSV /NH 2>$null'
+    if (-not $uninstallerText.Contains($queryStatement)) {
+        throw 'Ward binary-only uninstall test: scheduler query fixture must be updated for the production query'
+    }
+    $quotedRows = @($Rows | ForEach-Object { "'" + $_.Replace("'", "''") + "'" })
+    $replacement = '$diagnosticTasks = @(' + ($quotedRows -join ',') + '); $global:LASTEXITCODE = ' + $ExitCode
+    [System.IO.File]::WriteAllText($uninstaller, $uninstallerText.Replace($queryStatement, $replacement), $utf8NoBom)
+}
+
+function Get-TestPersistentFiles {
+    # PowerShell can initialize OS/runtime caches in the isolated profile.
+    # Assert exact bytes throughout Ward/Codex paths, not unrelated OS caches.
+    $records = @{}
+    foreach ($directory in @($testCodexHome, $testWardStateHome)) {
+        if (Test-Path -LiteralPath $directory) {
+            Get-ChildItem -LiteralPath $directory -File -Recurse -Force | ForEach-Object {
+                $relative = $_.FullName.Substring($testTemp.Length).TrimStart([char[]]'\/')
+                $records[$relative] = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
+            }
+        }
+    }
+    return $records
+}
+
+function Assert-TestPersistentFilesUnchanged {
+    param([string]$Description, [hashtable]$Before)
+
+    $after = Get-TestPersistentFiles
+    $names = @(@($Before.Keys) + @($after.Keys) | Sort-Object -Unique)
+    $changed = @(foreach ($name in $names) {
+        if (-not $Before.ContainsKey($name) -or -not $after.ContainsKey($name) -or $Before[$name] -cne $after[$name]) {
+            $name
+        }
+    })
+    if ($changed.Count -gt 0) {
+        # Never print file contents, which may include a synthetic canary.
+        throw "Ward binary-only uninstall test: $Description changed persistent paths: $($changed -join ', ')"
+    }
+}
+
+function Assert-DiagnosticArtifactOutcome {
+    param([string]$Description, [string]$Artifact, [bool]$ShouldRefuse)
+
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Artifact)) | Out-Null
+    [System.IO.File]::WriteAllText($Artifact, 'preserve diagnostics fixture bytes', $utf8NoBom)
+    $before = Get-TestPersistentFiles
+    $caseOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
+    $caseExit = $LASTEXITCODE
+    $expectedExit = if ($ShouldRefuse) { 1 } else { 0 }
+    $expectedMessage = if ($ShouldRefuse) { 'diagnostics artifacts remain' } else { 'Ward integration is already absent' }
+    if ($caseExit -ne $expectedExit -or ($caseOutput -join "`n") -notmatch $expectedMessage) {
+        throw "Ward binary-only uninstall test: $Description returned $caseExit, expected $expectedExit`: $($caseOutput -join [Environment]::NewLine)"
+    }
+    Assert-TestPersistentFilesUnchanged $Description $before
+    if ((Test-Path -LiteralPath $testBinary) -or (Test-Path -LiteralPath $testJournal)) {
+        throw "Ward binary-only uninstall test: $Description created Core or integration journal"
+    }
+    Remove-Item -LiteralPath $Artifact
+}
+
+function Assert-TaskQueryOutcome {
+    param([string]$Description, [AllowEmptyCollection()][string[]]$Rows, [int]$QueryExit, [bool]$ShouldRefuse, [string]$Message)
+
+    Write-TaskQueryFixture -Rows $Rows -ExitCode $QueryExit
+    $before = Get-TestPersistentFiles
+    $caseOutput = @(& $pwsh -NoLogo -NoProfile -NonInteractive -File $uninstaller -InstallDir $testInstallDir 2>&1)
+    $caseExit = $LASTEXITCODE
+    $expectedExit = if ($ShouldRefuse) { 1 } else { 0 }
+    if ($caseExit -ne $expectedExit -or ($caseOutput -join "`n") -notmatch $Message) {
+        throw "Ward binary-only uninstall test: $Description returned $caseExit, expected $expectedExit`: $($caseOutput -join [Environment]::NewLine)"
+    }
+    Assert-TestPersistentFilesUnchanged $Description $before
+}
+
 try {
     $sourceBinary = [System.IO.Path]::GetFullPath($WardBinary)
     if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
@@ -80,6 +162,8 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $testInstallDir | Out-Null
+    $uninstallerText = [System.IO.File]::ReadAllText($uninstallerSource)
+    Write-TaskQueryFixture
     Copy-Item -LiteralPath $sourceBinary -Destination $testBinary
     $configBytes = $utf8NoBom.GetBytes("approval_policy = `"never`"`nmodel = `"gpt-test`"`n")
     [System.IO.File]::WriteAllBytes($testConfig, $configBytes)
@@ -106,7 +190,7 @@ try {
     }
     if (Test-Path -LiteralPath $testHooks) { throw 'Ward binary-only uninstall test: hooks.json was created' }
     if (Test-Path -LiteralPath $testJournal) { throw 'Ward binary-only uninstall test: integration journal was created' }
-    if (Test-Path -LiteralPath $testStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
+    if (Test-Path -LiteralPath $testWardStateHome) { throw 'Ward binary-only uninstall test: persistent state was created' }
 
     $legacyHooksBytes = $utf8NoBom.GetBytes('{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"ward.exe hook codex-post-tool-use","timeout":10}]}]}}')
     [System.IO.File]::WriteAllBytes($testHooks, $legacyHooksBytes)
@@ -148,7 +232,31 @@ try {
     ) -join "`n"
     Assert-ConfigOutcome 'non-Ward near matches' ($nearMisses + "`n") $false
 
-    Write-Output 'PASS: Windows binary-only uninstall detected structural Ward references without near-miss refusals'
+    $diagnosticState = Join-Path $testStateHome 'Ward\state\core\diagnostics'
+    Assert-DiagnosticArtifactOutcome 'installation locator' (Join-Path $testInstallDir '.ward-diagnostics\installation.json') $true
+    Assert-DiagnosticArtifactOutcome 'collector copy' (Join-Path $testInstallDir 'ward-diagnostics.exe') $true
+    Assert-DiagnosticArtifactOutcome 'ownership manifest' (Join-Path $diagnosticState 'service-owner.json') $true
+    Assert-DiagnosticArtifactOutcome 'runtime descriptor' (Join-Path $diagnosticState 'runtime.json') $true
+    Assert-DiagnosticArtifactOutcome 'heartbeat' (Join-Path $diagnosticState 'heartbeat.json') $true
+    Assert-DiagnosticArtifactOutcome 'management lock' (Join-Path $diagnosticState 'management.lock') $false
+    Assert-DiagnosticArtifactOutcome 'collector lock' (Join-Path $diagnosticState 'collector.lock') $false
+    Assert-DiagnosticArtifactOutcome 'retained log' (Join-Path $testStateHome 'Ward\state\diagnostics\events-retained.jsonl') $false
+
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash($utf8NoBom.GetBytes($sid + [char]0 + $testBinary))
+    } finally { $sha.Dispose() }
+    $taskSuffix = ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant().Substring(0, 24)
+    $ownTask = '"\WardDiagnostics-' + $taskSuffix + '","N/A","Ready"'
+    $otherTask = '"\WardDiagnostics-000000000000000000000000","N/A","Ready"'
+    if ($taskSuffix -eq '000000000000000000000000') { throw 'unexpected test task hash collision' }
+    Assert-TaskQueryOutcome 'own scheduled task definition' @($ownTask) 0 $true 'diagnostics task references remain'
+    Assert-TaskQueryOutcome 'unrelated installation task' @($otherTask) 0 $false 'Ward integration is already absent'
+    Assert-TaskQueryOutcome 'failed scheduled task query' @() 1 $true 'cannot confirm diagnostics task absence'
+    Assert-TaskQueryOutcome 'no scheduled task' @() 0 $false 'Ward integration is already absent'
+
+    Write-Output 'PASS: Windows binary-only uninstall covered diagnostic artifacts, retained state, and isolated scheduler query fixtures'
 }
 finally {
     foreach ($name in $savedEnvironment.Keys) {

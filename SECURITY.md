@@ -11,6 +11,9 @@ Hooks cover only requests the Host delivers through the trusted definition.
 - Supported literal high-confidence destructive requests are denied; everything
   else, including evaluator errors, is left to the Host.
 - Hook evaluation writes no persistent Ward data for deny, defer, or error.
+- An opt-in separate collector can persist redacted PreToolUse diagnostics.
+  Delivery is authenticated IPv4 loopback UDP with a protected per-start key;
+  it is best effort and cannot prove Host dispatch, execution, or full coverage.
 - Native secret rules cover only reviewed names immediately below each Host
   workspace root on all platforms. Nested secrets are intentionally outside
   this boundary; Ward does not discover or register them.
@@ -24,6 +27,14 @@ Ward's installation state are outside these claims.
 Ward cannot verify Codex's user-Hook trust decision. Configuration is not proof
 of active PreToolUse enforcement; trusted real-Host dispatch remains a release
 gate.
+
+Diagnostics exclude original commands, patches, paths, output, environment
+values, and free-form error messages. Valid call identifiers are pseudonymous
+correlation metadata, not proof of identity. A same-user process with access to
+the collector key can inject events; HMAC is not tamper-proof security auditing.
+Keys and runtime descriptors remain under protected Core state. Log files are
+separate from installation ownership records. Only the collector writes and
+expires its owned logs; a Hook has no persistent fallback or remote endpoint.
 
 ## Reporting
 

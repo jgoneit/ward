@@ -16,14 +16,17 @@ Ward succeeds only when both statements are true:
 
 ## Fixed layers
 
-Ward has no user-selected runtime modes. A Core installation owns:
+Ward has no user-selected policy modes. A Core installation owns:
 
 - a synchronous destructive-action veto for supported tool paths;
 - a native profile for reviewed high-confidence secret names directly below
   each Host workspace root and for Ward control state.
 
-Hook evaluation is runtime-stateless. A deny, defer, or evaluator error does not
-create or update persistent Ward state.
+Hook evaluation is runtime-stateless. The Hook process does not create or
+update persistent state for deny, defer, or evaluator error. Users may explicitly
+enable a separate local diagnostics collector. It stores only bounded events
+about Ward's own processing, owns no permission or workflow decision, and does
+not make Hook progress depend on successful collection.
 
 The Plugin and Skill explain health and help the current Agent recover after a
 deny. They are not security boundaries and do not approve access.
@@ -31,8 +34,8 @@ deny. They are not security boundaries and do not approve access.
 ## Decision vocabulary
 
 - `deny`: a narrow, high-confidence destructive rule matched.
-- `defer`: Ward made no decision and produced no prompt, context, or persistent
-  mutation.
+- `defer`: Ward made no decision and the Hook produced no prompt, context, or
+  persistent mutation.
 - `error`: Ward could not classify reliably; the Codex adapter emits no
   permission decision and the Host remains authoritative.
 

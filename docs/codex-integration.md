@@ -19,8 +19,10 @@ does not add normal-path status or model context.
 | `defer` | no stdout or stderr | none |
 | `error` | no permission decision; Host flow continues | none |
 
-Ward never returns `allow`, `ask`, or updated input. A Hook request is never
-stored by Ward.
+Ward never returns `allow`, `ask`, or updated input. An original Hook request is
+never stored by Ward. The opt-in diagnostics collector is a separate process
+that can persist sanitized PreToolUse events; the Hook itself only attempts one
+bounded loopback delivery. It adds no Hook event or policy output.
 
 Current Codex runs command handlers but cannot use a Hook to create a separate
 Agent. The current Agent handles a denial using the Ward Skill and retries a
@@ -33,6 +35,14 @@ The CLI owns only:
 - the two Ward command entries in user-global `hooks.json`;
 - one marked `ward` permission-profile block and its selection in `config.toml`;
 - one private integration journal below the Ward `core` state directory.
+
+Explicit diagnostics activation additionally owns a separate service manifest
+and runtime descriptors below `core/diagnostics`, a real `ward-diagnostics`
+binary copy in the existing protected bin directory, and the exact per-user
+service registration. Its JSONL logs live in the sibling `diagnostics` directory,
+not in the integration journal. Disable removes only its owned service/runtime
+artifacts and preserves logs. Core uninstall stops diagnostics before removing
+the integration; an uncertain service stop preserves the Core binary.
 
 Fresh install requires the current Codex permission-profile configuration.
 Ward preserves unrelated Host bytes, refuses unsupported authority, and keeps
@@ -101,7 +111,8 @@ an already-authorized Host path or trusted local terminal. The Plugin reports
 - Lexical classification does not close kernel, mount, hard-link, or TOCTOU
   races.
 - The Host may retain original tool input in its own transcript even though
-  Ward stores no Hook request or result.
+  Ward stores no original Hook request. Optional Ward diagnostics describe its
+  own processing only; see [diagnostics](diagnostics.md).
 - Repository scripts test handlers and profiles in isolation. Refresh does not
   change a session's loaded permissions; real Hook dispatch and native cleanup
   need a fresh Host session with verified effective permissions.

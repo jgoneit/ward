@@ -28,9 +28,11 @@ tool request
 ```
 
 `defer` is not an allow. Ward never emits `allow`, `ask`, input replacement, or
-an additional approval step. Deny, defer, and evaluator error create no
-persistent Ward record. The ordinary path makes no model call, produces no
-model-visible bytes, and performs no persistent Hook write.
+an additional approval step. The Hook process creates no persistent record for
+deny, defer, or evaluator error. The ordinary path makes no model call, produces
+no model-visible bytes, and performs no persistent Hook write. An explicitly
+enabled, separate local diagnostics collector can store bounded, redacted
+PreToolUse events; collection never changes a permission decision.
 
 ## What v0.1 denies
 
@@ -231,7 +233,25 @@ ward hook codex-session-start
 ward codex install --scope user [--dry-run]
 ward codex uninstall --scope user [--dry-run]
 ward doctor [--project PATH] [--json]
+
+ward diagnostics enable [--dry-run]
+ward diagnostics disable [--dry-run]
+ward diagnostics status [--json]
 ```
+
+Diagnostics are off until explicitly enabled from a trusted local terminal.
+Enable registers a per-user launchd agent, systemd user service, or Windows
+logon task; it does not change the two Codex Hook definitions or approval
+policy. Collection resumes at user login, not before login. Linux requires a
+systemd user manager; WSL collection lasts only while its distribution runs.
+
+Logs are local JSONL under `${XDG_STATE_HOME:-$HOME/.local/state}/ward/diagnostics`
+on POSIX or `%LOCALAPPDATA%\Ward\state\diagnostics` on Windows. They rotate at
+1 MiB, cap owned logs at 10 MiB, and prune segments older than seven days while
+the collector runs.
+Disable preserves existing logs and leaves Ward protection active. See the
+[diagnostics contract](docs/diagnostics.md) for data fields, failure behavior,
+collector updates, and verification limits.
 
 Doctor JSON follows the retained
 [`ward-doctor/v1`](contracts/ward-doctor-v1.schema.json) contract. The safe

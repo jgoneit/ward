@@ -1,6 +1,6 @@
 ---
 name: ward
-description: Recover safely from a Ward WARD_* denial, explain a Ward session-health warning, or perform an explicitly requested Ward status, doctor, install, or uninstall workflow. Do not invoke for ordinary deferred tool requests or use Ward to grant access.
+description: Recover safely from a Ward WARD_* denial, explain a Ward session-health warning, or perform explicitly requested Ward status, doctor, install, uninstall, or local diagnostics management. Do not invoke for ordinary deferred tool requests or use Ward to grant access.
 ---
 
 # Ward
@@ -65,10 +65,31 @@ Treat `hooks.trust` as unverified until the Host has trusted the exact Hook
 definition. Never describe installation or Plugin presence alone as active
 enforcement.
 
+## Optional local diagnostics
+
+Only manage diagnostics when explicitly requested. `ward diagnostics status
+--json` is read-only; `enable` and `disable` support `--dry-run` and require the
+same trusted local management path as installation. Never enable collection
+in response to an ordinary defer or use diagnostic records to grant permission.
+
+The Hook process remains persistence-free. An explicitly enabled separate
+collector can store redacted PreToolUse events on the local machine. Missing
+records do not prove a defer or a successful tool call. `not_evaluated` is an
+input-processing failure, distinct from an evaluator error. Correlation IDs
+and authenticated local delivery do not prove trusted Host origin or complete
+coverage. Never request, display, or inspect collector keys or raw descriptors.
+
+Disable preserves logs and Ward protection. Repeated enable refreshes the
+separate collector binary when its digest differs; updating Core alone does
+not prove the collector was updated. Report service registration, readiness,
+and actual Host collection separately. Unsupported service environments are
+not a reason to weaken permissions or install a privileged service.
+
 ## Mutation boundary
 
-Never install or uninstall during a diagnostic or explanation request. Perform
-those mutations only when the user explicitly requests them. Show a dry run
+Never install or uninstall Core during a health explanation or read-only
+diagnostics request. Perform those mutations only when the user explicitly
+requests them. Show a dry run
 when supported, preserve `approval_policy` exactly, and stop on unsupported
 Host permission configuration instead of rewriting it.
 
