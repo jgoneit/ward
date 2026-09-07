@@ -24,10 +24,32 @@ func TestPreDiagnosticHelperProcess(t *testing.T) {
 	if os.Getenv("WARD_PRE_DIAGNOSTIC_HELPER") != "1" {
 		return
 	}
-	if os.Getenv("WARD_PRE_DIAGNOSTIC_BLOCK") == "1" {
+	var drained <-chan struct{}
+	switch os.Getenv("WARD_PRE_DIAGNOSTIC_WORKER") {
+	case "blocked":
 		diagnosticWorker = func(context.Context, []byte, diagnostics.Event) { select {} }
+	case "drain":
+		// Record-content assertions need the real sender to finish independently
+		// of the production 5ms budget. Only this helper owns a longer context
+		// and stays alive after Run; normal and blocked helpers remain unchanged.
+		done := make(chan struct{})
+		drained = done
+		diagnosticWorker = func(_ context.Context, raw []byte, event diagnostics.Event) {
+			defer close(done)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			sendPreDiagnostic(ctx, raw, event)
+		}
 	}
-	os.Exit(Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, os.Stdin, os.Stdout, os.Stderr))
+	code := Run(context.Background(), []string{"hook", "codex-pre-tool-use"}, os.Stdin, os.Stdout, os.Stderr)
+	if drained != nil {
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+			os.Exit(124)
+		}
+	}
+	os.Exit(code)
 }
 
 type diagnosticProcessResult struct {
@@ -35,7 +57,7 @@ type diagnosticProcessResult struct {
 	exit           int
 }
 
-func runDiagnosticProcess(t *testing.T, payload []byte, blocked bool) diagnosticProcessResult {
+func runDiagnosticProcess(t *testing.T, payload []byte, workerMode string) diagnosticProcessResult {
 	t.Helper()
 	binary, err := os.Executable()
 	if err != nil {
@@ -44,10 +66,7 @@ func runDiagnosticProcess(t *testing.T, payload []byte, blocked bool) diagnostic
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, binary, "-test.run=^TestPreDiagnosticHelperProcess$")
-	command.Env = append(os.Environ(), "WARD_PRE_DIAGNOSTIC_HELPER=1")
-	if blocked {
-		command.Env = append(command.Env, "WARD_PRE_DIAGNOSTIC_BLOCK=1")
-	}
+	command.Env = append(os.Environ(), "WARD_PRE_DIAGNOSTIC_HELPER=1", "WARD_PRE_DIAGNOSTIC_WORKER="+workerMode)
 	var out, errOut bytes.Buffer
 	command.Stdin, command.Stdout, command.Stderr = bytes.NewReader(payload), &out, &errOut
 	err = command.Run()
@@ -68,13 +87,16 @@ func runDiagnosticProcess(t *testing.T, payload []byte, blocked bool) diagnostic
 func TestPreDiagnosticProcessExitDoesNotWaitForWorker(t *testing.T) {
 	root, _ := isolatedUserEnvironment(t)
 	payload := mustHookPayload(t, filepath.Join(root, "project"), "printf ordinary")
-	baseline := runDiagnosticProcess(t, payload, false)
-	if result := runDiagnosticProcess(t, payload, true); result != baseline {
+	baseline := runDiagnosticProcess(t, payload, "default")
+	if result := runDiagnosticProcess(t, payload, "blocked"); result != baseline {
 		t.Fatalf("blocked diagnostic worker changed policy result: got=%+v want=%+v", result, baseline)
 	}
 }
 
-func TestPreDiagnosticProcessTemporaryCollector(t *testing.T) {
+// This checks real transport and stored content with a drained test helper.
+// Production process lifetime is covered separately; best-effort delivery does
+// not guarantee that every short-lived Hook sends before its deadline.
+func TestPreDiagnosticProcessDrainedCollector(t *testing.T) {
 	root, _ := isolatedUserEnvironment(t)
 	core, err := wardpaths.DefaultStateDir()
 	if err != nil {
@@ -108,7 +130,7 @@ func TestPreDiagnosticProcessTemporaryCollector(t *testing.T) {
 	}
 	baseline := make([]diagnosticProcessResult, len(payloads))
 	for index, payload := range payloads {
-		baseline[index] = runDiagnosticProcess(t, payload, false)
+		baseline[index] = runDiagnosticProcess(t, payload, "default")
 	}
 	if baseline[0] != (diagnosticProcessResult{}) || baseline[2] != (diagnosticProcessResult{}) || !strings.Contains(baseline[1].stdout, "deny") {
 		t.Fatalf("unexpected initial policy results: %+v", baseline)
@@ -130,7 +152,7 @@ func TestPreDiagnosticProcessTemporaryCollector(t *testing.T) {
 	})
 	waitDiagnosticCollector(t, paths, 0)
 	for index, payload := range payloads {
-		if result := runDiagnosticProcess(t, payload, false); result != baseline[index] {
+		if result := runDiagnosticProcess(t, payload, "drain"); result != baseline[index] {
 			t.Fatalf("enabled collector changed policy result %d: got=%+v want=%+v", index, result, baseline[index])
 		}
 	}
@@ -193,7 +215,7 @@ func TestPreDiagnosticProcessTemporaryCollector(t *testing.T) {
 	}
 	before := diagnosticProcessFiles(t, root)
 	for index, payload := range payloads {
-		if result := runDiagnosticProcess(t, payload, false); result != baseline[index] {
+		if result := runDiagnosticProcess(t, payload, "default"); result != baseline[index] {
 			t.Fatalf("unavailable collector changed policy result %d: got=%+v want=%+v", index, result, baseline[index])
 		}
 	}
